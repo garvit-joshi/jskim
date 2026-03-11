@@ -18,7 +18,10 @@ from jskim_util import (
     get_body_members, get_annotations, get_modifiers_node,
     extract_import_path, extract_field_info, get_type_keyword,
     get_declaration_name, get_superclass, get_interfaces,
-    build_class_declaration_text,
+    build_class_declaration_text, get_enum_constants, is_field_final,
+    get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
+    extract_mapping_paths, extract_request_method,
+    extract_first_annotation_string,
 )
 
 
@@ -37,6 +40,17 @@ INNER_TYPE_NODES = {
 METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
 
 
+def _join_paths(base, method_path):
+    """Join a base path and method path into a full endpoint path."""
+    if not base and not method_path:
+        return "/"
+    if not base:
+        return method_path if method_path.startswith("/") else "/" + method_path
+    if not method_path:
+        return base if base.startswith("/") else "/" + base
+    return base.rstrip("/") + "/" + method_path.lstrip("/")
+
+
 def _scan_type_declaration(decl):
     """Extract structural info from a single type declaration node."""
     class_type = get_type_keyword(decl)
@@ -51,17 +65,95 @@ def _scan_type_declaration(decl):
     annotations = get_annotations(mods)
     lombok_anns = [a for a in annotations if a in LOMBOK_SET]
 
+    # --- Spring Boot detection ---
+    is_controller = any(a in ("@RestController", "@Controller") for a in annotations)
+    is_spring_bean = any(a in (
+        "@Service", "@Component", "@Repository",
+        "@Controller", "@RestController", "@Configuration",
+    ) for a in annotations)
+    has_constructor_injection = any(a in ("@RequiredArgsConstructor", "@AllArgsConstructor") for a in annotations)
+
+    # Class-level base path and config prefix from annotation params
+    base_paths = []
+    config_prefix = None
+    if mods:
+        for child in mods.children:
+            if child.type in ("marker_annotation", "annotation"):
+                ann_name = get_annotation_name_from_node(child)
+                if ann_name == "@RequestMapping":
+                    base_paths = extract_mapping_paths(child)
+                elif ann_name == "@ConfigurationProperties":
+                    config_prefix = extract_first_annotation_string(child)
+    if not base_paths:
+        base_paths = [""]
+
     field_count = 0
     method_count = 0
     inner_types = []
+    endpoints = []
+    bean_deps = []
+    fields_detail = []
+    enum_constants_list = []
 
     body = get_class_body(decl)
+
+    # Enum constants
+    if class_type == "enum" and body:
+        enum_constants_list = get_enum_constants(body)
+
     for member in get_body_members(body):
         if member.type == "field_declaration":
             field_entries = extract_field_info(member)
             field_count += len(field_entries)
+
+            # Collect field details for config-properties display
+            for ftype, fname in field_entries:
+                fields_detail.append({"type": ftype, "name": fname})
+
+            # Bean dependency detection
+            if is_spring_bean:
+                field_mods = get_modifiers_node(member)
+                field_anns = get_annotations(field_mods) if field_mods else []
+                field_final = is_field_final(member)
+                is_injected = (
+                    "@Autowired" in field_anns or "@Inject" in field_anns
+                    or (has_constructor_injection and field_final)
+                )
+                if is_injected:
+                    for ftype, fname in field_entries:
+                        if ftype:
+                            dep_type = ftype.split("<")[0].strip()
+                            bean_deps.append(dep_type)
+
         elif member.type in METHOD_NODES:
             method_count += 1
+
+            # Endpoint detection for controllers
+            if is_controller:
+                method_mods = get_modifiers_node(member)
+                if method_mods:
+                    for child in method_mods.children:
+                        if child.type in ("marker_annotation", "annotation"):
+                            ann_name = get_annotation_name_from_node(child)
+                            if ann_name in HTTP_MAPPING_ANNOTATIONS:
+                                http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
+                                if http_method is None:
+                                    http_method = extract_request_method(child) or "REQUEST"
+                                method_paths = extract_mapping_paths(child)
+                                if not method_paths:
+                                    method_paths = [""]
+                                name_node = member.child_by_field_name("name")
+                                method_name = name_node.text.decode() if name_node else "?"
+                                start_line = member.start_point[0] + 1
+                                for bp in base_paths:
+                                    for mp in method_paths:
+                                        endpoints.append({
+                                            "method": http_method,
+                                            "path": _join_paths(bp, mp),
+                                            "handler": f"{class_name}.{method_name}()",
+                                            "line": start_line,
+                                        })
+
         elif member.type in INNER_TYPE_NODES:
             kw = get_type_keyword(member)
             nm = get_declaration_name(member)
@@ -77,6 +169,11 @@ def _scan_type_declaration(decl):
         "field_count": field_count,
         "method_count": method_count,
         "inner_types": inner_types,
+        "enum_constants": enum_constants_list,
+        "endpoints": endpoints,
+        "bean_deps": bean_deps,
+        "config_prefix": config_prefix,
+        "fields_detail": fields_detail,
     }
 
 
@@ -112,7 +209,6 @@ def scan_java_file(filepath):
     for info in type_infos:
         results.append({
             "filepath": filepath,
-            "content": content,
             "package": package,
             "imports": imports,
             "total_lines": total_lines,
@@ -173,7 +269,7 @@ def find_dependencies(file_info_list):
     return deps
 
 
-def format_output(file_infos, show_deps=False):
+def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=False):
     """Format the project map."""
     out = []
 
@@ -207,7 +303,15 @@ def format_output(file_infos, show_deps=False):
                 if key_anns:
                     parts.append(" ".join(key_anns))
 
-            desc = f"{ctype} {name}"
+            # For enums, show constants inline
+            if ctype == "enum" and info.get("enum_constants"):
+                constants = info["enum_constants"]
+                if len(constants) <= 6:
+                    desc = f"{ctype} {name} {{ {', '.join(constants)} }}"
+                else:
+                    desc = f"{ctype} {name} {{ {', '.join(constants[:5])}, ...+{len(constants) - 5} }}"
+            else:
+                desc = f"{ctype} {name}"
             if info["extends"]:
                 desc += f" extends {info['extends']}"
             if info["implements"]:
@@ -239,6 +343,57 @@ def format_output(file_infos, show_deps=False):
                 out.append(f"//   {name} → {', '.join(refs)}")
             out.append("//")
 
+    if show_endpoints:
+        all_endpoints = []
+        for info in file_infos:
+            for ep in info.get("endpoints", []):
+                all_endpoints.append(ep)
+        if all_endpoints:
+            all_endpoints.sort(key=lambda e: (e["path"], e["method"]))
+            max_method = max(len(e["method"]) for e in all_endpoints)
+            max_path = max(len(e["path"]) for e in all_endpoints)
+            out.append("// === REST Endpoints ===")
+            for e in all_endpoints:
+                out.append(
+                    f"//   {e['method']:<{max_method}}  {e['path']:<{max_path}}  "
+                    f"{e['handler']}  L{e['line']}"
+                )
+            out.append("//")
+
+    if show_beans:
+        bean_entries = []
+        for info in file_infos:
+            if info.get("bean_deps"):
+                ann = next(
+                    (a for a in info["annotations"] if a in (
+                        "@Service", "@Component", "@Repository",
+                        "@Controller", "@RestController", "@Configuration",
+                    )),
+                    "",
+                )
+                bean_entries.append((info["class_name"], ann, info["bean_deps"]))
+        if bean_entries:
+            out.append("// === Bean Dependencies ===")
+            for name, ann, deps in sorted(bean_entries):
+                ann_str = f" {ann}" if ann else ""
+                out.append(f"//   {name}{ann_str} ← {', '.join(deps)}")
+            out.append("//")
+
+        # Configuration properties
+        config_entries = []
+        for info in file_infos:
+            if info.get("config_prefix"):
+                fields = [f"{f['type']} {f['name']}" for f in info.get("fields_detail", [])]
+                config_entries.append((info["config_prefix"], info["class_name"], fields))
+        if config_entries:
+            out.append("// === Configuration Properties ===")
+            for prefix, name, fields in sorted(config_entries):
+                if fields:
+                    out.append(f"//   {prefix}.* ({name}): {', '.join(fields)}")
+                else:
+                    out.append(f"//   {prefix}.* ({name})")
+            out.append("//")
+
     return "\n".join(out)
 
 
@@ -246,6 +401,8 @@ def _parse_args(argv):
     """Parse CLI arguments."""
     src_dir = None
     show_deps = False
+    show_endpoints = False
+    show_beans = False
     pkg_filter = None
     ann_filter = None
     ext_filter = None
@@ -253,6 +410,12 @@ def _parse_args(argv):
     while i < len(argv):
         if argv[i] == "--deps":
             show_deps = True
+            i += 1
+        elif argv[i] == "--endpoints":
+            show_endpoints = True
+            i += 1
+        elif argv[i] == "--beans":
+            show_beans = True
             i += 1
         elif argv[i] == "--package" and i + 1 < len(argv):
             pkg_filter = argv[i + 1]
@@ -268,7 +431,7 @@ def _parse_args(argv):
             i += 1
         else:
             i += 1
-    return src_dir, show_deps, pkg_filter, ann_filter, ext_filter
+    return src_dir, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter
 
 
 def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter):
@@ -286,10 +449,16 @@ def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 jskim_project.py <src_dir> [--deps] [--package pkg] [--annotation @Ann] [--extends Class]", file=sys.stderr)
+        print(
+            "Usage: python3 jskim_project.py <src_dir> [--deps] [--endpoints] [--beans]"
+            " [--package pkg] [--annotation @Ann] [--extends Class]",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    src_dir_str, show_deps, pkg_filter, ann_filter, ext_filter = _parse_args(sys.argv[1:])
+    src_dir_str, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter = (
+        _parse_args(sys.argv[1:])
+    )
 
     if not src_dir_str:
         print("Error: no source directory specified", file=sys.stderr)
@@ -315,7 +484,7 @@ def main():
     if pkg_filter or ann_filter or ext_filter:
         file_infos = _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter)
 
-    print(format_output(file_infos, show_deps))
+    print(format_output(file_infos, show_deps, show_endpoints, show_beans))
 
 
 if __name__ == "__main__":

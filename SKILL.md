@@ -4,14 +4,21 @@ description: Token-saving Java file reader. Use when working with Java files (.j
 argument-hint: [file-path or src-directory]
 ---
 
-# jskim — Java Token Saver
+# jskim — Java Token Saver for Spring Boot
 
-You have access to three Python scripts in `${CLAUDE_SKILL_DIR}` that summarize Java files compactly, saving 70-80% of input tokens.
+You have access to three Python scripts in `${CLAUDE_SKILL_DIR}` that summarize Java files compactly, saving 70-80% of input tokens. Optimized for Spring Boot projects with Lombok, REST controllers, DI wiring, and configuration properties.
+
+## Requirements
+
+Python 3.10+ with these packages (install once):
+```bash
+pip install tree-sitter==0.25.2 tree-sitter-java==0.23.5
+```
 
 ## Tools
 
 ### 1. Single file summary: `jskim.py`
-Summarizes a Java file — collapses imports, fields, boilerplate (getters/setters/equals/hashCode), and shows method signatures with line ranges.
+Summarizes a Java file — collapses imports, fields, boilerplate (getters/setters/equals/hashCode), and shows method signatures with line ranges. Shows annotation parameters for key Spring annotations (`@GetMapping("/path")`, `@Value("${key}")`, `@ConfigurationProperties("prefix")`, etc.).
 
 ```bash
 python3 ${CLAUDE_SKILL_DIR}/jskim.py <file.java>
@@ -27,11 +34,13 @@ python3 ${CLAUDE_SKILL_DIR}/jskim.py A.java B.java C.java               # multip
 - Filters can be combined: `--grep create --annotation @PostMapping`
 
 ### 2. Project map: `jskim_project.py`
-Generates a compact map of all Java files in a directory — packages, classes, annotations, field/method counts, Lombok usage.
+Generates a compact map of all Java files in a directory — packages, classes, annotations, field/method counts, Lombok usage, enum constants.
 
 ```bash
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir>
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --deps                          # import-based dependencies
+python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --endpoints                     # REST endpoint map
+python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --beans                         # Spring bean DI graph + config properties
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --package <prefix>               # filter by package
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --annotation <@Ann>              # filter by class annotation
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --extends <ClassName>            # filter by superclass
@@ -42,7 +51,9 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --extends <ClassName>    
 - `--annotation @RestController` — only show classes with that annotation
 - `--extends BaseService` — only show classes extending that superclass
 - `--deps` — show which classes depend on which (uses imports, runs in seconds even on 2000+ files)
-- Filters can be combined: `--package com.example --annotation @Service --deps`
+- `--endpoints` — list all REST endpoints: HTTP method, path, handler method, line number
+- `--beans` — show Spring bean dependency injection graph + `@ConfigurationProperties` with field details
+- Filters can be combined: `--package com.example --annotation @Service --deps --endpoints --beans`
 
 ### 3. Method extraction: `jskim_method.py`
 Extracts method source code with context (fields, called methods, annotations, Javadoc).
@@ -66,8 +77,8 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_method.py <file.java> <method1> <method2> <met
 // path/to/File.java
 // com.example.billing | 12 imports: java.util(3), jakarta.persistence(2), ...
 // lombok: @Data: getters, setters, toString, equals, hashCode
-// @Service @Transactional
-// public class BillingService extends BaseService implements Auditable
+// @RestController @RequestMapping("/api/v1/billing")
+// public class BillingController extends BaseController
 //
 // fields:
 //   BillingRepository billingRepo (@Autowired)
@@ -78,7 +89,7 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_method.py <file.java> <method1> <method2> <met
 // boilerplate: toString, hashCode, equals  ← collapsed, names only
 // methods:
 //     L45-L62 ( 18 lines): @PostMapping public Bill createBill(BillDTO dto)
-//     L64-L80 ( 17 lines): public void processBill(Long id)
+//     L64-L80 ( 17 lines): @GetMapping("/{id}") public Bill getBill(Long id)
 //
 // inner types:
 //   L90: public static enum Status
@@ -89,10 +100,22 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_method.py <file.java> <method1> <method2> <met
 // total: 120 lines
 ```
 
+For enums:
+```
+// public enum BillStatus
+//
+// constants: DRAFT, PENDING, APPROVED, REJECTED
+//
+// fields:
+//   String label
+```
+
 - `L45-L62` = line range in the file (use with `Read` offset/limit)
 - `( 18 lines)` = method body length
+- Spring annotation parameters are preserved: `@GetMapping("/{id}")`, `@Value("${config.key}")`
 - getters/setters/boilerplate are collapsed to names only — no line ranges, not worth reading
 - `NF` = N fields, `NM` = N methods (used for inner/extra types)
+- Enum constants are listed inline
 
 ### `jskim_project.py` output format
 
@@ -103,9 +126,32 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_method.py <file.java> <method1> <method2> <met
 //   class BillingService @Service [3F | 8M | 120L | lombok:Data]
 //   class BillingRepository @Repository [0F | 5M | 45L]
 //   class BillDTO @Data [7F | 0M | 30L | lombok:Data,Builder]
-//   enum BillStatus [0F | 0M | 15L]
+//   enum BillStatus { DRAFT, PENDING, APPROVED, REJECTED } [0F | 0M | 15L]
 //   interface BillingPort [0F | 3M | 20L]
+```
+
+With `--endpoints`:
+```
+// === REST Endpoints ===
+//   GET     /api/v1/billing         BillingController.list()      L45
+//   POST    /api/v1/billing         BillingController.create()    L62
+//   GET     /api/v1/billing/{id}    BillingController.get()       L70
+//   PUT     /api/v1/billing/{id}    BillingController.update()    L80
+//   DELETE  /api/v1/billing/{id}    BillingController.delete()    L90
+```
+
+With `--beans`:
+```
+// === Bean Dependencies ===
+//   BillingService @Service ← BillingRepository, BillValidator, KafkaTemplate
+//   BillingController @RestController ← BillingService, AuthService
 //
+// === Configuration Properties ===
+//   billing.* (BillingProperties): BigDecimal taxRate, String currency, int maxRetries
+```
+
+With `--deps`:
+```
 // === Dependencies ===
 //   BillingService → BillingRepository, BillDTO, BillingPort
 ```
@@ -113,7 +159,10 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_method.py <file.java> <method1> <method2> <met
 - `NF` = N fields, `NM` = N methods, `NL` = N lines in file
 - `lombok:Data,Builder` = Lombok annotations present on the class
 - `inner:Foo,Bar` = inner classes/enums inside this class
-- Dependencies section (with `--deps`) shows import-based class references
+- Enum constants shown inline: `enum Status { ACTIVE, INACTIVE }`
+- Dependencies (`--deps`) = import-based class references
+- Endpoints (`--endpoints`) = all `@GetMapping`/`@PostMapping`/etc. with full paths
+- Beans (`--beans`) = DI wiring via `@Autowired`, `@RequiredArgsConstructor` + final fields
 
 ### `jskim_method.py` output format
 
@@ -152,10 +201,11 @@ Follow this order to minimize tokens:
 
 1. **Explore** → `jskim_project.py src/` to understand project structure
 2. **Narrow** → `jskim_project.py src/ --package com.example.billing` to focus on relevant package
-3. **Understand** → `jskim.py File.java` to see class structure (fields, methods, line ranges)
-4. **Filter** → `jskim.py File.java --grep billing` if the class has many methods
-5. **Focus** → `jskim_method.py File.java methodA methodB` to read the methods you need
-6. **Edit** → Use `Read` with `offset`/`limit` on only the lines that matter, then `Edit` normally
+3. **Spring context** → `jskim_project.py src/ --endpoints --beans` to see REST API + DI wiring
+4. **Understand** → `jskim.py File.java` to see class structure (fields, methods, line ranges)
+5. **Filter** → `jskim.py File.java --grep billing` if the class has many methods
+6. **Focus** → `jskim_method.py File.java methodA methodB` to read the methods you need
+7. **Edit** → Use `Read` with `offset`/`limit` on only the lines that matter, then `Edit` normally
 
 ### When to use each tool
 
@@ -163,15 +213,24 @@ Follow this order to minimize tokens:
 |---|---|
 | New project, need orientation | `jskim_project.py src/` |
 | Find all REST controllers | `jskim_project.py src/ --annotation @RestController` |
+| See all API endpoints at a glance | `jskim_project.py src/ --endpoints` |
+| See Spring bean DI wiring | `jskim_project.py src/ --beans` |
 | Find all classes extending BaseService | `jskim_project.py src/ --extends BaseService` |
 | Understand a class structure | `jskim.py File.java` |
 | Large class (500+ lines), looking for specific methods | `jskim.py File.java --grep keyword` |
 | Need to read a method's source code | `jskim_method.py File.java methodName` |
 | Need method + related methods together | `jskim_method.py File.java method1 method2 method3` |
-| Small file (<100 lines) | Just use `Read` directly — skim overhead isn't worth it |
+
+### When NOT to use jskim
+
+- **Small files (<100 lines)** — just use `Read` directly, skim overhead isn't worth it
+- **You already have line numbers** — if `Grep` already told you the exact lines, use `Read` with offset/limit directly. Don't waste a tool call on jskim.
+- **Generated code** — JOOQ output, Protobuf stubs, Swagger-generated clients. These are mechanical and don't benefit from summarization.
+- **Non-Java files** — this tool only handles `.java` files
+- **The user asked to read the full file** — respect the request, use `Read`
 
 ### Rules
-- ALWAYS run `jskim.py` before using the `Read` tool on a Java file, unless the file is small (<100 lines) or the user explicitly asks to read the full file
+- Run `jskim.py` before using the `Read` tool on a Java file when you don't already know where to look (no line numbers from grep, no prior context). Skip jskim if you already have the line range you need.
 - Use the line ranges from skim output to `Read` with `offset` and `limit` — never read the whole file when you only need one method
 - When exploring a new Java project, start with `jskim_project.py` to understand the structure
 - For large projects (500+ files), use `--package` to scope `jskim_project.py` output

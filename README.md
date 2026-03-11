@@ -1,6 +1,6 @@
 # jskim
 
-Token-saving Java file reader for Claude Code. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
+Token-saving Java file reader for Claude Code, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
 
 > *A human counted the tokens. An AI counted the getters. Both decided life's too short.*
 
@@ -10,13 +10,13 @@ Token-saving Java file reader for Claude Code. Summarizes Java files compactly u
 pip install -r requirements.txt
 ```
 
-Requires Python 3.8+.
+Requires Python 3.10+.
 
 ## Tools
 
 ### `jskim.py` — Single file summary
 
-Summarizes a Java file: collapses imports, fields, boilerplate (getters/setters/equals/hashCode), and shows method signatures with line ranges.
+Summarizes a Java file: collapses imports, fields, boilerplate (getters/setters/equals/hashCode), and shows method signatures with line ranges. Preserves annotation parameters for key Spring annotations (`@GetMapping("/path")`, `@Value("${key}")`, `@ConfigurationProperties("prefix")`).
 
 ```bash
 python3 jskim.py <file.java>
@@ -27,15 +27,21 @@ python3 jskim.py A.java B.java C.java                # multiple files
 
 ### `jskim_project.py` — Project map
 
-Generates a compact map of all Java files in a directory: packages, classes, annotations, field/method counts, Lombok usage.
+Generates a compact map of all Java files in a directory: packages, classes, annotations, field/method counts, Lombok usage, enum constants.
 
 ```bash
 python3 jskim_project.py <src_dir>
 python3 jskim_project.py <src_dir> --deps                 # import-based dependencies
+python3 jskim_project.py <src_dir> --endpoints             # REST endpoint map
+python3 jskim_project.py <src_dir> --beans                 # Spring bean DI graph + config properties
 python3 jskim_project.py <src_dir> --package <prefix>      # filter by package
 python3 jskim_project.py <src_dir> --annotation <@Ann>     # filter by class annotation
 python3 jskim_project.py <src_dir> --extends <ClassName>   # filter by superclass
 ```
+
+**Spring Boot flags:**
+- `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number
+- `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields) and `@ConfigurationProperties` with prefix + field details
 
 ### `jskim_method.py` — Method extraction
 
@@ -67,10 +73,11 @@ Install by adding the skill directory to your Claude Code configuration. Once in
 
 1. **Explore** — `jskim_project.py src/` to understand project structure
 2. **Narrow** — `jskim_project.py src/ --package com.example.billing` to focus on a package
-3. **Understand** — `jskim.py File.java` to see class structure
-4. **Filter** — `jskim.py File.java --grep billing` for large classes
-5. **Focus** — `jskim_method.py File.java methodA methodB` to read specific methods
-6. **Edit** — Use `Read` with `offset`/`limit` on only the lines that matter
+3. **Spring context** — `jskim_project.py src/ --endpoints --beans` to see REST API + DI wiring
+4. **Understand** — `jskim.py File.java` to see class structure
+5. **Filter** — `jskim.py File.java --grep billing` for large classes
+6. **Focus** — `jskim_method.py File.java methodA methodB` to read specific methods
+7. **Edit** — Use `Read` with `offset`/`limit` on only the lines that matter
 
 ## Dependencies
 

@@ -11,10 +11,10 @@ import re
 from pathlib import Path
 from jskim_util import (
     parse_java_bytes, find_first_type_declaration, get_class_body,
-    get_body_members, get_annotations, get_modifiers_node,
+    get_body_members, get_annotations, get_annotations_rich, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
     extract_field_info, extract_import_path, get_type_keyword,
-    get_declaration_name, get_interfaces,
+    get_declaration_name, get_interfaces, get_enum_constants,
 )
 
 
@@ -122,20 +122,27 @@ METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constr
 def _parse_type_declaration(decl):
     """Parse a single type declaration node and return its structural info."""
     mods = get_modifiers_node(decl)
-    class_annotations = get_annotations(mods)
+    rich_anns = get_annotations_rich(mods)
+    class_annotations = [a["full"] for a in rich_anns]
     class_declaration = build_class_declaration_text(decl)
     class_line = decl.start_point[0] + 1
 
     lombok_notes = []
-    for ann in class_annotations:
-        if ann in LOMBOK_ANNOTATIONS:
-            lombok_notes.append(f"{ann}: {LOMBOK_ANNOTATIONS[ann]}")
+    for a in rich_anns:
+        if a["name"] in LOMBOK_ANNOTATIONS:
+            lombok_notes.append(f"{a['name']}: {LOMBOK_ANNOTATIONS[a['name']]}")
 
     fields = []
     methods = []
     inner_types = []
+    enum_constants_list = []
 
     body = get_class_body(decl)
+
+    # Enum constants
+    if decl.type == "enum_declaration" and body:
+        enum_constants_list = get_enum_constants(body)
+
     for member in get_body_members(body):
         if member.type == "field_declaration":
             field_entries = extract_field_info(member)
@@ -150,7 +157,9 @@ def _parse_type_declaration(decl):
 
         elif member.type in METHOD_NODES:
             sig = build_method_signature(member)
-            anns = get_annotations(get_modifiers_node(member))
+            rich = get_annotations_rich(get_modifiers_node(member))
+            # Use full text (with params) for Spring annotations
+            anns = [a["full"] for a in rich]
             start = member.start_point[0] + 1
             end = member.end_point[0] + 1
             methods.append({
@@ -178,6 +187,7 @@ def _parse_type_declaration(decl):
         "methods": methods,
         "inner_types": inner_types,
         "lombok_notes": lombok_notes,
+        "enum_constants": enum_constants_list,
     }
 
 
@@ -255,6 +265,15 @@ def format_output(parsed, filepath, grep=None, annotation=None):
         out.append(f"// {' '.join(parsed['class_annotations'])}")
     if parsed["class_declaration"]:
         out.append(f"// {parsed['class_declaration']}")
+
+    # Enum constants
+    if parsed.get("enum_constants"):
+        out.append("//")
+        constants = parsed["enum_constants"]
+        if len(constants) <= 10:
+            out.append(f"// constants: {', '.join(constants)}")
+        else:
+            out.append(f"// constants: {', '.join(constants[:8])}, ... +{len(constants) - 8} more")
 
     # Fields
     if parsed["fields"]:

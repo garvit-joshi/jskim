@@ -242,3 +242,172 @@ def _get_modifier_keywords(modifiers_node):
         if child.type in keywords:
             result.append(child.type)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Spring Boot annotation support
+# ---------------------------------------------------------------------------
+
+SPRING_PARAM_ANNOTATIONS = {
+    "@GetMapping", "@PostMapping", "@PutMapping", "@DeleteMapping", "@PatchMapping",
+    "@RequestMapping", "@Value", "@Qualifier", "@Bean", "@Profile", "@Scheduled",
+    "@ConditionalOnProperty", "@ConfigurationProperties",
+    "@Table", "@Column", "@JoinColumn", "@Query",
+}
+
+HTTP_MAPPING_ANNOTATIONS = {
+    "@GetMapping": "GET",
+    "@PostMapping": "POST",
+    "@PutMapping": "PUT",
+    "@DeleteMapping": "DELETE",
+    "@PatchMapping": "PATCH",
+    "@RequestMapping": None,  # determined from method= param
+}
+
+
+def get_annotation_name_from_node(ann_node):
+    """Extract @AnnotationName from a marker_annotation or annotation node."""
+    name_node = ann_node.child_by_field_name("name")
+    if name_node:
+        return "@" + name_node.text.decode()
+    for c in ann_node.children:
+        if c.type in ("identifier", "scoped_identifier"):
+            return "@" + c.text.decode()
+    return None
+
+
+def get_annotations_rich(modifiers_node):
+    """Extract annotations with parameters for key Spring annotations.
+
+    Returns list of dicts:
+      {"name": "@Foo", "params": "(\"bar\")" or None, "full": "@Foo(\"bar\")"}
+    For non-Spring annotations, params is always None and full == name.
+    """
+    if modifiers_node is None or modifiers_node.type != "modifiers":
+        return []
+    result = []
+    for child in modifiers_node.children:
+        if child.type in ("marker_annotation", "annotation"):
+            name = get_annotation_name_from_node(child)
+            if not name:
+                continue
+            params = None
+            if name in SPRING_PARAM_ANNOTATIONS:
+                for sub in child.children:
+                    if sub.type == "annotation_argument_list":
+                        params = sub.text.decode()
+                        break
+            result.append({
+                "name": name,
+                "params": params,
+                "full": f"{name}{params}" if params else name,
+            })
+    return result
+
+
+def _strip_quotes(s):
+    """Strip surrounding double quotes."""
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _find_string_literals(node):
+    """Recursively collect all string literal values from a node subtree."""
+    results = []
+    if node.type == "string_literal":
+        results.append(_strip_quotes(node.text.decode()))
+    for c in node.named_children:
+        results.extend(_find_string_literals(c))
+    return results
+
+
+def _get_evp_key(evp_node):
+    """Get the key identifier from an element_value_pair node."""
+    for c in evp_node.children:
+        if c.type == "identifier":
+            return c.text.decode()
+    return None
+
+
+def extract_mapping_paths(ann_node):
+    """Extract URL path(s) from a Spring @*Mapping annotation.
+
+    Handles: @GetMapping("/p"), @GetMapping(value="/p"), @GetMapping({"/a","/b"})
+    Returns list of path strings.  Empty list if no path specified.
+    """
+    args = None
+    for child in ann_node.children:
+        if child.type == "annotation_argument_list":
+            args = child
+            break
+    if args is None:
+        return []
+
+    paths = []
+    for child in args.named_children:
+        if child.type == "string_literal":
+            paths.append(_strip_quotes(child.text.decode()))
+        elif child.type == "element_value_pair":
+            key = _get_evp_key(child)
+            if key in ("value", "path"):
+                paths.extend(_find_string_literals(child))
+        elif child.type == "element_value_array_initializer":
+            paths.extend(_find_string_literals(child))
+    return paths
+
+
+def extract_request_method(ann_node):
+    """Extract HTTP method from @RequestMapping's method= parameter.
+
+    Returns "GET", "POST", etc. or None.
+    """
+    for child in ann_node.children:
+        if child.type == "annotation_argument_list":
+            for arg in child.named_children:
+                if arg.type == "element_value_pair":
+                    key = _get_evp_key(arg)
+                    if key == "method":
+                        text = arg.text.decode()
+                        for m in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
+                            if m in text:
+                                return m
+    return None
+
+
+def extract_first_annotation_string(ann_node):
+    """Extract the first string literal value from an annotation's arguments.
+
+    Useful for @ConfigurationProperties("prefix"), @Qualifier("name"), etc.
+    """
+    for child in ann_node.children:
+        if child.type == "annotation_argument_list":
+            strings = _find_string_literals(child)
+            return strings[0] if strings else None
+    return None
+
+
+def get_enum_constants(body_node):
+    """Extract enum constant names from an enum body node."""
+    if body_node is None:
+        return []
+    constants = []
+    for child in body_node.named_children:
+        if child.type == "enum_constant":
+            name_node = child.child_by_field_name("name")
+            if name_node:
+                constants.append(name_node.text.decode())
+            else:
+                for c in child.children:
+                    if c.type == "identifier":
+                        constants.append(c.text.decode())
+                        break
+    return constants
+
+
+def is_field_final(field_node):
+    """Check if a field_declaration has the 'final' modifier."""
+    for child in field_node.children:
+        if child.type == "modifiers":
+            return "final" in _get_modifier_keywords(child)
+    return False
