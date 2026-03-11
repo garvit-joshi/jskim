@@ -44,12 +44,14 @@ python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --beans                  
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --package <prefix>               # filter by package
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --annotation <@Ann>              # filter by class annotation
 python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --extends <ClassName>            # filter by superclass
+python3 ${CLAUDE_SKILL_DIR}/jskim_project.py <src_dir> --implements <Interface>        # filter by implemented interface
 ```
 
 **Filters** (essential for large projects with hundreds of files):
 - `--package com.stw.server.tripsheet` — only show classes in that package (prefix match)
 - `--annotation @RestController` — only show classes with that annotation
 - `--extends BaseService` — only show classes extending that superclass
+- `--implements EventPublisher` — only show classes implementing that interface
 - `--deps` — show which classes depend on which (uses imports, runs in seconds even on 2000+ files)
 - `--endpoints` — list all REST endpoints: HTTP method, path, handler method, line number
 - `--beans` — show Spring bean dependency injection graph + `@ConfigurationProperties` with field details
@@ -116,6 +118,7 @@ For enums:
 - getters/setters/boilerplate are collapsed to names only — no line ranges, not worth reading
 - `NF` = N fields, `NM` = N methods (used for inner/extra types)
 - Enum constants are listed inline
+- Static initializer blocks shown with line ranges: `// static initializer (L10-L25, 16 lines)`
 
 ### `jskim_project.py` output format
 
@@ -216,6 +219,7 @@ Follow this order to minimize tokens:
 | See all API endpoints at a glance | `jskim_project.py src/ --endpoints` |
 | See Spring bean DI wiring | `jskim_project.py src/ --beans` |
 | Find all classes extending BaseService | `jskim_project.py src/ --extends BaseService` |
+| Find all implementations of an interface | `jskim_project.py src/ --implements EventPublisher` |
 | Understand a class structure | `jskim.py File.java` |
 | Large class (500+ lines), looking for specific methods | `jskim.py File.java --grep keyword` |
 | Need to read a method's source code | `jskim_method.py File.java methodName` |

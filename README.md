@@ -37,11 +37,13 @@ python3 jskim_project.py <src_dir> --beans                 # Spring bean DI grap
 python3 jskim_project.py <src_dir> --package <prefix>      # filter by package
 python3 jskim_project.py <src_dir> --annotation <@Ann>     # filter by class annotation
 python3 jskim_project.py <src_dir> --extends <ClassName>   # filter by superclass
+python3 jskim_project.py <src_dir> --implements <Name>     # filter by implemented interface
 ```
 
 **Spring Boot flags:**
 - `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number
 - `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields) and `@ConfigurationProperties` with prefix + field details
+- `--implements` — filter classes by implemented interface name
 
 ### `jskim_method.py` — Method extraction
 

@@ -136,6 +136,7 @@ def _parse_type_declaration(decl):
     methods = []
     inner_types = []
     enum_constants_list = []
+    static_initializers = []
 
     body = get_class_body(decl)
 
@@ -169,6 +170,11 @@ def _parse_type_declaration(decl):
                 "annotations": anns,
             })
 
+        elif member.type == "static_initializer":
+            start = member.start_point[0] + 1
+            end = member.end_point[0] + 1
+            static_initializers.append({"start": start, "end": end})
+
         elif member.type in INNER_TYPE_NODES:
             inner_line = member.start_point[0] + 1
             inner_decl = build_class_declaration_text(member)
@@ -188,6 +194,7 @@ def _parse_type_declaration(decl):
         "inner_types": inner_types,
         "lombok_notes": lombok_notes,
         "enum_constants": enum_constants_list,
+        "static_initializers": static_initializers,
     }
 
 
@@ -283,6 +290,13 @@ def format_output(parsed, filepath, grep=None, annotation=None):
             ann = f" ({f['annotations']})" if f["annotations"] else ""
             name = f" {f['name']}" if f["name"] else ""
             out.append(f"//   {f['type']}{name}{ann}")
+
+    # Static initializers
+    if parsed.get("static_initializers"):
+        out.append("//")
+        for si in parsed["static_initializers"]:
+            lines = si["end"] - si["start"] + 1
+            out.append(f"// static initializer (L{si['start']}-L{si['end']}, {lines} lines)")
 
     # Methods
     if parsed["methods"]:

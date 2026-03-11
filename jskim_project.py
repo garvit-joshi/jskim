@@ -8,6 +8,7 @@ Options:
   --package <prefix>     Filter by package prefix (e.g. com.stw.server.tripsheet)
   --annotation <@Ann>    Filter by class-level annotation (e.g. @RestController)
   --extends <ClassName>  Filter by superclass name
+  --implements <Name>    Filter by implemented interface name
 """
 
 import sys
@@ -94,6 +95,7 @@ def _scan_type_declaration(decl):
     bean_deps = []
     fields_detail = []
     enum_constants_list = []
+    static_initializers = []
 
     body = get_class_body(decl)
 
@@ -154,6 +156,11 @@ def _scan_type_declaration(decl):
                                             "line": start_line,
                                         })
 
+        elif member.type == "static_initializer":
+            start = member.start_point[0] + 1
+            end = member.end_point[0] + 1
+            static_initializers.append({"start": start, "end": end})
+
         elif member.type in INNER_TYPE_NODES:
             kw = get_type_keyword(member)
             nm = get_declaration_name(member)
@@ -174,6 +181,7 @@ def _scan_type_declaration(decl):
         "bean_deps": bean_deps,
         "config_prefix": config_prefix,
         "fields_detail": fields_detail,
+        "static_initializers": static_initializers,
     }
 
 
@@ -325,6 +333,10 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
             extras.append(f"{info['total_lines']}L")
             if info["lombok"]:
                 extras.append(f"lombok:{','.join(a.lstrip('@') for a in info['lombok'])}")
+            if info.get("static_initializers"):
+                si = info["static_initializers"]
+                ranges = ", ".join(f"L{s['start']}-L{s['end']}" for s in si)
+                extras.append(f"static-init:{ranges}")
             if info["inner_types"]:
                 extras.append(f"inner:{','.join(t.split()[-1] for t in info['inner_types'])}")
 
@@ -406,6 +418,7 @@ def _parse_args(argv):
     pkg_filter = None
     ann_filter = None
     ext_filter = None
+    impl_filter = None
     i = 0
     while i < len(argv):
         if argv[i] == "--deps":
@@ -426,16 +439,19 @@ def _parse_args(argv):
         elif argv[i] == "--extends" and i + 1 < len(argv):
             ext_filter = argv[i + 1]
             i += 2
+        elif argv[i] == "--implements" and i + 1 < len(argv):
+            impl_filter = argv[i + 1]
+            i += 2
         elif src_dir is None:
             src_dir = argv[i]
             i += 1
         else:
             i += 1
-    return src_dir, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter
+    return src_dir, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter, impl_filter
 
 
-def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter):
-    """Filter file infos by package, annotation, or superclass."""
+def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter=None):
+    """Filter file infos by package, annotation, superclass, or implemented interface."""
     result = file_infos
     if pkg_filter:
         result = [i for i in result if i["package"] and i["package"].startswith(pkg_filter)]
@@ -444,6 +460,10 @@ def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter):
         result = [i for i in result if any(a.startswith(ann) for a in i["annotations"])]
     if ext_filter:
         result = [i for i in result if i["extends"] and ext_filter in i["extends"]]
+    if impl_filter:
+        result = [i for i in result if any(
+            impl_filter in iface.split("<")[0] for iface in i.get("implements", [])
+        )]
     return result
 
 
@@ -451,12 +471,12 @@ def main():
     if len(sys.argv) < 2:
         print(
             "Usage: python3 jskim_project.py <src_dir> [--deps] [--endpoints] [--beans]"
-            " [--package pkg] [--annotation @Ann] [--extends Class]",
+            " [--package pkg] [--annotation @Ann] [--extends Class] [--implements Interface]",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    src_dir_str, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter = (
+    src_dir_str, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter, impl_filter = (
         _parse_args(sys.argv[1:])
     )
 
@@ -481,8 +501,8 @@ def main():
         infos = scan_java_file(f)
         file_infos.extend(infos)
 
-    if pkg_filter or ann_filter or ext_filter:
-        file_infos = _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter)
+    if pkg_filter or ann_filter or ext_filter or impl_filter:
+        file_infos = _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter)
 
     print(format_output(file_infos, show_deps, show_endpoints, show_beans))
 
