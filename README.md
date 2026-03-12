@@ -1,5 +1,9 @@
 # jskim
 
+[![PyPI version](https://img.shields.io/pypi/v/jskim)](https://pypi.org/project/jskim/)
+[![Python](https://img.shields.io/pypi/pyversions/jskim)](https://pypi.org/project/jskim/)
+[![License](https://img.shields.io/github/license/garvit-joshi/jskim)](https://github.com/garvit-joshi/jskim/blob/main/LICENSE.txt)
+
 Token-saving Java file reader for Claude Code, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
 
 > *A human counted the tokens. An AI counted the getters. Both decided life's too short.*

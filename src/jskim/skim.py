@@ -15,6 +15,7 @@ from .util import (
     build_method_signature, build_class_declaration_text,
     extract_field_info, extract_import_path, get_type_keyword,
     get_declaration_name, get_interfaces, get_enum_constants,
+    INNER_TYPE_NODES, METHOD_NODES,
 )
 
 
@@ -109,14 +110,6 @@ def classify_method(sig):
 
     return "business"
 
-
-INNER_TYPE_NODES = {
-    "class_declaration", "interface_declaration",
-    "enum_declaration", "record_declaration",
-    "annotation_type_declaration",
-}
-
-METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
 
 
 def _parse_type_declaration(decl):
@@ -409,10 +402,12 @@ def main():
         print("Error: no files specified", file=sys.stderr)
         sys.exit(1)
 
+    errors = 0
     for arg in files:
         filepath = Path(arg)
         if not filepath.exists():
             print(f"Error: {filepath} not found", file=sys.stderr)
+            errors += 1
             continue
         if not filepath.suffix == ".java":
             print(f"Warning: {filepath} is not a .java file, skipping", file=sys.stderr)
@@ -423,6 +418,9 @@ def main():
         print(format_output(parsed, filepath, grep=grep, annotation=annotation))
         if len(files) > 1:
             print()
+
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -21,16 +21,9 @@ from .util import (
     get_body_members, get_annotations, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
     extract_field_info, get_declaration_name,
+    INNER_TYPE_NODES, METHOD_NODES,
 )
 
-
-INNER_TYPE_NODES = {
-    "class_declaration", "interface_declaration",
-    "enum_declaration", "record_declaration",
-    "annotation_type_declaration",
-}
-
-METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
 
 
 def _parse_type_methods(decl):

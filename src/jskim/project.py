@@ -23,22 +23,9 @@ from .util import (
     get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
     extract_mapping_paths, extract_request_method,
     extract_first_annotation_string,
+    INNER_TYPE_NODES, METHOD_NODES, LOMBOK_SET,
 )
 
-
-LOMBOK_SET = {
-    "@Data", "@Value", "@Getter", "@Setter", "@Builder", "@SuperBuilder",
-    "@NoArgsConstructor", "@AllArgsConstructor", "@RequiredArgsConstructor",
-    "@ToString", "@EqualsAndHashCode", "@Slf4j", "@Log", "@Log4j2",
-}
-
-INNER_TYPE_NODES = {
-    "class_declaration", "interface_declaration",
-    "enum_declaration", "record_declaration",
-    "annotation_type_declaration",
-}
-
-METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
 
 
 def _join_paths(base, method_path):
@@ -418,7 +405,14 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
             out.append("// === Bean Producers (@Bean) ===")
             for name, ann, produces in sorted(producer_entries):
                 ann_str = f" {ann}" if ann else ""
-                out.append(f"//   {name}{ann_str} → {', '.join(produces)}")
+                # Deduplicate while preserving order; show count for repeated types
+                seen = {}
+                for p in produces:
+                    seen[p] = seen.get(p, 0) + 1
+                deduped = []
+                for p, count in seen.items():
+                    deduped.append(f"{p}(x{count})" if count > 1 else p)
+                out.append(f"//   {name}{ann_str} → {', '.join(deduped)}")
             out.append("//")
 
         # Configuration properties

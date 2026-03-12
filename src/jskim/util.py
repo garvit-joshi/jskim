@@ -8,6 +8,21 @@ JAVA_LANGUAGE = tree_sitter.Language(tsjava.language())
 _PARSER = tree_sitter.Parser(JAVA_LANGUAGE)
 
 
+INNER_TYPE_NODES = {
+    "class_declaration", "interface_declaration",
+    "enum_declaration", "record_declaration",
+    "annotation_type_declaration",
+}
+
+METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
+
+LOMBOK_SET = {
+    "@Data", "@Value", "@Getter", "@Setter", "@Builder", "@SuperBuilder",
+    "@NoArgsConstructor", "@AllArgsConstructor", "@RequiredArgsConstructor",
+    "@ToString", "@EqualsAndHashCode", "@Slf4j", "@Log", "@Log4j2",
+}
+
+
 def parse_java_bytes(source_bytes):
     """Parse Java source bytes and return the root node."""
     tree = _PARSER.parse(source_bytes)
