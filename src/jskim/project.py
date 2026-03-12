@@ -14,12 +14,12 @@ Options:
 import sys
 from pathlib import Path
 from collections import defaultdict
-from jskim_util import (
+from .util import (
     parse_java_bytes, find_first_type_declaration, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
     extract_import_path, extract_field_info, get_type_keyword,
     get_declaration_name, get_superclass, get_interfaces,
-    build_class_declaration_text, get_enum_constants, is_field_final,
+    build_class_declaration_text, get_enum_constants, is_field_final, is_field_static,
     get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
     extract_mapping_paths, extract_request_method,
     extract_first_annotation_string,
@@ -93,6 +93,7 @@ def _scan_type_declaration(decl):
     inner_types = []
     endpoints = []
     bean_deps = []
+    bean_produces = []
     fields_detail = []
     enum_constants_list = []
     static_initializers = []
@@ -117,9 +118,10 @@ def _scan_type_declaration(decl):
                 field_mods = get_modifiers_node(member)
                 field_anns = get_annotations(field_mods) if field_mods else []
                 field_final = is_field_final(member)
+                field_static = is_field_static(member)
                 is_injected = (
                     "@Autowired" in field_anns or "@Inject" in field_anns
-                    or (has_constructor_injection and field_final)
+                    or (has_constructor_injection and field_final and not field_static)
                 )
                 if is_injected:
                     for ftype, fname in field_entries:
@@ -130,31 +132,40 @@ def _scan_type_declaration(decl):
         elif member.type in METHOD_NODES:
             method_count += 1
 
+            method_mods = get_modifiers_node(member)
+
             # Endpoint detection for controllers
-            if is_controller:
-                method_mods = get_modifiers_node(member)
-                if method_mods:
-                    for child in method_mods.children:
-                        if child.type in ("marker_annotation", "annotation"):
-                            ann_name = get_annotation_name_from_node(child)
-                            if ann_name in HTTP_MAPPING_ANNOTATIONS:
-                                http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
-                                if http_method is None:
-                                    http_method = extract_request_method(child) or "REQUEST"
-                                method_paths = extract_mapping_paths(child)
-                                if not method_paths:
-                                    method_paths = [""]
-                                name_node = member.child_by_field_name("name")
-                                method_name = name_node.text.decode() if name_node else "?"
-                                start_line = member.start_point[0] + 1
-                                for bp in base_paths:
-                                    for mp in method_paths:
-                                        endpoints.append({
-                                            "method": http_method,
-                                            "path": _join_paths(bp, mp),
-                                            "handler": f"{class_name}.{method_name}()",
-                                            "line": start_line,
-                                        })
+            if is_controller and method_mods:
+                for child in method_mods.children:
+                    if child.type in ("marker_annotation", "annotation"):
+                        ann_name = get_annotation_name_from_node(child)
+                        if ann_name in HTTP_MAPPING_ANNOTATIONS:
+                            http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
+                            if http_method is None:
+                                http_method = extract_request_method(child) or "REQUEST"
+                            method_paths = extract_mapping_paths(child)
+                            if not method_paths:
+                                method_paths = [""]
+                            name_node = member.child_by_field_name("name")
+                            method_name = name_node.text.decode() if name_node else "?"
+                            start_line = member.start_point[0] + 1
+                            for bp in base_paths:
+                                for mp in method_paths:
+                                    endpoints.append({
+                                        "method": http_method,
+                                        "path": _join_paths(bp, mp),
+                                        "handler": f"{class_name}.{method_name}()",
+                                        "line": start_line,
+                                    })
+
+            # @Bean producer detection
+            if method_mods:
+                method_anns = get_annotations(method_mods)
+                if "@Bean" in method_anns:
+                    type_node = member.child_by_field_name("type")
+                    if type_node:
+                        bean_type = type_node.text.decode().split("<")[0].strip()
+                        bean_produces.append(bean_type)
 
         elif member.type == "static_initializer":
             start = member.start_point[0] + 1
@@ -179,6 +190,7 @@ def _scan_type_declaration(decl):
         "enum_constants": enum_constants_list,
         "endpoints": endpoints,
         "bean_deps": bean_deps,
+        "bean_produces": bean_produces,
         "config_prefix": config_prefix,
         "fields_detail": fields_detail,
         "static_initializers": static_initializers,
@@ -389,6 +401,24 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
             for name, ann, deps in sorted(bean_entries):
                 ann_str = f" {ann}" if ann else ""
                 out.append(f"//   {name}{ann_str} ← {', '.join(deps)}")
+            out.append("//")
+
+        # Bean producers (@Bean factory methods)
+        producer_entries = []
+        for info in file_infos:
+            if info.get("bean_produces"):
+                ann = next(
+                    (a for a in info["annotations"] if a in (
+                        "@Configuration", "@Component", "@Service",
+                    )),
+                    "",
+                )
+                producer_entries.append((info["class_name"], ann, info["bean_produces"]))
+        if producer_entries:
+            out.append("// === Bean Producers (@Bean) ===")
+            for name, ann, produces in sorted(producer_entries):
+                ann_str = f" {ann}" if ann else ""
+                out.append(f"//   {name}{ann_str} → {', '.join(produces)}")
             out.append("//")
 
         # Configuration properties

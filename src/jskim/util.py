@@ -411,3 +411,11 @@ def is_field_final(field_node):
         if child.type == "modifiers":
             return "final" in _get_modifier_keywords(child)
     return False
+
+
+def is_field_static(field_node):
+    """Check if a field_declaration has the 'static' modifier."""
+    for child in field_node.children:
+        if child.type == "modifiers":
+            return "static" in _get_modifier_keywords(child)
+    return False

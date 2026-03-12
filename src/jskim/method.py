@@ -16,7 +16,7 @@ Outputs method bodies with surrounding context:
 import sys
 import re
 from pathlib import Path
-from jskim_util import (
+from .util import (
     parse_java_bytes, find_first_type_declaration, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
