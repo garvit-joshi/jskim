@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared tree-sitter utilities for the jskim toolkit."""
 
 import tree_sitter_java as tsjava

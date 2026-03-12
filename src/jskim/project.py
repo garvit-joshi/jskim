@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """jskim_project - Generate a compact project structure map for Java projects.
 
 Usage: python3 jskim_project.py <src_dir> [options]

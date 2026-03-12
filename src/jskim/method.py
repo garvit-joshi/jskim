@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """jskim_method - Extract methods from a Java file with context.
 
 Usage: python3 jskim_method.py <file.java> <method_name> [method2 ...]

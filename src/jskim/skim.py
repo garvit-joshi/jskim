@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """jskim - Summarize Java files to save tokens for Claude Code.
 
 Usage: python3 jskim.py <file.java> [file2.java ...]

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """jskim CLI - unified entry point for Java file skimming."""
 
 import sys
