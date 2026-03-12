@@ -433,3 +433,55 @@ def is_field_static(field_node):
         if child.type == "modifiers":
             return "static" in _get_modifier_keywords(child)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Method call extraction
+# ---------------------------------------------------------------------------
+
+def extract_method_calls(method_node):
+    """Extract method calls from a method/constructor body.
+
+    Returns a deduplicated sorted list of call strings like:
+      ["orderRepo.save", "paymentService.charge", "validate"]
+
+    Only includes calls with a simple object (field/variable identifier) or
+    unqualified calls (same-class methods). Chained/fluent calls (where the
+    object is another method_invocation) are skipped — they are intermediate
+    steps in builder/stream chains and add noise.
+
+    Handles this.field.method() → field.method, this.method() → method.
+    """
+    body = method_node.child_by_field_name("body")
+    if body is None:
+        return []
+    calls = set()
+    _collect_method_calls(body, calls)
+    return sorted(calls)
+
+
+def _collect_method_calls(node, calls):
+    """Recursively collect method invocation strings from an AST subtree."""
+    if node.type == "method_invocation":
+        obj = node.child_by_field_name("object")
+        name = node.child_by_field_name("name")
+        if name:
+            method_name = name.text.decode()
+            if obj is None:
+                calls.add(method_name)
+            elif obj.type == "identifier":
+                calls.add(f"{obj.text.decode()}.{method_name}")
+            elif obj.type == "this":
+                calls.add(method_name)
+            elif obj.type == "super":
+                calls.add(f"super.{method_name}")
+            elif obj.type == "field_access":
+                # Handle this.field.method() → field.method
+                inner_obj = obj.child_by_field_name("object")
+                field = obj.child_by_field_name("field")
+                if inner_obj and inner_obj.type == "this" and field:
+                    calls.add(f"{field.text.decode()}.{method_name}")
+            # else: chained call (object is method_invocation etc.), skip
+
+    for child in node.children:
+        _collect_method_calls(child, calls)

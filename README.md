@@ -49,6 +49,20 @@ jskim <src_dir> --implements <Name>     # filter by implemented interface
 - `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
 - `--implements` — filter classes by implemented interface name
 
+### Diff mode
+
+Summarizes only the Java files and methods changed in a git diff. Ideal for PR reviews.
+
+```bash
+jskim --diff HEAD~1                    # changes since last commit
+jskim --diff main                      # changes vs main branch
+jskim --diff main...feature-branch     # merge-base comparison
+jskim src/ --diff HEAD~1               # scoped to directory
+git diff main | jskim --diff -         # read diff from stdin
+```
+
+Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`. Getters/setters/boilerplate changes are suppressed.
+
 ### Extract methods
 
 ```bash
@@ -56,6 +70,20 @@ jskim <file.java> --list                          # list all methods
 jskim <file.java> <method_name>                    # extract one method
 jskim <file.java> <method1> <method2> <method3>    # extract multiple
 ```
+
+## Method calls (`→`)
+
+Each method in the skim output shows its direct method invocations:
+
+```
+// methods:
+//     L45-L62 ( 18 lines): @PostMapping public Bill createBill(BillDTO dto)
+//                → auditLogger.log, billingService.create, notifyStakeholders, validator.validate
+//     L64-L80 ( 17 lines): @GetMapping("/{id}") public Bill getBill(Long id)
+//                → billingService.findById
+```
+
+Cross-reference the `→` calls with the `fields:` section to trace call flow across files — if a method calls `billingService.create`, the fields show `BillingService billingService`, so skim `BillingService.java` next. Chained/fluent calls (streams, builders) are excluded to keep output compact.
 
 ## Usage as a Claude Code Skill
 
@@ -74,10 +102,11 @@ Install by adding the skill directory to your Claude Code configuration. Once in
 1. **Explore** — `jskim src/` to understand project structure
 2. **Narrow** — `jskim src/ --package com.example.billing` to focus on a package
 3. **Spring context** — `jskim src/ --endpoints --beans` to see REST API + DI wiring
-4. **Understand** — `jskim File.java` to see class structure
-5. **Filter** — `jskim File.java --grep billing` for large classes
-6. **Focus** — `jskim File.java methodA methodB` to read specific methods
-7. **Edit** — Use `Read` with `offset`/`limit` on only the lines that matter
+4. **Understand** — `jskim File.java` to see class structure, fields, methods, and calls
+5. **Trace** — Follow `→` calls by matching field types to find the next class to skim
+6. **Filter** — `jskim File.java --grep billing` for large classes
+7. **Focus** — `jskim File.java methodA methodB` to read specific methods
+8. **Edit** — Use `Read` with `offset`/`limit` on only the lines that matter
 
 ## Dependencies
 

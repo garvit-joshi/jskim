@@ -14,6 +14,7 @@ from .util import (
     build_method_signature, build_class_declaration_text,
     extract_field_info, extract_import_path, get_type_keyword,
     get_declaration_name, get_interfaces, get_enum_constants,
+    extract_method_calls,
     INNER_TYPE_NODES, METHOD_NODES,
 )
 
@@ -155,11 +156,13 @@ def _parse_type_declaration(decl):
             anns = [a["full"] for a in rich]
             start = member.start_point[0] + 1
             end = member.end_point[0] + 1
+            calls = extract_method_calls(member)
             methods.append({
                 "start": start,
                 "end": end,
                 "sig": sig,
                 "annotations": anns,
+                "calls": calls,
             })
 
         elif member.type == "static_initializer":
@@ -336,6 +339,12 @@ def format_output(parsed, filepath, grep=None, annotation=None):
                 if m["annotations"]:
                     ann_str = " " + " ".join(m["annotations"])
                 out.append(f"//   {loc:>12} ({lines:>3} lines):{ann_str} {m['sig']}")
+                calls = m.get("calls", [])
+                if calls:
+                    if len(calls) <= 10:
+                        out.append(f"//                → {', '.join(calls)}")
+                    else:
+                        out.append(f"//                → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
 
     # Inner types
     if parsed["inner_types"]:

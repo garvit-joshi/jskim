@@ -245,6 +245,12 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
             out.append(
                 f"//   [NEW] L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
             )
+            calls = m.get("calls", [])
+            if calls:
+                if len(calls) <= 10:
+                    out.append(f"//     → {', '.join(calls)}")
+                else:
+                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
         out.append("//")
 
     # --- Modified files ---
@@ -317,6 +323,12 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
             out.append(
                 f"//   [NEW]      L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
             )
+            calls = m.get("calls", [])
+            if calls:
+                if len(calls) <= 10:
+                    out.append(f"//     → {', '.join(calls)}")
+                else:
+                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
 
         for m in modified_methods:
             lines = m["end"] - m["start"] + 1
@@ -326,6 +338,12 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
             out.append(
                 f"//   [MODIFIED] L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
             )
+            calls = m.get("calls", [])
+            if calls:
+                if len(calls) <= 10:
+                    out.append(f"//     → {', '.join(calls)}")
+                else:
+                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
 
         for name in deleted_method_names:
             out.append(f"//   [DELETED]  {name}()")

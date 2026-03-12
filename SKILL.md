@@ -74,6 +74,7 @@ git diff main | jskim --diff -         # read diff from stdin
 - `[NEW]` — file or method that was added
 - `[MODIFIED]` — method whose body was changed
 - `[DELETED]` — file or method that was removed
+- `→` calls shown for new/modified methods (same format as file summary)
 - Getters, setters, and boilerplate changes are suppressed (not interesting)
 - Unchanged methods are counted but not listed
 
@@ -104,14 +105,21 @@ jskim <file.java> <method1> <method2> <method3>   # extract multiple
 //
 // fields:
 //   BillingRepository billingRepo (@Autowired)
+//   BillingValidator validator
+//   AuditLogger auditLogger
 //   String tenantId
 //
 // getters: getName, getStatus              <- collapsed, names only
 // setters: setName, setStatus              <- collapsed, names only
 // boilerplate: toString, hashCode, equals  <- collapsed, names only
 // methods:
+//     L18-L21 (  4 lines): public BillingController(BillingService svc, BillingValidator v)
 //     L45-L62 ( 18 lines): @PostMapping public Bill createBill(BillDTO dto)
+//                → auditLogger.log, billingService.create, notifyStakeholders, validator.validate
 //     L64-L80 ( 17 lines): @GetMapping("/{id}") public Bill getBill(Long id)
+//                → billingService.findById
+//     L82-L95 ( 14 lines): @PutMapping("/{id}") public Bill updateBill(Long id, BillDTO dto)
+//                → auditLogger.log, billingService.findById, billingService.update, validator.validate
 //
 // inner types:
 //   L90: public static enum Status
@@ -134,11 +142,35 @@ For enums:
 
 - `L45-L62` = line range in the file (use with `Read` offset/limit)
 - `( 18 lines)` = method body length
+- `→` = method calls — lists direct method invocations made by this method (sorted alphabetically)
+  - Chained/fluent calls (streams, builders) are excluded — only the root call on a simple object is shown
+  - Calls are capped at 10 per method; overflow shown as `... +N more`
+  - Abstract methods and methods with no calls have no `→` line
 - Spring annotation parameters are preserved: `@GetMapping("/{id}")`, `@Value("${config.key}")`
-- getters/setters/boilerplate are collapsed to names only — no line ranges, not worth reading
+- getters/setters/boilerplate are collapsed to names only — no line ranges, no calls, not worth reading
 - `NF` = N fields, `NM` = N methods (used for inner/extra types)
 - Enum constants are listed inline
 - Static initializer blocks shown with line ranges: `// static initializer (L10-L25, 16 lines)`
+
+### Interpreting `→` method calls
+
+The `→` line shows every direct method call inside a method body. Not all calls are equally important. Use the `fields:` section to distinguish signal from noise:
+
+**Signal — dependency calls (match a field in `fields:`):**
+- `billingService.create` → field `BillingService billingService` exists → this is a call to an injected dependency. **Follow this.**
+- `validator.validate` → field `BillingValidator validator` exists → dependency call. **Follow this.**
+- `auditLogger.log` → field `AuditLogger auditLogger` exists → dependency call (usually not worth tracing further, but confirms audit logging happens).
+
+**Signal — same-class calls (no dot prefix):**
+- `notifyStakeholders` → unqualified name → this is a private/inherited method in the same class. Use `jskim File.java notifyStakeholders` to read it.
+
+**Signal — static utility calls (uppercase first letter):**
+- `ResponseEntity.ok`, `Collections.emptyList`, `Integer.parseInt` → framework/JDK utilities. Usually not worth tracing.
+
+**Noise — accessor calls on parameters/locals (do NOT match any field):**
+- `dto.getName`, `order.getId`, `request.getHeader` → these are getter calls on method parameters or local variables. The object name does NOT appear in `fields:`. **Ignore these for tracing.**
+
+**Rule of thumb:** If the object name before the dot matches a field name in the `fields:` section, it's a dependency call worth following. If it doesn't match any field, it's likely an accessor on a parameter or local variable — noise for call tracing.
 
 ### Project map output format
 
@@ -228,10 +260,46 @@ Follow this order to minimize tokens:
 1. **Explore** -> `jskim src/` to understand project structure
 2. **Narrow** -> `jskim src/ --package com.example.billing` to focus on relevant package
 3. **Spring context** -> `jskim src/ --endpoints --beans` to see REST API + DI wiring
-4. **Understand** -> `jskim File.java` to see class structure (fields, methods, line ranges)
-5. **Filter** -> `jskim File.java --grep billing` if the class has many methods
-6. **Focus** -> `jskim File.java methodA methodB` to read the methods you need
-7. **Edit** -> Use `Read` with `offset`/`limit` on only the lines that matter, then `Edit` normally
+4. **Understand** -> `jskim File.java` to see class structure (fields, methods, line ranges, and method calls)
+5. **Trace** -> Use `→` calls to follow execution: match `fieldName.method` against `fields:` to find the target class type, then skim that class to continue
+6. **Filter** -> `jskim File.java --grep billing` if the class has many methods
+7. **Focus** -> `jskim File.java methodA methodB` to read the methods you need
+8. **Edit** -> Use `Read` with `offset`/`limit` on only the lines that matter, then `Edit` normally
+
+### Tracing call flow across files (step-by-step example)
+
+**Goal:** Understand what happens when `POST /api/v1/billing` is called.
+
+```
+Step 1: jskim BillingController.java
+        → See: createBill() calls billingService.create, validator.validate
+        → See fields: BillingService billingService, BillingValidator validator
+
+Step 2: jskim BillingService.java
+        → See: create() calls billingRepo.save, eventPublisher.publish, calculateTax
+        → See fields: BillingRepository billingRepo, EventPublisher eventPublisher
+
+Step 3: jskim BillingService.java calculateTax
+        → Read the method source to understand the tax logic
+
+Done — you traced Controller → Service → Repository in 3 tool calls,
+reading ~50 lines of skim output instead of ~500 lines of raw Java.
+```
+
+### Finding callers (reverse lookup)
+
+The `→` calls show what a method calls (downstream). To find what calls a method (upstream), combine `Grep` with `jskim`:
+
+```
+Goal: Who calls billingService.create()?
+
+Step 1: Grep for "\.create(" across *.java files → find calling files
+Step 2: jskim each calling file → see which methods contain the call and their full context
+```
+
+For finding all usages of a method within the same project:
+- `jskim src/ --grep create` — scans all files but only shows methods matching "create"
+- `Grep "create(" --glob "*.java"` — finds raw references, then skim the files to understand context
 
 ### When to use each tool
 
@@ -245,6 +313,9 @@ Follow this order to minimize tokens:
 | Find all classes extending BaseService | `jskim src/ --extends BaseService` |
 | Find all implementations of an interface | `jskim src/ --implements EventPublisher` |
 | Understand a class structure | `jskim File.java` |
+| Trace call flow downstream | Skim the class → follow `→` field calls → skim the dependency class |
+| Find callers (upstream) | `Grep "methodName("` across `*.java` → skim calling files |
+| Assess impact of a change | Combine downstream (`→`) + upstream (`Grep`) to see full blast radius |
 | Large class (500+ lines), looking for specific methods | `jskim File.java --grep keyword` |
 | Need to read a method's source code | `jskim File.java methodName` |
 | Need method + related methods together | `jskim File.java method1 method2 method3` |
@@ -265,6 +336,7 @@ Follow this order to minimize tokens:
 - For large classes (300+ lines, many methods), use `--grep` or `--annotation` to filter output
 - For editing: use the `Read` tool with offset/limit to get the exact lines, then `Edit` normally — skim is for understanding, not for editing
 - When you need multiple related methods, extract them all in one `jskim File.java method1 method2` call
+- When tracing call flow, check the `→` calls against the `fields:` section to identify dependency calls vs parameter accessor noise
 
 ## Fallback — if jskim crashes
 
