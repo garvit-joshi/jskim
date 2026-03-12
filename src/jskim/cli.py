@@ -13,13 +13,14 @@ def _print_usage():
         "  jskim <file.java> <method> [method2 ...]         Extract method source code\n"
         "  jskim <file.java> --list                         List all methods\n"
         "  jskim <directory> [--deps] [--endpoints] [--beans]  Project structure map\n"
+        "  jskim --diff <ref> [directory]                   Summarize changed files/methods\n"
         "  jskim --version                                  Show version",
         file=sys.stderr,
     )
 
 
 # Flags that consume the next argument as a value
-_FLAGS_WITH_VALUE = {"--grep", "--annotation", "--package", "--extends", "--implements"}
+_FLAGS_WITH_VALUE = {"--grep", "--annotation", "--package", "--extends", "--implements", "--diff"}
 
 
 def main():
@@ -34,6 +35,12 @@ def main():
 
     if sys.argv[1] in ("--help", "-h"):
         _print_usage()
+        return
+
+    # --diff flag -> diff mode (check before directory/file routing)
+    if "--diff" in sys.argv:
+        from .diff import main as diff_main
+        diff_main()
         return
 
     first_arg = sys.argv[1]

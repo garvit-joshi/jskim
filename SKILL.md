@@ -59,6 +59,24 @@ jskim <src_dir> --implements <Interface>        # filter by implemented interfac
 - `--beans` — show Spring bean DI graph, `@Bean` factory method producers, and `@ConfigurationProperties` with field details
 - Filters can be combined: `--package com.example --annotation @Service --deps --endpoints --beans`
 
+### Diff mode
+Summarizes only the Java files and methods changed in a git diff. Ideal for PR reviews — instead of reading full files, get structural context for just the changed parts.
+
+```bash
+jskim --diff HEAD~1                    # changes since last commit
+jskim --diff main                      # changes vs main branch
+jskim --diff main...feature-branch     # merge-base comparison
+jskim src/ --diff HEAD~1               # scoped to directory
+git diff main | jskim --diff -         # read diff from stdin
+```
+
+**Output markers**:
+- `[NEW]` — file or method that was added
+- `[MODIFIED]` — method whose body was changed
+- `[DELETED]` — file or method that was removed
+- Getters, setters, and boilerplate changes are suppressed (not interesting)
+- Unchanged methods are counted but not listed
+
 ### Method extraction
 Extracts method source code with context (fields, called methods, annotations, Javadoc).
 
@@ -219,6 +237,7 @@ Follow this order to minimize tokens:
 
 | Situation | Tool |
 |---|---|
+| PR review / what changed? | `jskim --diff HEAD~1` or `jskim --diff main` |
 | New project, need orientation | `jskim src/` |
 | Find all REST controllers | `jskim src/ --annotation @RestController` |
 | See all API endpoints at a glance | `jskim src/ --endpoints` |
