@@ -89,7 +89,13 @@ Cross-reference the `→` calls with the `fields:` section to trace call flow ac
 
 This project is designed to be used as a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills). The `SKILL.md` file configures the skill behavior, auto-triggering when working with Java files.
 
-Install by adding the skill directory to your Claude Code configuration. Once installed, invoke with `/jskim`:
+Install from the [Vercel Skills Registry](https://skills.claudecode.dev):
+
+```bash
+npx skills add garvit-joshi/jskim
+```
+
+Once installed, invoke with `/jskim`:
 
 ```
 /jskim <file.java>              # summarize a file
