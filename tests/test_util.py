@@ -787,6 +787,98 @@ class TestExtractMethodCalls:
         calls = extract_method_calls(method)
         assert calls == sorted(calls)
 
+    def test_filters_noise_objects(self):
+        """Calls on known noise objects (log, Objects, StringUtils, etc.) are excluded."""
+        source = b"""
+        class Foo {
+            void bar() {
+                log.info("hello");
+                Objects.requireNonNull(x);
+                StringUtils.isBlank(s);
+                service.process();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        calls = extract_method_calls(method)
+        assert "service.process" in calls
+        assert "log.info" not in calls
+        assert "Objects.requireNonNull" not in calls
+        assert "StringUtils.isBlank" not in calls
+
+    def test_filters_noise_methods(self):
+        """Collection/stream methods (put, get, add, stream, etc.) are excluded on any object."""
+        source = b"""
+        class Foo {
+            void bar() {
+                map.put("key", val);
+                list.add(item);
+                set.contains(x);
+                items.stream();
+                service.validate();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        calls = extract_method_calls(method)
+        assert "service.validate" in calls
+        assert "map.put" not in calls
+        assert "list.add" not in calls
+        assert "set.contains" not in calls
+        assert "items.stream" not in calls
+
+    def test_keeps_unqualified_calls(self):
+        """Unqualified calls (same-class methods) are never filtered, even if name matches noise."""
+        source = b"""
+        class Foo {
+            void bar() {
+                validate();
+                isEmpty();
+                toString();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        calls = extract_method_calls(method)
+        assert "validate" in calls
+        assert "isEmpty" in calls
+        assert "toString" in calls
+
+    def test_keeps_business_calls_with_noise_method_names_on_services(self):
+        """A method like cartService.isEmpty() is kept because the object isn't a noise object."""
+        # Wait — isEmpty IS in NOISE_CALL_METHODS so it gets filtered on any object.
+        # This is by design: isEmpty() on a service is extremely rare and not worth the noise.
+        source = b"""
+        class Foo {
+            void bar() {
+                orderService.createOrder();
+                paymentGateway.charge();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        calls = extract_method_calls(method)
+        assert "orderService.createOrder" in calls
+        assert "paymentGateway.charge" in calls
+
+    def test_filters_mixed_noise_and_signal(self):
+        """Real-world scenario: a method with noise and signal calls mixed."""
+        source = b"""
+        class OrderService {
+            void processOrder(Order order) {
+                log.debug("processing");
+                validator.validate(order);
+                MapUtils.isEmpty(order.getExtras());
+                customMap.put("key", "val");
+                orderRepo.save(order);
+                notifyStakeholders();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        calls = extract_method_calls(method)
+        assert calls == ["notifyStakeholders", "order.getExtras", "orderRepo.save", "validator.validate"]
+
 
 # ---------------------------------------------------------------------------
 # Spring annotation helpers

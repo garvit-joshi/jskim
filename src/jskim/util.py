@@ -464,6 +464,45 @@ def is_field_static(field_node):
 # Method call extraction
 # ---------------------------------------------------------------------------
 
+# Object names whose calls are always noise (logging, utilities, primitives).
+NOISE_CALL_OBJECTS = {
+    "log", "logger", "LOG", "LOGGER",
+    "Objects", "StringUtils", "CollectionUtils", "MapUtils", "ArrayUtils",
+    "Optional", "Collections", "Arrays", "Math",
+    "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte", "Short",
+    "Character", "BigDecimal", "BigInteger",
+}
+
+# Method names that are noise when called on any object (collection ops,
+# identity methods, type conversions). Unqualified calls (same-class methods)
+# are never filtered by this set.
+NOISE_CALL_METHODS = {
+    "put", "putAll", "get", "getOrDefault", "add", "addAll", "remove",
+    "removeAll", "contains", "containsKey", "containsAll", "size", "isEmpty",
+    "clear", "entrySet", "keySet", "values", "stream", "iterator",
+    "toString", "valueOf", "hashCode", "equals", "compareTo",
+    "parseInt", "parseLong", "parseDouble", "parseFloat",
+    "of", "ofNullable", "orElse", "orElseGet", "orElseThrow",
+    "isPresent", "ifPresent",
+    "format", "trim", "strip", "toLowerCase", "toUpperCase",
+    "substring", "startsWith", "endsWith", "charAt", "length",
+    "append", "insert", "delete", "replace",
+    "collect", "map", "filter", "flatMap", "forEach", "reduce",
+    "findFirst", "findAny", "anyMatch", "allMatch", "noneMatch",
+    "toList", "toSet", "toMap", "sorted", "distinct", "count",
+    "min", "max", "sum", "average",
+}
+
+
+def _is_noise_call(call_str):
+    """Return True if a call string is boilerplate noise (not business logic)."""
+    if "." not in call_str:
+        # Unqualified call (same-class method) — always keep
+        return False
+    obj, method = call_str.rsplit(".", 1)
+    return obj in NOISE_CALL_OBJECTS or method in NOISE_CALL_METHODS
+
+
 def extract_method_calls(method_node):
     """Extract method calls from a method/constructor body.
 
@@ -475,6 +514,11 @@ def extract_method_calls(method_node):
     object is another method_invocation) are skipped — they are intermediate
     steps in builder/stream chains and add noise.
 
+    Filters out boilerplate noise: collection operations (put, get, add),
+    utility checks (Objects.equals, StringUtils.isBlank), logging (log.info),
+    stream plumbing (stream, collect, map), and type conversions (toString,
+    valueOf). See NOISE_CALL_OBJECTS and NOISE_CALL_METHODS constants.
+
     Handles this.field.method() → field.method, this.method() → method.
     """
     body = method_node.child_by_field_name("body")
@@ -482,7 +526,7 @@ def extract_method_calls(method_node):
         return []
     calls = set()
     _collect_method_calls(body, calls)
-    return sorted(calls)
+    return sorted(c for c in calls if not _is_noise_call(c))
 
 
 def _collect_method_calls(node, calls):

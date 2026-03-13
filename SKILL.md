@@ -144,6 +144,7 @@ For enums:
 - `L45-L62` = line range in the file (use with `Read` offset/limit)
 - `( 18 lines)` = method body length
 - `→` = method calls — lists direct method invocations made by this method (sorted alphabetically)
+  - **Noise is auto-filtered**: collection ops (`put`, `get`, `add`, `remove`, `stream`, `collect`), utility checks (`Objects.equals`, `StringUtils.isBlank`, `MapUtils.isEmpty`), logging (`log.info`, `logger.debug`), type conversions (`toString`, `valueOf`), and stream plumbing (`map`, `filter`, `forEach`) are excluded
   - Chained/fluent calls (streams, builders) are excluded — only the root call on a simple object is shown
   - Calls are capped at 10 per method; overflow shown as `... +N more`
   - Abstract methods and methods with no calls have no `→` line
@@ -155,23 +156,19 @@ For enums:
 
 ### Interpreting `→` method calls
 
-The `→` line shows every direct method call inside a method body. Not all calls are equally important. Use the `fields:` section to distinguish signal from noise:
+The `→` line shows business-logic calls only — boilerplate noise (collection ops, logging, utility checks, stream plumbing, type conversions) is automatically filtered out. What remains is high-signal:
 
-**Signal — dependency calls (match a field in `fields:`):**
-- `billingService.create` → field `BillingService billingService` exists → this is a call to an injected dependency. **Follow this.**
+**Dependency calls (match a field in `fields:`):**
+- `billingService.create` → field `BillingService billingService` exists → injected dependency call. **Follow this.**
 - `validator.validate` → field `BillingValidator validator` exists → dependency call. **Follow this.**
-- `auditLogger.log` → field `AuditLogger auditLogger` exists → dependency call (usually not worth tracing further, but confirms audit logging happens).
 
-**Signal — same-class calls (no dot prefix):**
-- `notifyStakeholders` → unqualified name → this is a private/inherited method in the same class. Use `jskim File.java notifyStakeholders` to read it.
+**Same-class calls (no dot prefix):**
+- `notifyStakeholders` → unqualified name → private/inherited method in the same class. Use `jskim File.java notifyStakeholders` to read it.
 
-**Signal — static utility calls (uppercase first letter):**
-- `ResponseEntity.ok`, `Collections.emptyList`, `Integer.parseInt` → framework/JDK utilities. Usually not worth tracing.
+**Accessor calls on parameters/locals (do NOT match any field):**
+- `dto.getName`, `order.getId` → getter calls on method parameters or local variables. Usually not worth tracing.
 
-**Noise — accessor calls on parameters/locals (do NOT match any field):**
-- `dto.getName`, `order.getId`, `request.getHeader` → these are getter calls on method parameters or local variables. The object name does NOT appear in `fields:`. **Ignore these for tracing.**
-
-**Rule of thumb:** If the object name before the dot matches a field name in the `fields:` section, it's a dependency call worth following. If it doesn't match any field, it's likely an accessor on a parameter or local variable — noise for call tracing.
+**Rule of thumb:** If the object name before the dot matches a field name in the `fields:` section, it's a dependency call worth following. If it doesn't match any field, it's likely an accessor on a parameter or local — lower priority for tracing.
 
 ### Project map output format
 
