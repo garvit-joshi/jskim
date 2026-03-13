@@ -14,9 +14,9 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 from .util import (
-    parse_java_bytes, find_first_type_declaration, get_class_body,
+    parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
-    extract_import_path, extract_field_info, get_type_keyword,
+    extract_field_info, get_type_keyword,
     get_declaration_name, get_superclass, get_interfaces,
     build_class_declaration_text, get_enum_constants, is_field_final, is_field_static,
     get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
@@ -189,34 +189,16 @@ def scan_java_file(filepath):
     Returns a list of info dicts — one per top-level type declaration.
     """
     content = filepath.read_text(encoding="utf-8", errors="replace")
-    root = parse_java_bytes(content.encode("utf-8"))
+    structure = parse_file_structure(content.encode("utf-8"))
     total_lines = len(content.split("\n"))
 
-    package = None
-    imports = []
-    type_infos = []
-
-    for child in root.children:
-        if child.type == "package_declaration":
-            for sub in child.children:
-                if sub.type in ("scoped_identifier", "identifier"):
-                    package = sub.text.decode()
-                    break
-
-        elif child.type == "import_declaration":
-            path = extract_import_path(child)
-            if path:
-                imports.append(path)
-
-        elif child.type in INNER_TYPE_NODES:
-            type_infos.append(_scan_type_declaration(child))
-
     results = []
-    for info in type_infos:
+    for node in structure["type_nodes"]:
+        info = _scan_type_declaration(node)
         results.append({
             "filepath": filepath,
-            "package": package,
-            "imports": imports,
+            "package": structure["package"],
+            "imports": structure["imports"],
             "total_lines": total_lines,
             **info,
         })

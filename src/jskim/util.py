@@ -21,6 +21,12 @@ LOMBOK_SET = {
     "@ToString", "@EqualsAndHashCode", "@Slf4j", "@Log", "@Log4j2",
 }
 
+MODIFIER_KEYWORDS = {
+    "public", "private", "protected", "static", "final",
+    "abstract", "synchronized", "native", "default",
+    "strictfp", "volatile", "transient", "sealed", "non-sealed",
+}
+
 
 def parse_java_bytes(source_bytes):
     """Parse Java source bytes and return the root node."""
@@ -91,15 +97,39 @@ def extract_import_path(import_node):
     return path
 
 
+def parse_file_structure(source_bytes):
+    """Parse a Java file and extract the common top-level structure.
+
+    Returns a dict with:
+      - "package": package name string or None
+      - "imports": list of import path strings
+      - "type_nodes": list of top-level type declaration AST nodes
+    """
+    root = parse_java_bytes(source_bytes)
+    package = None
+    imports = []
+    type_nodes = []
+
+    for child in root.children:
+        if child.type == "package_declaration":
+            for sub in child.children:
+                if sub.type in ("scoped_identifier", "identifier"):
+                    package = sub.text.decode()
+                    break
+        elif child.type == "import_declaration":
+            path = extract_import_path(child)
+            if path:
+                imports.append(path)
+        elif child.type in INNER_TYPE_NODES:
+            type_nodes.append(child)
+
+    return {"package": package, "imports": imports, "type_nodes": type_nodes}
+
+
 def find_first_type_declaration(root):
     """Find the first class/interface/enum/record/@interface declaration in the AST."""
-    type_decl_types = {
-        "class_declaration", "interface_declaration",
-        "enum_declaration", "record_declaration",
-        "annotation_type_declaration",
-    }
     for child in root.children:
-        if child.type in type_decl_types:
+        if child.type in INNER_TYPE_NODES:
             return child
     return None
 
@@ -246,14 +276,9 @@ def extract_field_info(field_node):
 
 def _get_modifier_keywords(modifiers_node):
     """Extract keyword modifiers (public, static, etc.) from a modifiers node."""
-    keywords = {
-        "public", "private", "protected", "static", "final",
-        "abstract", "synchronized", "native", "default",
-        "strictfp", "volatile", "transient", "sealed", "non-sealed",
-    }
     result = []
     for child in modifiers_node.children:
-        if child.type in keywords:
+        if child.type in MODIFIER_KEYWORDS:
             result.append(child.type)
     return result
 

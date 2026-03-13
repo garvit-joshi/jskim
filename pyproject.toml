@@ -45,6 +45,9 @@ Issues = "https://github.com/garvit-joshi/jskim/issues"
 [project.scripts]
 jskim = "jskim.cli:main"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.hatch.version]
 path = "src/jskim/__init__.py"
 

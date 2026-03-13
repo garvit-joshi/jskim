@@ -16,11 +16,11 @@ import sys
 import re
 from pathlib import Path
 from .util import (
-    parse_java_bytes, find_first_type_declaration, get_class_body,
+    parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
     extract_field_info, get_declaration_name,
-    INNER_TYPE_NODES, METHOD_NODES,
+    METHOD_NODES,
 )
 
 
@@ -65,32 +65,24 @@ def _parse_type_methods(decl):
 
 def parse_methods(content):
     """Parse all methods from a Java file using tree-sitter."""
-    root = parse_java_bytes(content.encode("utf-8"))
+    structure = parse_file_structure(content.encode("utf-8"))
     lines = content.split("\n")
 
-    package = None
     class_name = None
     class_declaration = None
     fields = []
     methods = []
 
-    for child in root.children:
-        if child.type == "package_declaration":
-            for sub in child.children:
-                if sub.type in ("scoped_identifier", "identifier"):
-                    package = sub.text.decode()
-                    break
-
-        elif child.type in INNER_TYPE_NODES:
-            cn, cd, fs, ms = _parse_type_methods(child)
-            if class_name is None:
-                class_name = cn
-                class_declaration = cd
-                fields = fs
-            methods.extend(ms)
+    for node in structure["type_nodes"]:
+        cn, cd, fs, ms = _parse_type_methods(node)
+        if class_name is None:
+            class_name = cn
+            class_declaration = cd
+            fields = fs
+        methods.extend(ms)
 
     return {
-        "package": package,
+        "package": structure["package"],
         "class_name": class_name,
         "class_declaration": class_declaration,
         "fields": fields,

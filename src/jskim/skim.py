@@ -9,13 +9,13 @@ import sys
 import re
 from pathlib import Path
 from .util import (
-    parse_java_bytes, find_first_type_declaration, get_class_body,
+    parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_annotations_rich, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
-    extract_field_info, extract_import_path, get_type_keyword,
+    extract_field_info, get_type_keyword,
     get_declaration_name, get_interfaces, get_enum_constants,
     extract_method_calls,
-    INNER_TYPE_NODES, METHOD_NODES,
+    INNER_TYPE_NODES, METHOD_NODES, MODIFIER_KEYWORDS,
 )
 
 
@@ -70,11 +70,7 @@ def classify_method(sig):
         idx = name_match.start()
     before_name = clean[:idx].strip()
     tokens = before_name.split()
-    modifiers = {
-        "public", "private", "protected", "static", "final",
-        "abstract", "synchronized", "native", "default", "strictfp",
-    }
-    non_mod = [t for t in tokens if t not in modifiers and not t.startswith("@")]
+    non_mod = [t for t in tokens if t not in MODIFIER_KEYWORDS and not t.startswith("@")]
 
     if not non_mod and name[0].isupper():
         return "constructor"
@@ -195,27 +191,10 @@ def _parse_type_declaration(decl):
 
 def parse_java(content):
     """Parse a Java file using tree-sitter and extract structural information."""
-    root = parse_java_bytes(content.encode("utf-8"))
+    structure = parse_file_structure(content.encode("utf-8"))
     lines = content.split("\n")
 
-    package = None
-    imports = []
-    type_declarations = []
-
-    for child in root.children:
-        if child.type == "package_declaration":
-            for sub in child.children:
-                if sub.type in ("scoped_identifier", "identifier"):
-                    package = sub.text.decode()
-                    break
-
-        elif child.type == "import_declaration":
-            path = extract_import_path(child)
-            if path:
-                imports.append(path)
-
-        elif child.type in INNER_TYPE_NODES:
-            type_declarations.append(_parse_type_declaration(child))
+    type_declarations = [_parse_type_declaration(node) for node in structure["type_nodes"]]
 
     # Primary class is the first declaration
     primary = type_declarations[0]
@@ -224,8 +203,8 @@ def parse_java(content):
     extra_types = type_declarations[1:]
 
     return {
-        "package": package,
-        "imports": imports,
+        "package": structure["package"],
+        "imports": structure["imports"],
         **primary,
         "extra_types": extra_types,
         "total_lines": len(lines),
