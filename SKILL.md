@@ -2,6 +2,7 @@
 name: jskim
 description: Token-saving Java file reader. Use when working with Java files (.java) to reduce token usage. Auto-triggers when exploring, reading, or understanding Java classes, services, controllers, entities, or any .java files. Run jskim before using the Read tool on Java files to understand structure first, then Read only the lines you need.
 argument-hint: [file-path or src-directory]
+allowed-tools: Bash(jskim:*)
 ---
 
 # jskim — Java Token Saver for Spring Boot
