@@ -12,7 +12,7 @@ from .util import (
     parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_annotations_rich, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
-    extract_field_info, get_type_keyword,
+    extract_field_info, extract_record_components, get_type_keyword,
     get_declaration_name, get_interfaces, get_enum_constants,
     extract_method_calls,
     INNER_TYPE_NODES, METHOD_NODES, MODIFIER_KEYWORDS,
@@ -127,6 +127,10 @@ def _parse_type_declaration(decl):
     enum_constants_list = []
     static_initializers = []
 
+    # Record components (shown as fields)
+    for ftype, fname in extract_record_components(decl):
+        fields.append({"type": ftype, "name": fname, "annotations": ""})
+
     body = get_class_body(decl)
 
     # Enum constants
@@ -196,8 +200,22 @@ def parse_java(content):
 
     type_declarations = [_parse_type_declaration(node) for node in structure["type_nodes"]]
 
-    # Primary class is the first declaration
-    primary = type_declarations[0]
+    if not type_declarations:
+        # Implicitly declared class (Java 23+): no type declaration wrapper
+        primary = {
+            "class_annotations": [],
+            "class_declaration": None,
+            "class_line": 1,
+            "fields": [],
+            "methods": [],
+            "inner_types": [],
+            "lombok_notes": [],
+            "enum_constants": [],
+            "static_initializers": [],
+        }
+    else:
+        # Primary class is the first declaration
+        primary = type_declarations[0]
 
     # Additional top-level classes (package-private helpers, sealed subtypes, etc.)
     extra_types = type_declarations[1:]

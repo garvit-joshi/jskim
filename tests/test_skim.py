@@ -286,6 +286,77 @@ class TestParseJava:
         parsed = parse_java(content)
         assert parsed["total_lines"] == 4
 
+    def test_record_components_as_fields(self):
+        content = "package com.example; public record UserDTO(String name, int age) {}"
+        parsed = parse_java(content)
+        field_names = [f["name"] for f in parsed["fields"]]
+        assert "name" in field_names
+        assert "age" in field_names
+        field_types = [f["type"] for f in parsed["fields"]]
+        assert "String" in field_types
+        assert "int" in field_types
+
+    def test_generic_record_components(self):
+        content = "package com.example; public record Response<T>(T data, String message, int code) {}"
+        parsed = parse_java(content)
+        assert len(parsed["fields"]) == 3
+        field_names = [f["name"] for f in parsed["fields"]]
+        assert "data" in field_names
+        assert "message" in field_names
+        assert "code" in field_names
+
+    def test_record_with_body_methods(self):
+        content = """
+        package com.example;
+        public record Point(int x, int y) {
+            public double distance() { return Math.sqrt(x * x + y * y); }
+        }
+        """
+        parsed = parse_java(content)
+        assert len(parsed["fields"]) == 2
+        assert len(parsed["methods"]) == 1
+        assert "distance" in parsed["methods"][0]["sig"]
+
+    def test_implicitly_declared_class(self):
+        content = 'void main() { System.out.println("Hello"); }'
+        parsed = parse_java(content)
+        assert parsed["class_declaration"] is None
+        assert parsed["total_lines"] == 1
+
+    def test_generic_type_in_declaration(self):
+        content = "package com.example; public class Container<T extends Comparable<T>> {}"
+        parsed = parse_java(content)
+        assert "Container<T extends Comparable<T>>" in parsed["class_declaration"]
+
+    def test_annotation_type_elements(self):
+        content = load_fixture("AnnotationType.java")
+        parsed = parse_java(content)
+        assert "@interface" in parsed["class_declaration"]
+        sigs = [m["sig"] for m in parsed["methods"]]
+        assert any("value()" in s for s in sigs)
+        assert any("priority()" in s for s in sigs)
+        assert any("tags()" in s for s in sigs)
+        assert any("enabled()" in s for s in sigs)
+
+    def test_sealed_interface(self):
+        content = """
+        package com.example;
+        public sealed interface Shape permits Circle, Rectangle {
+            double area();
+        }
+        """
+        parsed = parse_java(content)
+        assert "sealed" in parsed["class_declaration"]
+        assert "interface" in parsed["class_declaration"]
+        assert "permits" in parsed["class_declaration"]
+
+    def test_modern_java_features_fixture(self):
+        content = load_fixture("ModernJavaFeatures.java")
+        parsed = parse_java(content)
+        assert "sealed" in parsed["class_declaration"]
+        assert "Shape<T>" in parsed["class_declaration"]
+        assert len(parsed["extra_types"]) >= 3
+
 
 # ---------------------------------------------------------------------------
 # format_output
@@ -409,6 +480,35 @@ class TestFormatOutput:
         for line in output.split("\n"):
             assert line.startswith("//"), f"Line not prefixed: {line!r}"
 
+    def test_record_fields_in_output(self):
+        content = "package com.example; public record UserDTO(String name, int age) {}"
+        parsed = parse_java(content)
+        output = format_output(parsed, "UserDTO.java")
+        assert "fields:" in output
+        assert "String name" in output
+        assert "int age" in output
+
+    def test_generic_class_declaration_in_output(self):
+        content = "package com.example; public class Foo<T> extends Bar<T> {}"
+        parsed = parse_java(content)
+        output = format_output(parsed, "Foo.java")
+        assert "Foo<T>" in output
+        assert "extends Bar<T>" in output
+
+    def test_annotation_type_elements_in_output(self):
+        content = load_fixture("AnnotationType.java")
+        parsed = parse_java(content)
+        output = format_output(parsed, "AnnotationType.java")
+        assert "value()" in output
+        assert "priority()" in output
+
+    def test_implicit_class_output(self):
+        content = load_fixture("ImplicitClass.java")
+        parsed = parse_java(content)
+        output = format_output(parsed, "ImplicitClass.java")
+        assert output.startswith("//")
+        assert "total:" in output
+
 
 # ---------------------------------------------------------------------------
 # Integration tests with real fixture files
@@ -418,6 +518,7 @@ class TestSkimFixtureFiles:
     """Test that skim can parse and format every fixture file without errors."""
 
     @pytest.fixture(params=[
+        "AnnotationType.java",
         "AnonClassFields.java",
         "AppConfiguration.java",
         "BillingCalculator.java",
@@ -429,11 +530,13 @@ class TestSkimFixtureFiles:
         "ContractType.java",
         "EdgeCaseBugs.java",
         "HealthConfiguration.java",
+        "ImplicitClass.java",
         "InlineAnnotations.java",
         "LambdaEdgeCases.java",
         "LambdaFields.java",
         "MammothRawTripDataReportTaskDefinitions.java",
         "MammothRawTripRowMapper.java",
+        "ModernJavaFeatures.java",
         "NestedAnnotations.java",
         "RawTripDataReportTaskDefinitions.java",
         "RawTripRowMapper.java",

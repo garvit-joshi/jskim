@@ -157,6 +157,35 @@ class TestScanJavaFile:
         info = infos[0]
         assert len(info["bean_produces"]) > 0
 
+    def test_record_components_counted(self):
+        path = fixture_path("ModernJavaFeatures.java")
+        infos = scan_java_file(path)
+        # Find the Point record
+        point = next(i for i in infos if i["class_name"] == "Point")
+        assert point["class_type"] == "record"
+        assert point["field_count"] == 2  # x, y
+
+    def test_generic_record_components(self):
+        path = fixture_path("ModernJavaFeatures.java")
+        infos = scan_java_file(path)
+        response = next(i for i in infos if i["class_name"] == "Response")
+        assert response["class_type"] == "record"
+        assert response["field_count"] == 3  # data, message, code
+
+    def test_annotation_type_methods_counted(self):
+        path = fixture_path("AnnotationType.java")
+        infos = scan_java_file(path)
+        info = infos[0]
+        assert info["class_type"] == "@interface"
+        assert info["method_count"] == 4  # value, priority, tags, enabled
+
+    def test_sealed_interface_scanned(self):
+        path = fixture_path("ModernJavaFeatures.java")
+        infos = scan_java_file(path)
+        shape = next(i for i in infos if i["class_name"] == "Shape")
+        assert shape["class_type"] == "interface"
+        assert shape["method_count"] == 2  # area, perimeter
+
 
 # ---------------------------------------------------------------------------
 # find_dependencies

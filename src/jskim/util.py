@@ -13,7 +13,10 @@ INNER_TYPE_NODES = {
     "annotation_type_declaration",
 }
 
-METHOD_NODES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
+METHOD_NODES = {
+    "method_declaration", "constructor_declaration",
+    "compact_constructor_declaration", "annotation_type_element_declaration",
+}
 
 LOMBOK_SET = {
     "@Data", "@Value", "@Getter", "@Setter", "@Builder", "@SuperBuilder",
@@ -136,7 +139,7 @@ def find_first_type_declaration(root):
 
 def get_class_body(decl_node):
     """Get the body node from a type declaration (class_body, interface_body, enum_body, etc.)."""
-    body_types = {"class_body", "interface_body", "enum_body", "record_body", "annotation_type_body"}
+    body_types = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
     for child in decl_node.children:
         if child.type in body_types:
             return child
@@ -232,7 +235,10 @@ def build_class_declaration_text(decl_node):
             parts.append(" ".join(kws))
 
     parts.append(get_type_keyword(decl_node))
-    parts.append(get_declaration_name(decl_node))
+
+    name = get_declaration_name(decl_node)
+    type_params = _get_type_parameters(decl_node)
+    parts.append(f"{name}{type_params}" if type_params else name)
 
     superclass = get_superclass(decl_node)
     if superclass:
@@ -281,6 +287,42 @@ def _get_modifier_keywords(modifiers_node):
         if child.type in MODIFIER_KEYWORDS:
             result.append(child.type)
     return result
+
+
+def _get_type_parameters(decl_node):
+    """Extract the type_parameters text (e.g. '<T extends Comparable<T>>') from a declaration."""
+    for child in decl_node.children:
+        if child.type == "type_parameters":
+            return child.text.decode()
+    return None
+
+
+def extract_record_components(decl_node):
+    """Extract record component types and names from a record declaration.
+
+    Returns a list of (type_str, name_str) tuples, one per component.
+    E.g., 'record Point(int x, int y)' -> [('int', 'x'), ('int', 'y')]
+    Returns an empty list for non-record declarations or if no parameters found.
+    """
+    if decl_node.type != "record_declaration":
+        return []
+    for child in decl_node.children:
+        if child.type == "formal_parameters":
+            result = []
+            for param in child.named_children:
+                if param.type == "formal_parameter":
+                    type_text = None
+                    name_text = None
+                    for sub in param.children:
+                        if sub.type == "identifier":
+                            name_text = sub.text.decode()
+                        elif sub.type != "modifiers":
+                            if type_text is None:
+                                type_text = sub.text.decode()
+                    if type_text and name_text:
+                        result.append((type_text, name_text))
+            return result
+    return []
 
 
 # ---------------------------------------------------------------------------

@@ -237,3 +237,58 @@ class TestExtractMethods:
         output = extract_methods(parsed, ["isSingleEscortTrip"])
         # The Javadoc above isSingleEscortTrip should be captured
         assert "single escort trip" in output.lower()
+
+
+# ---------------------------------------------------------------------------
+# Record and @interface support
+# ---------------------------------------------------------------------------
+
+class TestModernJavaFeatures:
+    def test_record_components_as_fields(self):
+        content = """
+        package com.example;
+        public record UserDTO(String name, int age) {
+            public String displayName() { return name.toUpperCase(); }
+        }
+        """
+        parsed = parse_methods(content)
+        assert any("String name" in f for f in parsed["fields"])
+        assert any("int age" in f for f in parsed["fields"])
+        names = [m["name"] for m in parsed["methods"]]
+        assert "displayName" in names
+
+    def test_annotation_type_elements(self):
+        content = load_fixture("AnnotationType.java")
+        parsed = parse_methods(content)
+        names = [m["name"] for m in parsed["methods"]]
+        assert "value" in names
+        assert "priority" in names
+        assert "tags" in names
+        assert "enabled" in names
+
+    def test_annotation_type_list_methods(self):
+        content = load_fixture("AnnotationType.java")
+        parsed = parse_methods(content)
+        output = list_methods(parsed)
+        assert "value()" in output
+        assert "priority()" in output
+
+    def test_generic_class_declaration(self):
+        content = """
+        package com.example;
+        public class Container<T extends Comparable<T>> {
+            private T value;
+            public T getValue() { return value; }
+        }
+        """
+        parsed = parse_methods(content)
+        assert "Container<T extends Comparable<T>>" in parsed["class_declaration"]
+
+    def test_modern_java_features_fixture(self):
+        content = load_fixture("ModernJavaFeatures.java")
+        parsed = parse_methods(content)
+        names = [m["name"] for m in parsed["methods"]]
+        assert "area" in names
+        assert "perimeter" in names
+        assert "describe" in names
+        assert "distance" in names

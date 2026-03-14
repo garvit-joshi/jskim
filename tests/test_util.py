@@ -19,6 +19,7 @@ from jskim.util import (
     get_modifiers_node,
     build_class_declaration_text,
     extract_field_info,
+    extract_record_components,
     get_enum_constants,
     is_field_final,
     is_field_static,
@@ -1006,7 +1007,7 @@ class TestConstants:
     def test_method_nodes_complete(self):
         expected = {
             "method_declaration", "constructor_declaration",
-            "compact_constructor_declaration",
+            "compact_constructor_declaration", "annotation_type_element_declaration",
         }
         assert METHOD_NODES == expected
 
@@ -1030,3 +1031,194 @@ class TestConstants:
         assert HTTP_MAPPING_ANNOTATIONS["@GetMapping"] == "GET"
         assert HTTP_MAPPING_ANNOTATIONS["@PostMapping"] == "POST"
         assert HTTP_MAPPING_ANNOTATIONS["@RequestMapping"] is None
+
+
+# ---------------------------------------------------------------------------
+# extract_record_components
+# ---------------------------------------------------------------------------
+
+class TestExtractRecordComponents:
+    def test_simple_record(self):
+        root = parse_java_bytes(b"record Point(int x, int y) {}")
+        decl = find_first_type_declaration(root)
+        components = extract_record_components(decl)
+        assert len(components) == 2
+        assert ("int", "x") in components
+        assert ("int", "y") in components
+
+    def test_generic_record(self):
+        root = parse_java_bytes(b"record Pair<A, B>(A first, B second) {}")
+        decl = find_first_type_declaration(root)
+        components = extract_record_components(decl)
+        assert len(components) == 2
+        assert ("A", "first") in components
+        assert ("B", "second") in components
+
+    def test_record_with_generic_types(self):
+        root = parse_java_bytes(b"record Response<T>(T data, List<String> tags, int code) {}")
+        decl = find_first_type_declaration(root)
+        components = extract_record_components(decl)
+        assert len(components) == 3
+        assert components[0] == ("T", "data")
+        assert components[1] == ("List<String>", "tags")
+        assert components[2] == ("int", "code")
+
+    def test_non_record_returns_empty(self):
+        root = parse_java_bytes(b"class Foo { int x; }")
+        decl = find_first_type_declaration(root)
+        assert extract_record_components(decl) == []
+
+    def test_enum_returns_empty(self):
+        root = parse_java_bytes(b"enum Foo { A }")
+        decl = find_first_type_declaration(root)
+        assert extract_record_components(decl) == []
+
+
+# ---------------------------------------------------------------------------
+# build_class_declaration_text — type parameters
+# ---------------------------------------------------------------------------
+
+class TestBuildClassDeclarationTypeParams:
+    def test_generic_class(self):
+        root = parse_java_bytes(b"public class Container<T> {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert text == "public class Container<T>"
+
+    def test_bounded_generic_class(self):
+        root = parse_java_bytes(b"public class Container<T extends Comparable<T>> {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "Container<T extends Comparable<T>>" in text
+
+    def test_generic_interface(self):
+        root = parse_java_bytes(b"public interface Validator<T> {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert text == "public interface Validator<T>"
+
+    def test_generic_record(self):
+        root = parse_java_bytes(b"public record Pair<A, B>(A first, B second) {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert text == "public record Pair<A, B>"
+
+    def test_sealed_generic_interface(self):
+        source = b"public sealed interface Shape<T> permits Circle, Rectangle {}"
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "Shape<T>" in text
+        assert "permits" in text
+
+    def test_no_type_params_unchanged(self):
+        root = parse_java_bytes(b"public class Foo {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert text == "public class Foo"
+
+    def test_generic_with_extends_and_implements(self):
+        source = b"public class Foo<T> extends Bar<T> implements Baz<T> {}"
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "Foo<T>" in text
+        assert "extends Bar<T>" in text
+        assert "implements Baz<T>" in text
+
+
+# ---------------------------------------------------------------------------
+# build_method_signature — annotation_type_element_declaration
+# ---------------------------------------------------------------------------
+
+class TestAnnotationTypeElements:
+    def _get_elements(self, source):
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        body = get_class_body(decl)
+        return [m for m in get_body_members(body) if m.type in METHOD_NODES]
+
+    def test_simple_element(self):
+        elements = self._get_elements(b"@interface Foo { String value(); }")
+        assert len(elements) == 1
+        sig = build_method_signature(elements[0])
+        assert "String" in sig
+        assert "value()" in sig
+
+    def test_element_with_default(self):
+        elements = self._get_elements(b"@interface Foo { int count() default 1; }")
+        assert len(elements) == 1
+        sig = build_method_signature(elements[0])
+        assert "int" in sig
+        assert "count()" in sig
+        assert "default" in sig
+
+    def test_multiple_elements(self):
+        source = b"""
+        @interface Foo {
+            String value();
+            int priority() default 0;
+            boolean enabled() default true;
+        }
+        """
+        elements = self._get_elements(source)
+        assert len(elements) == 3
+        names = [build_method_signature(e) for e in elements]
+        assert any("value()" in n for n in names)
+        assert any("priority()" in n for n in names)
+        assert any("enabled()" in n for n in names)
+
+    def test_extract_method_calls_empty_for_elements(self):
+        elements = self._get_elements(b"@interface Foo { String value(); }")
+        calls = extract_method_calls(elements[0])
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Sealed interface support
+# ---------------------------------------------------------------------------
+
+class TestSealedInterface:
+    def test_sealed_interface_type(self):
+        root = parse_java_bytes(b"sealed interface Shape permits Circle {}")
+        decl = find_first_type_declaration(root)
+        assert get_type_keyword(decl) == "interface"
+
+    def test_sealed_interface_permits(self):
+        root = parse_java_bytes(b"sealed interface Shape permits Circle, Rectangle {}")
+        decl = find_first_type_declaration(root)
+        permits = get_permits(decl)
+        assert "Circle" in permits
+        assert "Rectangle" in permits
+
+    def test_sealed_interface_declaration_text(self):
+        root = parse_java_bytes(b"public sealed interface Shape permits Circle {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "sealed" in text
+        assert "interface" in text
+        assert "Shape" in text
+        assert "permits" in text
+        assert "Circle" in text
+
+
+# ---------------------------------------------------------------------------
+# Record with implements
+# ---------------------------------------------------------------------------
+
+class TestRecordWithImplements:
+    def test_record_implements(self):
+        source = b"public record Point(int x, int y) implements Comparable<Point> {}"
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        ifaces = get_interfaces(decl)
+        assert len(ifaces) == 1
+        assert "Comparable<Point>" in ifaces[0]
+
+    def test_record_declaration_with_implements(self):
+        source = b"public record Point(int x, int y) implements Comparable<Point> {}"
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "record Point" in text
+        assert "implements" in text

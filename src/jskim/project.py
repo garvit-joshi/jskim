@@ -16,7 +16,7 @@ from collections import defaultdict
 from .util import (
     parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
-    extract_field_info, get_type_keyword,
+    extract_field_info, extract_record_components, get_type_keyword,
     get_declaration_name, get_superclass, get_interfaces,
     build_class_declaration_text, get_enum_constants, is_field_final, is_field_static,
     get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
@@ -83,6 +83,12 @@ def _scan_type_declaration(decl):
     fields_detail = []
     enum_constants_list = []
     static_initializers = []
+
+    # Record components count as fields
+    record_components = extract_record_components(decl)
+    field_count += len(record_components)
+    for ftype, fname in record_components:
+        fields_detail.append({"type": ftype, "name": fname})
 
     body = get_class_body(decl)
 

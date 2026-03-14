@@ -19,7 +19,7 @@ from .util import (
     parse_file_structure, get_class_body,
     get_body_members, get_annotations, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
-    extract_field_info, get_declaration_name,
+    extract_field_info, extract_record_components, get_declaration_name,
     METHOD_NODES,
 )
 
@@ -31,6 +31,10 @@ def _parse_type_methods(decl):
     class_declaration = build_class_declaration_text(decl)
     fields = []
     methods = []
+
+    # Record components (shown as fields)
+    for ftype, fname in extract_record_components(decl):
+        fields.append(f"{ftype} {fname}" if fname else ftype)
 
     body = get_class_body(decl)
     for member in get_body_members(body):
