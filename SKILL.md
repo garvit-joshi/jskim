@@ -16,6 +16,11 @@ Python 3.10+ — install via pip:
 pip install jskim
 ```
 
+**Before first use**, verify jskim is installed by running `jskim --version`. If you get "command not found", tell the user:
+> jskim is not installed. Install it with: `pip install jskim`
+
+Do not attempt to run jskim commands until it is confirmed installed. Fall back to the `Read` tool if the user declines to install it.
+
 ## Usage
 
 `jskim` auto-detects whether you're pointing at a file or directory, and whether you're asking for a summary or method extraction.
