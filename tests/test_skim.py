@@ -438,8 +438,9 @@ class TestFormatOutput:
         # Only methods matching "fetch" should appear in business methods
         lines = output.split("\n")
         method_lines = [l for l in lines if "lines):" in l]
+        assert len(method_lines) > 0, "grep filter should still show matching methods"
         for ml in method_lines:
-            assert "fetch" in ml.lower() or "send" not in ml.lower()
+            assert "fetch" in ml.lower(), f"Non-matching method leaked through grep filter: {ml}"
 
     def test_annotation_filter(self):
         content = load_fixture("AppConfiguration.java")
