@@ -303,7 +303,8 @@ For finding all usages of a method within the same project:
 
 | Situation | Tool |
 |---|---|
-| PR review / what changed? | `jskim --diff HEAD~1` or `jskim --diff main` |
+| PR review / what changed? (large diff, 1000+ lines) | `jskim --diff develop` to triage, then `git diff` for details |
+| PR review / what changed? (small diff, < 1000 lines) | `git diff develop...HEAD` directly — skip jskim |
 | New project, need orientation | `jskim src/` |
 | Find all REST controllers | `jskim src/ --annotation @RestController` |
 | See all API endpoints at a glance | `jskim src/ --endpoints` |
@@ -318,10 +319,30 @@ For finding all usages of a method within the same project:
 | Need to read a method's source code | `jskim File.java methodName` |
 | Need method + related methods together | `jskim File.java method1 method2 method3` |
 
+### When to use `jskim --diff` vs `git diff`
+
+`jskim --diff` gives **structural context** — which methods were added, modified, or deleted, with signatures and call graphs. `git diff` gives the **actual code changes**. They serve different purposes:
+
+**Use `jskim --diff` when:**
+- The diff is large (1000+ lines, 10+ files) and you need to triage what changed before diving in
+- Changed files are large (300+ lines each) — skim tells you which methods were affected without reading entire files
+- You need to understand the shape/scope of changes across many files before reviewing details
+- You want to identify which modified methods call what, to assess blast radius
+
+**Use `git diff` directly (skip `jskim --diff`) when:**
+- The diff is small (< ~1000 lines total) — you can read the entire diff faster than running jskim and then reading the diff anyway
+- All changed files are small (< 150 lines each) — the skim output is roughly the same size as the raw diff, so it saves nothing
+- You've already read the full `git diff` — running jskim after is redundant
+- You need to review actual code logic, not just structure — jskim shows signatures and call graphs, not the changed lines themselves. For bug hunting and code review, you still need the real diff
+
+**Key insight:** `jskim --diff` is a **triage tool**, not a replacement for reading the diff. Use it first on large diffs to decide where to focus, then read the actual changes with `git diff` or `Read`. On small diffs, skip it entirely and go straight to `git diff`.
+
 ### When NOT to use jskim
 
 - **Small files (<100 lines)** — just use `Read` directly, skim overhead isn't worth it
+- **Small diffs (< ~1000 lines)** — `git diff` is faster and gives you more useful information than `jskim --diff`
 - **You already have line numbers** — if `Grep` already told you the exact lines, use `Read` with offset/limit directly. Don't waste a tool call on jskim.
+- **You already read the full diff** — don't run `jskim --diff` after reading `git diff`; the structural info is already in context
 - **Generated code** — JOOQ output, Protobuf stubs, Swagger-generated clients. These are mechanical and don't benefit from summarization.
 - **Non-Java files** — this tool only handles `.java` files
 - **The user asked to read the full file** — respect the request, use `Read`
