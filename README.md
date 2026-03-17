@@ -89,7 +89,7 @@ Cross-reference the `→` calls with the `fields:` section to trace call flow ac
 
 This project is designed to be used as a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills). The `SKILL.md` file configures the skill behavior, auto-triggering when working with Java files.
 
-Install from the [Vercel Skills Registry](https://skills.claudecode.dev):
+Install from the [Vercel Skills Registry]([https://skills.claudecode.dev](https://skills.sh/garvit-joshi/jskim/jskim)):
 
 ```bash
 npx skills add garvit-joshi/jskim
