@@ -38,6 +38,110 @@ def _join_paths(base, method_path):
     return base.rstrip("/") + "/" + method_path.lstrip("/")
 
 
+def _scan_members(
+    members,
+    class_type,
+    class_name,
+    annotations,
+    is_controller=False,
+    is_spring_bean=False,
+    has_constructor_injection=False,
+    base_paths=None,
+):
+    """Scan fields, methods, and nested types from a member list."""
+    if not base_paths:
+        base_paths = [""]
+
+    field_count = 0
+    method_count = 0
+    inner_types = []
+    endpoints = []
+    bean_deps = []
+    bean_produces = []
+    fields_detail = []
+    static_initializers = []
+
+    for member in members:
+        if member.type == "field_declaration":
+            field_entries = extract_field_info(member)
+            field_count += len(field_entries)
+
+            for ftype, fname in field_entries:
+                fields_detail.append({"type": ftype, "name": fname})
+
+            if is_spring_bean:
+                field_mods = get_modifiers_node(member)
+                field_anns = get_annotations(field_mods) if field_mods else []
+                field_final = is_field_final(member)
+                field_static = is_field_static(member)
+                is_injected = (
+                    "@Autowired" in field_anns or "@Inject" in field_anns
+                    or (has_constructor_injection and field_final and not field_static)
+                )
+                if is_injected:
+                    for ftype, fname in field_entries:
+                        if ftype:
+                            dep_type = ftype.split("<")[0].strip()
+                            bean_deps.append(dep_type)
+
+        elif member.type in METHOD_NODES:
+            method_count += 1
+
+            method_mods = get_modifiers_node(member)
+
+            if is_controller and method_mods:
+                for child in method_mods.children:
+                    if child.type in ("marker_annotation", "annotation"):
+                        ann_name = get_annotation_name_from_node(child)
+                        if ann_name in HTTP_MAPPING_ANNOTATIONS:
+                            http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
+                            if http_method is None:
+                                http_method = extract_request_method(child) or "REQUEST"
+                            method_paths = extract_mapping_paths(child)
+                            if not method_paths:
+                                method_paths = [""]
+                            name_node = member.child_by_field_name("name")
+                            method_name = name_node.text.decode() if name_node else "?"
+                            start_line = member.start_point[0] + 1
+                            for bp in base_paths:
+                                for mp in method_paths:
+                                    endpoints.append({
+                                        "method": http_method,
+                                        "path": _join_paths(bp, mp),
+                                        "handler": f"{class_name}.{method_name}()",
+                                        "line": start_line,
+                                    })
+
+            if method_mods:
+                method_anns = get_annotations(method_mods)
+                if "@Bean" in method_anns:
+                    type_node = member.child_by_field_name("type")
+                    if type_node:
+                        bean_type = type_node.text.decode().split("<")[0].strip()
+                        bean_produces.append(bean_type)
+
+        elif member.type == "static_initializer":
+            start = member.start_point[0] + 1
+            end = member.end_point[0] + 1
+            static_initializers.append({"start": start, "end": end})
+
+        elif member.type in INNER_TYPE_NODES:
+            kw = get_type_keyword(member)
+            nm = get_declaration_name(member)
+            inner_types.append(f"{kw} {nm}")
+
+    return {
+        "field_count": field_count,
+        "method_count": method_count,
+        "inner_types": inner_types,
+        "endpoints": endpoints,
+        "bean_deps": bean_deps,
+        "bean_produces": bean_produces,
+        "fields_detail": fields_detail,
+        "static_initializers": static_initializers,
+    }
+
+
 def _scan_type_declaration(decl):
     """Extract structural info from a single type declaration node."""
     class_type = get_type_keyword(decl)
@@ -74,100 +178,25 @@ def _scan_type_declaration(decl):
     if not base_paths:
         base_paths = [""]
 
-    field_count = 0
-    method_count = 0
-    inner_types = []
-    endpoints = []
-    bean_deps = []
-    bean_produces = []
-    fields_detail = []
     enum_constants_list = []
-    static_initializers = []
-
-    # Record components count as fields
-    record_components = extract_record_components(decl)
-    field_count += len(record_components)
-    for ftype, fname in record_components:
-        fields_detail.append({"type": ftype, "name": fname})
 
     body = get_class_body(decl)
+    scanned_members = _scan_members(
+        get_body_members(body),
+        class_type,
+        class_name,
+        annotations,
+        is_controller=is_controller,
+        is_spring_bean=is_spring_bean,
+        has_constructor_injection=has_constructor_injection,
+        base_paths=base_paths,
+    )
 
-    # Enum constants
     if class_type == "enum" and body:
         enum_constants_list = get_enum_constants(body)
 
-    for member in get_body_members(body):
-        if member.type == "field_declaration":
-            field_entries = extract_field_info(member)
-            field_count += len(field_entries)
-
-            # Collect field details for config-properties display
-            for ftype, fname in field_entries:
-                fields_detail.append({"type": ftype, "name": fname})
-
-            # Bean dependency detection
-            if is_spring_bean:
-                field_mods = get_modifiers_node(member)
-                field_anns = get_annotations(field_mods) if field_mods else []
-                field_final = is_field_final(member)
-                field_static = is_field_static(member)
-                is_injected = (
-                    "@Autowired" in field_anns or "@Inject" in field_anns
-                    or (has_constructor_injection and field_final and not field_static)
-                )
-                if is_injected:
-                    for ftype, fname in field_entries:
-                        if ftype:
-                            dep_type = ftype.split("<")[0].strip()
-                            bean_deps.append(dep_type)
-
-        elif member.type in METHOD_NODES:
-            method_count += 1
-
-            method_mods = get_modifiers_node(member)
-
-            # Endpoint detection for controllers
-            if is_controller and method_mods:
-                for child in method_mods.children:
-                    if child.type in ("marker_annotation", "annotation"):
-                        ann_name = get_annotation_name_from_node(child)
-                        if ann_name in HTTP_MAPPING_ANNOTATIONS:
-                            http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
-                            if http_method is None:
-                                http_method = extract_request_method(child) or "REQUEST"
-                            method_paths = extract_mapping_paths(child)
-                            if not method_paths:
-                                method_paths = [""]
-                            name_node = member.child_by_field_name("name")
-                            method_name = name_node.text.decode() if name_node else "?"
-                            start_line = member.start_point[0] + 1
-                            for bp in base_paths:
-                                for mp in method_paths:
-                                    endpoints.append({
-                                        "method": http_method,
-                                        "path": _join_paths(bp, mp),
-                                        "handler": f"{class_name}.{method_name}()",
-                                        "line": start_line,
-                                    })
-
-            # @Bean producer detection
-            if method_mods:
-                method_anns = get_annotations(method_mods)
-                if "@Bean" in method_anns:
-                    type_node = member.child_by_field_name("type")
-                    if type_node:
-                        bean_type = type_node.text.decode().split("<")[0].strip()
-                        bean_produces.append(bean_type)
-
-        elif member.type == "static_initializer":
-            start = member.start_point[0] + 1
-            end = member.end_point[0] + 1
-            static_initializers.append({"start": start, "end": end})
-
-        elif member.type in INNER_TYPE_NODES:
-            kw = get_type_keyword(member)
-            nm = get_declaration_name(member)
-            inner_types.append(f"{kw} {nm}")
+    record_components = extract_record_components(decl)
+    record_fields = [{"type": ftype, "name": fname} for ftype, fname in record_components]
 
     return {
         "class_type": class_type,
@@ -176,16 +205,38 @@ def _scan_type_declaration(decl):
         "lombok": lombok_anns,
         "extends": extends,
         "implements": ifaces,
-        "field_count": field_count,
-        "method_count": method_count,
-        "inner_types": inner_types,
+        "field_count": len(record_fields) + scanned_members["field_count"],
+        "method_count": scanned_members["method_count"],
+        "inner_types": scanned_members["inner_types"],
         "enum_constants": enum_constants_list,
-        "endpoints": endpoints,
-        "bean_deps": bean_deps,
-        "bean_produces": bean_produces,
+        "endpoints": scanned_members["endpoints"],
+        "bean_deps": scanned_members["bean_deps"],
+        "bean_produces": scanned_members["bean_produces"],
         "config_prefix": config_prefix,
-        "fields_detail": fields_detail,
-        "static_initializers": static_initializers,
+        "fields_detail": record_fields + scanned_members["fields_detail"],
+        "static_initializers": scanned_members["static_initializers"],
+    }
+
+
+def _scan_implicit_source_file(filepath, program_members):
+    """Scan the implicit class produced by a Java simple source file."""
+    class_name = filepath.stem
+    scanned_members = _scan_members(
+        program_members,
+        "implicit class",
+        class_name,
+        [],
+    )
+    return {
+        "class_type": "implicit class",
+        "class_name": class_name,
+        "annotations": [],
+        "lombok": [],
+        "extends": None,
+        "implements": [],
+        "enum_constants": [],
+        "config_prefix": None,
+        **scanned_members,
     }
 
 
@@ -199,8 +250,8 @@ def scan_java_file(filepath):
     total_lines = len(content.split("\n"))
 
     results = []
-    for node in structure["type_nodes"]:
-        info = _scan_type_declaration(node)
+    if structure["program_members"]:
+        info = _scan_implicit_source_file(filepath, structure["program_members"])
         results.append({
             "filepath": filepath,
             "package": structure["package"],
@@ -208,6 +259,16 @@ def scan_java_file(filepath):
             "total_lines": total_lines,
             **info,
         })
+    else:
+        for node in structure["type_nodes"]:
+            info = _scan_type_declaration(node)
+            results.append({
+                "filepath": filepath,
+                "package": structure["package"],
+                "imports": structure["imports"],
+                "total_lines": total_lines,
+                **info,
+            })
 
     return results
 
@@ -263,6 +324,25 @@ def find_dependencies(file_info_list):
     return deps
 
 
+def _count_unique_files(file_infos):
+    """Count files and lines once per filepath, not once per top-level type."""
+    unique_files = {}
+    fallback_count = 0
+    fallback_lines = 0
+
+    for info in file_infos:
+        filepath = info.get("filepath")
+        if filepath is None:
+            fallback_count += 1
+            fallback_lines += info.get("total_lines", 0)
+            continue
+
+        if filepath not in unique_files:
+            unique_files[filepath] = info.get("total_lines", 0)
+
+    return len(unique_files) + fallback_count, sum(unique_files.values()) + fallback_lines
+
+
 def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=False):
     """Format the project map."""
     out = []
@@ -272,16 +352,15 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
         pkg = info["package"] or "(default)"
         packages[pkg].append(info)
 
-    total_files = len(file_infos)
-    total_lines = sum(info["total_lines"] for info in file_infos)
+    total_files, total_lines = _count_unique_files(file_infos)
 
     out.append(f"// Project Map: {total_files} files, {total_lines} lines")
     out.append("//")
 
     for pkg in sorted(packages.keys()):
         infos = sorted(packages[pkg], key=lambda x: x["class_name"] or "")
-        pkg_lines = sum(i["total_lines"] for i in infos)
-        out.append(f"// {pkg} ({len(infos)} files, {pkg_lines} lines)")
+        pkg_files, pkg_lines = _count_unique_files(infos)
+        out.append(f"// {pkg} ({pkg_files} files, {pkg_lines} lines)")
 
         for info in infos:
             name = info["class_name"] or "(unknown)"
@@ -309,7 +388,8 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
             if info["extends"]:
                 desc += f" extends {info['extends']}"
             if info["implements"]:
-                desc += f" implements {', '.join(info['implements'])}"
+                keyword = "extends" if ctype == "interface" else "implements"
+                desc += f" {keyword} {', '.join(info['implements'])}"
 
             extras = []
             if info["field_count"]:

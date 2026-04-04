@@ -1,5 +1,7 @@
 """Tests for jskim.diff — git diff summarization."""
 
+import subprocess
+
 import pytest
 from jskim.diff import parse_diff_output, _changes_overlap, _resolve_base_ref, format_diff_output
 from pathlib import Path
@@ -409,3 +411,48 @@ class TestDiffIntegration:
         statuses = {f["status"] for f in files}
         assert "added" in statuses
         assert "deleted" in statuses
+
+
+class TestDiffOverloads:
+    def _format_repo_diff(self, tmp_path, old_source, new_source):
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+
+        path = tmp_path / "Foo.java"
+        path.write_text(old_source, encoding="utf-8")
+        subprocess.run(["git", "add", "Foo.java"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=tmp_path, check=True)
+
+        path.write_text(new_source, encoding="utf-8")
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        changed = parse_diff_output(diff)
+        return format_diff_output(changed, tmp_path, "HEAD")
+
+    def test_added_overload_marked_new(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    void foo(int x) {}\n}\n",
+            "class Foo {\n    void foo(int x) {}\n    void foo(String x) {}\n}\n",
+        )
+        assert "[NEW]" in output
+        assert "void foo(String x)" in output
+        assert "[MODIFIED]" not in output
+
+    def test_replaced_overload_marked_new_and_deleted(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    void foo(int x) {}\n}\n",
+            "class Foo {\n    void foo(String x) {}\n}\n",
+        )
+        assert "[NEW]" in output
+        assert "[DELETED]" in output
+        assert "void foo(String x)" in output
+        assert "void foo(int x)" in output
+        assert "[MODIFIED]" not in output

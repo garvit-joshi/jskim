@@ -29,6 +29,8 @@ jskim <file.java> --annotation <@Ann>     # filter methods by annotation
 jskim A.java B.java C.java                # multiple files
 ```
 
+Java simple source files without an explicit type wrapper are summarized as `implicit class <FileStem>`, and their top-level methods are treated like normal class methods.
+
 ### Project map
 
 Generates a compact map of all Java files in a directory: packages, classes, annotations, field/method counts, Lombok usage, enum constants.
@@ -62,6 +64,7 @@ git diff main | jskim --diff -         # read diff from stdin
 ```
 
 Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`. Getters/setters/boilerplate changes are suppressed.
+Deleted methods are shown with their previous signature when a base ref is available, so overload removals stay distinguishable.
 
 ### Extract methods
 

@@ -1,5 +1,7 @@
 """Shared tree-sitter utilities for the jskim toolkit."""
 
+from pathlib import Path
+
 import tree_sitter_java as tsjava
 import tree_sitter
 
@@ -13,10 +15,16 @@ INNER_TYPE_NODES = {
     "annotation_type_declaration",
 }
 
+PROGRAM_STRUCTURE_NODES = {"package_declaration", "import_declaration"}
+
 METHOD_NODES = {
     "method_declaration", "constructor_declaration",
     "compact_constructor_declaration", "annotation_type_element_declaration",
 }
+
+IMPLICIT_CLASS_MEMBER_NODES = METHOD_NODES | {"field_declaration", "static_initializer"}
+
+PARAMETER_NODES = {"formal_parameter", "spread_parameter", "receiver_parameter"}
 
 LOMBOK_SET = {
     "@Data", "@Value", "@Getter", "@Setter", "@Builder", "@SuperBuilder",
@@ -81,6 +89,40 @@ def build_method_signature(node):
     return sig
 
 
+def build_method_identity(node):
+    """Build a stable method identity using just the name and parameter types."""
+    name_node = node.child_by_field_name("name")
+    if not name_node:
+        for child in node.children:
+            if child.type == "identifier":
+                name_node = child
+                break
+    name = name_node.text.decode() if name_node else "unknown"
+
+    params_node = node.child_by_field_name("parameters")
+    if params_node is None:
+        for child in node.children:
+            if child.type == "formal_parameters":
+                params_node = child
+                break
+
+    param_types = []
+    if params_node is not None:
+        for param in params_node.named_children:
+            if param.type not in PARAMETER_NODES:
+                continue
+            type_node = param.child_by_field_name("type")
+            if type_node is not None:
+                type_text = type_node.text.decode()
+                if param.type == "spread_parameter":
+                    type_text += "..."
+                param_types.append(type_text)
+            else:
+                param_types.append(param.text.decode())
+
+    return f"{name}({', '.join(param_types)})"
+
+
 def extract_import_path(import_node):
     """Extract the import path string from an import_declaration node.
 
@@ -107,13 +149,17 @@ def parse_file_structure(source_bytes):
       - "package": package name string or None
       - "imports": list of import path strings
       - "type_nodes": list of top-level type declaration AST nodes
+      - "program_members": implicit-class members when the file has loose
+        top-level declarations (methods, fields, nested types, etc.)
     """
     root = parse_java_bytes(source_bytes)
     package = None
     imports = []
     type_nodes = []
+    program_members = []
+    non_structure_nodes = []
 
-    for child in root.children:
+    for child in root.named_children:
         if child.type == "package_declaration":
             for sub in child.children:
                 if sub.type in ("scoped_identifier", "identifier"):
@@ -123,10 +169,23 @@ def parse_file_structure(source_bytes):
             path = extract_import_path(child)
             if path:
                 imports.append(path)
-        elif child.type in INNER_TYPE_NODES:
-            type_nodes.append(child)
+        elif child.type not in PROGRAM_STRUCTURE_NODES:
+            non_structure_nodes.append(child)
 
-    return {"package": package, "imports": imports, "type_nodes": type_nodes}
+    if any(child.type in IMPLICIT_CLASS_MEMBER_NODES for child in non_structure_nodes):
+        program_members = [
+            child for child in non_structure_nodes
+            if child.type in IMPLICIT_CLASS_MEMBER_NODES or child.type in INNER_TYPE_NODES
+        ]
+    else:
+        type_nodes = [child for child in non_structure_nodes if child.type in INNER_TYPE_NODES]
+
+    return {
+        "package": package,
+        "imports": imports,
+        "type_nodes": type_nodes,
+        "program_members": program_members,
+    }
 
 
 def find_first_type_declaration(root):
@@ -187,6 +246,15 @@ def get_declaration_name(decl_node):
     return None
 
 
+def build_implicit_class_declaration(source_name=None):
+    """Build a display label for a Java simple source file's implicit class."""
+    if source_name:
+        stem = Path(str(source_name)).stem
+        if stem:
+            return f"implicit class {stem}"
+    return "implicit class"
+
+
 def get_superclass(decl_node):
     """Extract the extends clause text (just the type, not the 'extends' keyword)."""
     for child in decl_node.children:
@@ -198,9 +266,13 @@ def get_superclass(decl_node):
 
 
 def get_interfaces(decl_node):
-    """Extract implemented interface names as a list of strings."""
+    """Extract related interface names as a list of strings.
+
+    For classes/records, this returns implemented interfaces.
+    For interfaces, this returns extended interfaces.
+    """
     for child in decl_node.children:
-        if child.type == "super_interfaces":
+        if child.type in ("super_interfaces", "extends_interfaces"):
             for sub in child.children:
                 if sub.type == "type_list":
                     return [t.text.decode() for t in sub.named_children]
@@ -247,7 +319,7 @@ def build_class_declaration_text(decl_node):
 
     ifaces = get_interfaces(decl_node)
     if ifaces:
-        parts.append("implements")
+        parts.append("extends" if decl_node.type == "interface_declaration" else "implements")
         parts.append(", ".join(" ".join(i.split()) for i in ifaces))
 
     permits = get_permits(decl_node)

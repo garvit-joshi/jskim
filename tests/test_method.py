@@ -114,6 +114,14 @@ class TestParseMethods:
         assert "area" in names  # present in multiple classes
         assert "getColor" in names
 
+    def test_implicit_class_methods(self):
+        content = load_fixture("ImplicitClass.java")
+        parsed = parse_methods(content, source_name="ImplicitClass.java")
+        assert parsed["class_name"] == "ImplicitClass"
+        assert parsed["class_declaration"] == "implicit class ImplicitClass"
+        assert len(parsed["methods"]) == 1
+        assert parsed["methods"][0]["name"] == "main"
+
 
 # ---------------------------------------------------------------------------
 # list_methods
@@ -157,6 +165,13 @@ class TestListMethods:
         output = list_methods(parsed)
         assert "cabUpdateEventKafkaListenerContainerFactory" in output
         assert "cabCreationEventConsumerFactory" in output
+
+    def test_implicit_class_list_methods(self):
+        content = load_fixture("ImplicitClass.java")
+        parsed = parse_methods(content, source_name="ImplicitClass.java")
+        output = list_methods(parsed)
+        assert "implicit class ImplicitClass" in output
+        assert "main()" in output
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +252,13 @@ class TestExtractMethods:
         output = extract_methods(parsed, ["isSingleEscortTrip"])
         # The Javadoc above isSingleEscortTrip should be captured
         assert "single escort trip" in output.lower()
+
+    def test_implicit_class_extract(self):
+        content = load_fixture("ImplicitClass.java")
+        parsed = parse_methods(content, source_name="ImplicitClass.java")
+        output = extract_methods(parsed, ["main"])
+        assert "implicit class ImplicitClass" in output
+        assert "Hello from implicit class" in output
 
 
 # ---------------------------------------------------------------------------

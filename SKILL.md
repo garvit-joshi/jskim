@@ -35,6 +35,8 @@ jskim <file.java> --annotation <@Ann>    # filter methods by annotation
 jskim A.java B.java C.java               # multiple files
 ```
 
+Java simple source files without an explicit type wrapper are summarized as `implicit class <FileStem>`, and their top-level methods are treated like normal class methods.
+
 **Filters** (useful for large files with many methods):
 - `--grep billing` — show only methods whose signature contains "billing" (case-insensitive)
 - `--annotation @Transactional` — show only methods with that annotation
@@ -80,6 +82,7 @@ git diff main | jskim --diff -         # read diff from stdin
 - `[NEW]` — file or method that was added
 - `[MODIFIED]` — method whose body was changed
 - `[DELETED]` — file or method that was removed
+- Deleted methods are shown with their previous signature when the base ref is available, so overload removals stay distinguishable
 - `→` calls shown for new/modified methods (same format as file summary)
 - Getters, setters, and boilerplate changes are suppressed (not interesting)
 - Unchanged methods are counted but not listed
@@ -134,6 +137,18 @@ jskim <file.java> <method1> <method2> <method3>   # extract multiple
 //   L100: class BillingHelper [2F, 3M]     <- 2F = 2 fields, 3M = 3 methods
 //
 // total: 120 lines
+```
+
+For Java simple source files:
+```
+// SomeScript.java
+// (default) | 0 imports
+// implicit class SomeScript
+//
+// methods:
+//         L1-L3 (  3 lines): void main()
+//
+// total: 3 lines
 ```
 
 For enums:
@@ -255,6 +270,7 @@ With `--deps`:
 - `fields:` lists class fields for context
 - `called methods in same class` shows other methods referenced in the extracted method bodies
 - `// not found: methodX` appears if a requested method name wasn't found
+- Simple source files use the same format with an `implicit class <FileStem>` header
 
 ## Workflow
 

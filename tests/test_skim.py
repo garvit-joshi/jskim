@@ -320,7 +320,9 @@ class TestParseJava:
     def test_implicitly_declared_class(self):
         content = 'void main() { System.out.println("Hello"); }'
         parsed = parse_java(content)
-        assert parsed["class_declaration"] is None
+        assert parsed["class_declaration"] == "implicit class"
+        assert len(parsed["methods"]) == 1
+        assert parsed["methods"][0]["sig"] == "void main()"
         assert parsed["total_lines"] == 1
 
     def test_generic_type_in_declaration(self):
@@ -505,9 +507,11 @@ class TestFormatOutput:
 
     def test_implicit_class_output(self):
         content = load_fixture("ImplicitClass.java")
-        parsed = parse_java(content)
+        parsed = parse_java(content, source_name="ImplicitClass.java")
         output = format_output(parsed, "ImplicitClass.java")
         assert output.startswith("//")
+        assert "implicit class ImplicitClass" in output
+        assert "void main()" in output
         assert "total:" in output
 
 

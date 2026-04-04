@@ -6,6 +6,7 @@ from jskim.util import (
     get_annotations,
     get_annotations_rich,
     build_method_signature,
+    build_method_identity,
     extract_import_path,
     parse_file_structure,
     find_first_type_declaration,
@@ -131,6 +132,13 @@ class TestParseFileStructure:
         result = parse_file_structure(source)
         assert len(result["type_nodes"]) == 1
         assert result["type_nodes"][0].type == "annotation_type_declaration"
+
+    def test_implicit_source_members(self):
+        source = b"void main() { System.out.println(\"Hello\"); }"
+        result = parse_file_structure(source)
+        assert result["type_nodes"] == []
+        assert len(result["program_members"]) == 1
+        assert result["program_members"][0].type == "method_declaration"
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +294,14 @@ class TestGetInterfaces:
         decl = find_first_type_declaration(root)
         ifaces = get_interfaces(decl)
         assert len(ifaces) == 2
+
+    def test_interface_extends_interfaces(self):
+        root = parse_java_bytes(b"interface Foo extends Bar, Baz {}")
+        decl = find_first_type_declaration(root)
+        ifaces = get_interfaces(decl)
+        assert len(ifaces) == 2
+        assert "Bar" in ifaces
+        assert "Baz" in ifaces
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +539,35 @@ class TestBuildMethodSignature:
         assert "bar()" in sig
 
 
+class TestBuildMethodIdentity:
+    def _get_first_method(self, source):
+        root = parse_java_bytes(source)
+        decl = find_first_type_declaration(root)
+        body = get_class_body(decl)
+        for member in get_body_members(body):
+            if member.type in METHOD_NODES:
+                return member
+        return None
+
+    def test_method_uses_parameter_types(self):
+        method = self._get_first_method(
+            b"class Foo { void bar(int count, @A final String name) {} }"
+        )
+        assert build_method_identity(method) == "bar(int, String)"
+
+    def test_constructor_identity(self):
+        method = self._get_first_method(b"class Foo { Foo(int count) {} }")
+        assert build_method_identity(method) == "Foo(int)"
+
+    def test_compact_constructor_identity(self):
+        method = self._get_first_method(b"record Foo(int count) { Foo {} }")
+        assert build_method_identity(method) == "Foo()"
+
+    def test_annotation_element_identity(self):
+        method = self._get_first_method(b"@interface Foo { String value(); }")
+        assert build_method_identity(method) == "value()"
+
+
 # ---------------------------------------------------------------------------
 # build_class_declaration_text
 # ---------------------------------------------------------------------------
@@ -545,6 +590,12 @@ class TestBuildClassDeclarationText:
         decl = find_first_type_declaration(root)
         text = build_class_declaration_text(decl)
         assert "implements Serializable" in text
+
+    def test_interface_with_extends(self):
+        root = parse_java_bytes(b"public interface Foo extends Serializable, AutoCloseable {}")
+        decl = find_first_type_declaration(root)
+        text = build_class_declaration_text(decl)
+        assert "extends Serializable, AutoCloseable" in text
 
     def test_sealed_class_with_permits(self):
         source = b"public sealed class Shape permits Circle, Rectangle {}"
