@@ -49,7 +49,7 @@ All notable changes to jskim are documented here.
 
 ## [0.1.0] - 2026-03-12
 
-Initial release. Token-saving Java file reader for Claude Code.
+Initial release. Token-saving Java file reader for AI coding agents.
 
 ### Features
 - **File summary** — collapses imports, fields, boilerplate; shows method signatures with line ranges
@@ -58,4 +58,4 @@ Initial release. Token-saving Java file reader for Claude Code.
 - **Diff mode** — summarize only files/methods changed in a git diff
 - **Spring Boot support** — REST endpoint map, bean DI graph, Bean producers, ConfigurationProperties, Lombok awareness
 - **Unified CLI** — single `jskim` command auto-detects mode
-- **Claude Code skill** — auto-triggers when working with .java files
+- **Agent skill definition** — supports skill-enabled environments when working with `.java` files

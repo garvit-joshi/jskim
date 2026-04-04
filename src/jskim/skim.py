@@ -1,4 +1,4 @@
-"""jskim - Summarize Java files to save tokens for Claude Code.
+"""jskim - Summarize Java files to save tokens for AI coding agents.
 
 Usage: python3 jskim.py <file.java> [file2.java ...]
        python3 jskim.py <file.java> --grep <pattern>

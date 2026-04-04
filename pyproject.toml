@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jskim"
 dynamic = ["version"]
-description = "Token-saving Java file reader for Claude Code. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens."
+description = "Token-saving Java file reader for AI coding agents. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = [
     "java",
-    "claude-code",
+    "ai-agents",
     "tree-sitter",
     "spring-boot",
     "token-saving",

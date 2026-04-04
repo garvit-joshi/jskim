@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/jskim)](https://pypi.org/project/jskim/)
 [![License](https://img.shields.io/github/license/garvit-joshi/jskim)](https://github.com/garvit-joshi/jskim/blob/main/LICENSE.txt)
 
-Token-saving Java file reader for Claude Code, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
+Token-saving Java file reader for AI coding agents, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
 
 > *A human counted the tokens. An AI counted the getters. Both decided life's too short.*
 
@@ -88,17 +88,17 @@ Each method in the skim output shows its direct method invocations:
 
 Cross-reference the `→` calls with the `fields:` section to trace call flow across files — if a method calls `billingService.create`, the fields show `BillingService billingService`, so skim `BillingService.java` next. Chained/fluent calls (streams, builders) are excluded to keep output compact.
 
-## Usage as a Claude Code Skill
+## Usage in Skill-enabled Agents
 
-This project is designed to be used as a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills). The `SKILL.md` file configures the skill behavior, auto-triggering when working with Java files.
+Any coding agent that can run shell commands can use `jskim` directly. The repo also includes a `SKILL.md` definition for environments that support skill-style tool packaging and auto-triggering.
 
-Install from the [Vercel Skills Registry]([https://skills.claudecode.dev](https://skills.sh/garvit-joshi/jskim/jskim)):
+One published install path for skill-enabled environments is the [Vercel Skills Registry](https://skills.sh/garvit-joshi/jskim/jskim):
 
 ```bash
 npx skills add garvit-joshi/jskim
 ```
 
-Once installed, invoke with `/jskim`:
+In hosts that expose the skill as a slash command, invoke it with `/jskim`:
 
 ```
 /jskim <file.java>              # summarize a file
@@ -115,7 +115,7 @@ Once installed, invoke with `/jskim`:
 5. **Trace** — Follow `→` calls by matching field types to find the next class to skim
 6. **Filter** — `jskim File.java --grep billing` for large classes
 7. **Focus** — `jskim File.java methodA methodB` to read specific methods
-8. **Edit** — Use `Read` with `offset`/`limit` on only the lines that matter
+8. **Edit** — Read only the specific lines you need from the source file before editing
 
 ## Dependencies
 

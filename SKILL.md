@@ -1,6 +1,6 @@
 ---
 name: jskim
-description: Token-saving Java file reader. Use when working with Java files (.java) to reduce token usage. Auto-triggers when exploring, reading, or understanding Java classes, services, controllers, entities, or any .java files. Run jskim before using the Read tool on Java files to understand structure first, then Read only the lines you need.
+description: Token-saving Java file reader. Use when working with Java files (.java) to reduce token usage. Auto-triggers when exploring, reading, or understanding Java classes, services, controllers, entities, or any .java files. Run jskim before reading raw Java source when you need structural context first, then inspect only the lines you need.
 argument-hint: [file-path or src-directory]
 allowed-tools: Bash(jskim:*)
 ---
@@ -19,7 +19,7 @@ pip install jskim
 **Before first use**, verify jskim is installed by running `jskim --version`. If you get "command not found", tell the user:
 > jskim is not installed. Install it with: `pip install jskim`
 
-Do not attempt to run jskim commands until it is confirmed installed. Fall back to the `Read` tool if the user declines to install it.
+Do not attempt to run jskim commands until it is confirmed installed. Fall back to your normal file-reading tools if the user declines to install it.
 
 ## Usage
 
@@ -283,7 +283,7 @@ Follow this order to minimize tokens:
 5. **Trace** -> Use `→` calls to follow execution: match `fieldName.method` against `fields:` to find the target class type, then skim that class to continue
 6. **Filter** -> `jskim File.java --grep billing` if the class has many methods
 7. **Focus** -> `jskim File.java methodA methodB` to read the methods you need
-8. **Edit** -> Use `Read` with `offset`/`limit` on only the lines that matter, then `Edit` normally
+8. **Edit** -> Read only the lines that matter from the source file, then edit normally
 
 ### Tracing call flow across files (step-by-step example)
 
@@ -307,18 +307,18 @@ reading ~50 lines of skim output instead of ~500 lines of raw Java.
 
 ### Finding callers (reverse lookup)
 
-The `→` calls show what a method calls (downstream). To find what calls a method (upstream), combine `Grep` with `jskim`:
+The `→` calls show what a method calls (downstream). To find what calls a method (upstream), combine a text search tool with `jskim`:
 
 ```
 Goal: Who calls billingService.create()?
 
-Step 1: Grep for "\.create(" across *.java files → find calling files
+Step 1: Search for "\.create(" across *.java files → find calling files
 Step 2: jskim each calling file → see which methods contain the call and their full context
 ```
 
 For finding all usages of a method within the same project:
 - `jskim src/ --grep create` — scans all files but only shows methods matching "create"
-- `Grep "create(" --glob "*.java"` — finds raw references, then skim the files to understand context
+- `rg "create\\(" -g "*.java"` — finds raw references, then skim the files to understand context
 
 ### When to use each tool
 
@@ -334,7 +334,7 @@ For finding all usages of a method within the same project:
 | Find all implementations of an interface | `jskim src/ --implements EventPublisher` |
 | Understand a class structure | `jskim File.java` |
 | Trace call flow downstream | Skim the class → follow `→` field calls → skim the dependency class |
-| Find callers (upstream) | `Grep "methodName("` across `*.java` → skim calling files |
+| Find callers (upstream) | Search for `methodName(` across `*.java`, then skim calling files |
 | Assess impact of a change | Combine downstream (`→`) + upstream (`Grep`) to see full blast radius |
 | Large class (500+ lines), looking for specific methods | `jskim File.java --grep keyword` |
 | Need to read a method's source code | `jskim File.java methodName` |
@@ -356,25 +356,25 @@ For finding all usages of a method within the same project:
 - You've already read the full `git diff` — running jskim after is redundant
 - You need to review actual code logic, not just structure — jskim shows signatures and call graphs, not the changed lines themselves. For bug hunting and code review, you still need the real diff
 
-**Key insight:** `jskim --diff` is a **triage tool**, not a replacement for reading the diff. Use it first on large diffs to decide where to focus, then read the actual changes with `git diff` or `Read`. On small diffs, skip it entirely and go straight to `git diff`.
+**Key insight:** `jskim --diff` is a **triage tool**, not a replacement for reading the diff. Use it first on large diffs to decide where to focus, then read the actual changes with `git diff` or your normal diff/file viewer. On small diffs, skip it entirely and go straight to `git diff`.
 
 ### When NOT to use jskim
 
-- **Small files (<100 lines)** — just use `Read` directly, skim overhead isn't worth it
+- **Small files (<100 lines)** — just read the file directly, skim overhead isn't worth it
 - **Small diffs (< ~1000 lines)** — `git diff` is faster and gives you more useful information than `jskim --diff`
-- **You already have line numbers** — if `Grep` already told you the exact lines, use `Read` with offset/limit directly. Don't waste a tool call on jskim.
+- **You already have line numbers** — if search already told you the exact lines, go straight to that slice of the file. Don't waste a tool call on jskim.
 - **You already read the full diff** — don't run `jskim --diff` after reading `git diff`; the structural info is already in context
 - **Generated code** — JOOQ output, Protobuf stubs, Swagger-generated clients. These are mechanical and don't benefit from summarization.
 - **Non-Java files** — this tool only handles `.java` files
-- **The user asked to read the full file** — respect the request, use `Read`
+- **The user asked to read the full file** — respect the request and read the full file directly
 
 ### Rules
-- Run `jskim` before using the `Read` tool on a Java file when you don't already know where to look (no line numbers from grep, no prior context). Skip jskim if you already have the line range you need.
-- Use the line ranges from skim output to `Read` with `offset` and `limit` — never read the whole file when you only need one method
+- Run `jskim` before reading a Java file directly when you don't already know where to look (no line numbers from search, no prior context). Skip jskim if you already have the line range you need.
+- Use the line ranges from skim output to read only the relevant slice of the file — never read the whole file when you only need one method
 - When exploring a new Java project, start with `jskim <src_dir>` to understand the structure
 - For large projects (500+ files), use `--package` to scope project map output
 - For large classes (300+ lines, many methods), use `--grep` or `--annotation` to filter output
-- For editing: use the `Read` tool with offset/limit to get the exact lines, then `Edit` normally — skim is for understanding, not for editing
+- For editing: read the exact lines you need first, then edit normally — skim is for understanding, not for editing
 - When you need multiple related methods, extract them all in one `jskim File.java method1 method2` call
 - When tracing call flow, check the `→` calls against the `fields:` section to identify dependency calls vs parameter accessor noise
 
@@ -382,7 +382,7 @@ For finding all usages of a method within the same project:
 
 If `jskim` fails (syntax error, unexpected Java construct, Python not found, etc.), **do not stop or ask the user to fix it**. Fall back to your native tools:
 
-1. Use the `Read` tool to read the Java file directly
+1. Read the Java file directly with your normal file-reading tool
 2. Produce a similar compact summary yourself — list the package, key annotations, fields (type + name), and method signatures with line ranges
 3. Continue with the workflow as normal
 
@@ -390,8 +390,8 @@ The goal is always: understand the Java file's structure with minimal tokens. js
 
 ## What $ARGUMENTS is for
 
-If the user invokes `/jskim` with arguments:
+If the host skill environment invokes this skill with arguments:
 - If argument is a `.java` file -> run `jskim $ARGUMENTS`
 - If argument is a directory -> run `jskim $ARGUMENTS`
 - If argument is `<file.java> <method>` -> run `jskim $ARGUMENTS`
-- If no arguments -> explain the available tools
+- If no arguments -> explain the available jskim modes
