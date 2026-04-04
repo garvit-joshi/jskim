@@ -2,6 +2,23 @@
 
 All notable changes to jskim are documented here.
 
+## [0.2.3] - 2026-04-04
+
+### Fixes
+- **Implicit class support completed** — Java simple source files without an explicit top-level type now show up consistently in skim, method, and project mode instead of being silently dropped
+- **Project totals now count unique files** — project map headers and package summaries no longer double-count lines or files when a single Java file contains multiple top-level types
+- **Interface inheritance preserved** — interface `extends` clauses are now parsed and rendered correctly in skim and project output
+- **Overloaded diff detection fixed** — diff mode now matches methods by name plus parameter types, so overload additions and removals are reported as `[NEW]` and `[DELETED]` instead of collapsing into `[MODIFIED]`
+
+### Tests
+- Added regression coverage for implicit classes, unique project totals, interface inheritance, and overloaded diff handling
+- Expanded the suite to 390 tests
+
+### Docs
+- **Generalized product positioning** — updated package metadata, README, and skill docs to describe jskim as a tool for AI coding agents instead of a Claude-specific tool
+- **Skill guidance made more portable** — replaced host-specific `Read`/`Edit` wording in `SKILL.md` with generic file-reading and editing guidance
+- **Release docs cleaned up** — clarified skill-enabled environment wording while keeping the published install path and slash-command examples accurate
+
 ## [0.2.2] - 2026-03-14
 
 ### Fixes
