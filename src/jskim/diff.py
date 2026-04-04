@@ -121,10 +121,10 @@ def _resolve_base_ref(ref, cwd=None):
     return ref
 
 
-def _get_old_method_names(base_ref, path, cwd=None):
-    """Get method names from the old version of a file.
+def _get_old_methods(base_ref, path, cwd=None):
+    """Get method identities and signatures from the old version of a file.
 
-    Returns a set of method names, or None if the old file cannot be retrieved.
+    Returns a dict {identity: signature}, or None if the old file cannot be retrieved.
     """
     result = subprocess.run(
         ["git", "show", f"{base_ref}:{path}"],
@@ -133,13 +133,11 @@ def _get_old_method_names(base_ref, path, cwd=None):
     if result.returncode != 0:
         return None
     try:
-        parsed = parse_java(result.stdout)
-        names = set()
+        parsed = parse_java(result.stdout, source_name=path)
+        methods = {}
         for m in parsed["methods"]:
-            name_match = re.search(r"(\w+)\s*\(", m["sig"])
-            if name_match:
-                names.add(name_match.group(1))
-        return names
+            methods[m["identity"]] = m["sig"]
+        return methods
     except Exception:
         return None
 
@@ -271,11 +269,11 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
 
         changed_lines = f["changed_lines"]
 
-        # Get old method names for NEW/DELETED detection
-        old_method_names = None
+        # Get old method identities for NEW/DELETED detection
+        old_methods = None
         if base_ref:
             old_path = f.get("old_path", f["path"])
-            old_method_names = _get_old_method_names(base_ref, old_path, cwd=git_root)
+            old_methods = _get_old_methods(base_ref, old_path, cwd=git_root)
 
         out.append(f"// {f['path']}")
         if parsed["class_annotations"]:
@@ -286,16 +284,15 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
         modified_methods = []
         unchanged_count = 0
 
-        current_method_names = set()
+        current_method_ids = set()
         for m in parsed["methods"]:
-            name_match = re.search(r"(\w+)\s*\(", m["sig"])
-            name = name_match.group(1) if name_match else m["sig"]
-            current_method_names.add(name)
+            method_id = m.get("identity", m["sig"])
+            current_method_ids.add(method_id)
 
             kind = classify_method(m["sig"])
             is_trivial = kind in ("getter", "setter", "boilerplate")
 
-            if old_method_names is not None and name not in old_method_names:
+            if old_methods is not None and method_id not in old_methods:
                 # Method exists in current but not in old -> NEW
                 if not is_trivial:
                     new_methods.append(m)
@@ -311,9 +308,9 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
                 unchanged_count += 1
 
         # Detect deleted methods
-        deleted_method_names = []
-        if old_method_names is not None:
-            deleted_method_names = sorted(old_method_names - current_method_names)
+        deleted_method_ids = []
+        if old_methods is not None:
+            deleted_method_ids = sorted(set(old_methods) - current_method_ids)
 
         for m in new_methods:
             lines = m["end"] - m["start"] + 1
@@ -345,10 +342,10 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
                 else:
                     out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
 
-        for name in deleted_method_names:
-            out.append(f"//   [DELETED]  {name}()")
+        for method_id in deleted_method_ids:
+            out.append(f"//   [DELETED]  {old_methods[method_id]}")
 
-        if not new_methods and not modified_methods and not deleted_method_names:
+        if not new_methods and not modified_methods and not deleted_method_ids:
             out.append("//   (non-method changes only)")
 
         if unchanged_count:

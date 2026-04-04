@@ -14,7 +14,7 @@ from .util import (
     build_method_signature, build_class_declaration_text,
     extract_field_info, extract_record_components, get_type_keyword,
     get_declaration_name, get_interfaces, get_enum_constants,
-    extract_method_calls,
+    extract_method_calls, build_implicit_class_declaration, build_method_identity,
     INNER_TYPE_NODES, METHOD_NODES, MODIFIER_KEYWORDS,
 )
 
@@ -108,36 +108,13 @@ def classify_method(sig):
 
 
 
-def _parse_type_declaration(decl):
-    """Parse a single type declaration node and return its structural info."""
-    mods = get_modifiers_node(decl)
-    rich_anns = get_annotations_rich(mods)
-    class_annotations = [a["full"] for a in rich_anns]
-    class_declaration = build_class_declaration_text(decl)
-    class_line = decl.start_point[0] + 1
-
-    lombok_notes = []
-    for a in rich_anns:
-        if a["name"] in LOMBOK_ANNOTATIONS:
-            lombok_notes.append(f"{a['name']}: {LOMBOK_ANNOTATIONS[a['name']]}")
-
+def _parse_members(members):
+    """Parse fields, methods, and nested declarations from a member list."""
     fields = []
     methods = []
     inner_types = []
-    enum_constants_list = []
     static_initializers = []
-
-    # Record components (shown as fields)
-    for ftype, fname in extract_record_components(decl):
-        fields.append({"type": ftype, "name": fname, "annotations": ""})
-
-    body = get_class_body(decl)
-
-    # Enum constants
-    if decl.type == "enum_declaration" and body:
-        enum_constants_list = get_enum_constants(body)
-
-    for member in get_body_members(body):
+    for member in members:
         if member.type == "field_declaration":
             field_entries = extract_field_info(member)
             anns = get_annotations(get_modifiers_node(member))
@@ -161,6 +138,7 @@ def _parse_type_declaration(decl):
                 "start": start,
                 "end": end,
                 "sig": sig,
+                "identity": build_method_identity(member),
                 "annotations": anns,
                 "calls": calls,
             })
@@ -181,44 +159,97 @@ def _parse_type_declaration(decl):
             })
 
     return {
-        "class_annotations": class_annotations,
-        "class_declaration": class_declaration,
-        "class_line": class_line,
         "fields": fields,
         "methods": methods,
         "inner_types": inner_types,
-        "lombok_notes": lombok_notes,
-        "enum_constants": enum_constants_list,
         "static_initializers": static_initializers,
     }
 
 
-def parse_java(content):
+def _parse_type_declaration(decl):
+    """Parse a single type declaration node and return its structural info."""
+    mods = get_modifiers_node(decl)
+    rich_anns = get_annotations_rich(mods)
+    class_annotations = [a["full"] for a in rich_anns]
+    class_declaration = build_class_declaration_text(decl)
+    class_line = decl.start_point[0] + 1
+
+    lombok_notes = []
+    for a in rich_anns:
+        if a["name"] in LOMBOK_ANNOTATIONS:
+            lombok_notes.append(f"{a['name']}: {LOMBOK_ANNOTATIONS[a['name']]}")
+
+    body = get_class_body(decl)
+    parsed_members = _parse_members(get_body_members(body))
+
+    # Record components (shown as fields)
+    record_fields = []
+    for ftype, fname in extract_record_components(decl):
+        record_fields.append({"type": ftype, "name": fname, "annotations": ""})
+
+    enum_constants_list = []
+    if decl.type == "enum_declaration" and body:
+        enum_constants_list = get_enum_constants(body)
+
+    return {
+        "class_annotations": class_annotations,
+        "class_declaration": class_declaration,
+        "class_line": class_line,
+        "fields": record_fields + parsed_members["fields"],
+        "methods": parsed_members["methods"],
+        "inner_types": parsed_members["inner_types"],
+        "lombok_notes": lombok_notes,
+        "enum_constants": enum_constants_list,
+        "static_initializers": parsed_members["static_initializers"],
+    }
+
+
+def _parse_implicit_declaration(program_members, source_name=None):
+    """Parse the synthetic implicit class for a Java simple source file."""
+    parsed_members = _parse_members(program_members)
+    return {
+        "class_annotations": [],
+        "class_declaration": build_implicit_class_declaration(source_name),
+        "class_line": 1,
+        "fields": parsed_members["fields"],
+        "methods": parsed_members["methods"],
+        "inner_types": parsed_members["inner_types"],
+        "lombok_notes": [],
+        "enum_constants": [],
+        "static_initializers": parsed_members["static_initializers"],
+    }
+
+
+def parse_java(content, source_name=None):
     """Parse a Java file using tree-sitter and extract structural information."""
     structure = parse_file_structure(content.encode("utf-8"))
     lines = content.split("\n")
 
-    type_declarations = [_parse_type_declaration(node) for node in structure["type_nodes"]]
-
-    if not type_declarations:
-        # Implicitly declared class (Java 23+): no type declaration wrapper
-        primary = {
-            "class_annotations": [],
-            "class_declaration": None,
-            "class_line": 1,
-            "fields": [],
-            "methods": [],
-            "inner_types": [],
-            "lombok_notes": [],
-            "enum_constants": [],
-            "static_initializers": [],
-        }
+    if structure["program_members"]:
+        primary = _parse_implicit_declaration(structure["program_members"], source_name)
+        extra_types = []
     else:
-        # Primary class is the first declaration
-        primary = type_declarations[0]
+        type_declarations = [_parse_type_declaration(node) for node in structure["type_nodes"]]
 
-    # Additional top-level classes (package-private helpers, sealed subtypes, etc.)
-    extra_types = type_declarations[1:]
+        if not type_declarations:
+            primary = {
+                "class_annotations": [],
+                "class_declaration": None,
+                "class_line": 1,
+                "fields": [],
+                "methods": [],
+                "inner_types": [],
+                "lombok_notes": [],
+                "enum_constants": [],
+                "static_initializers": [],
+            }
+            extra_types = []
+        else:
+            # Primary class is the first declaration
+            primary = type_declarations[0]
+
+            # Additional top-level classes (package-private helpers, sealed subtypes, etc.)
+            extra_types = type_declarations[1:]
 
     return {
         "package": structure["package"],
@@ -419,7 +450,7 @@ def main():
             continue
 
         content = filepath.read_text(encoding="utf-8", errors="replace")
-        parsed = parse_java(content)
+        parsed = parse_java(content, source_name=filepath)
         print(format_output(parsed, filepath, grep=grep, annotation=annotation))
         if len(files) > 1:
             print()

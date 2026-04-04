@@ -92,6 +92,18 @@ class TestMethodMode:
         assert "fetchOfficesForBusinessUnitId" in stdout
         assert "fetchShiftsForBusinessUnitId" in stdout
 
+    def test_implicit_class_list_methods(self):
+        path = str(fixture_path("ImplicitClass.java"))
+        stdout, _, _ = run_jskim(path, "--list")
+        assert "implicit class ImplicitClass" in stdout
+        assert "main()" in stdout
+
+    def test_implicit_class_extract_method(self):
+        path = str(fixture_path("ImplicitClass.java"))
+        stdout, _, _ = run_jskim(path, "main")
+        assert "implicit class ImplicitClass" in stdout
+        assert "Hello from implicit class" in stdout
+
 
 class TestProjectMode:
     def test_directory_scan(self):

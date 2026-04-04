@@ -20,24 +20,22 @@ from .util import (
     get_body_members, get_annotations, get_modifiers_node,
     build_method_signature, build_class_declaration_text,
     extract_field_info, extract_record_components, get_declaration_name,
+    build_implicit_class_declaration,
     METHOD_NODES,
 )
 
 
 
-def _parse_type_methods(decl):
-    """Parse methods and fields from a single type declaration node."""
-    class_name = get_declaration_name(decl)
-    class_declaration = build_class_declaration_text(decl)
+def _parse_members(class_name, class_declaration, members, record_components=None):
+    """Parse methods and fields from a member list."""
     fields = []
     methods = []
 
     # Record components (shown as fields)
-    for ftype, fname in extract_record_components(decl):
+    for ftype, fname in record_components or []:
         fields.append(f"{ftype} {fname}" if fname else ftype)
 
-    body = get_class_body(decl)
-    for member in get_body_members(body):
+    for member in members:
         if member.type == "field_declaration":
             field_entries = extract_field_info(member)
             for ftype, fname in field_entries:
@@ -67,23 +65,47 @@ def _parse_type_methods(decl):
     return class_name, class_declaration, fields, methods
 
 
-def parse_methods(content):
+def _parse_type_methods(decl):
+    """Parse methods and fields from a single type declaration node."""
+    class_name = get_declaration_name(decl)
+    class_declaration = build_class_declaration_text(decl)
+    return _parse_members(
+        class_name,
+        class_declaration,
+        get_body_members(get_class_body(decl)),
+        extract_record_components(decl),
+    )
+
+
+def _parse_implicit_methods(program_members, source_name=None):
+    """Parse the implicit class members of a Java simple source file."""
+    class_name = Path(source_name).stem if source_name else "implicit class"
+    class_declaration = build_implicit_class_declaration(source_name)
+    return _parse_members(class_name, class_declaration, program_members)
+
+
+def parse_methods(content, source_name=None):
     """Parse all methods from a Java file using tree-sitter."""
     structure = parse_file_structure(content.encode("utf-8"))
     lines = content.split("\n")
 
-    class_name = None
-    class_declaration = None
-    fields = []
-    methods = []
+    if structure["program_members"]:
+        class_name, class_declaration, fields, methods = _parse_implicit_methods(
+            structure["program_members"], source_name
+        )
+    else:
+        class_name = None
+        class_declaration = None
+        fields = []
+        methods = []
 
-    for node in structure["type_nodes"]:
-        cn, cd, fs, ms = _parse_type_methods(node)
-        if class_name is None:
-            class_name = cn
-            class_declaration = cd
-            fields = fs
-        methods.extend(ms)
+        for node in structure["type_nodes"]:
+            cn, cd, fs, ms = _parse_type_methods(node)
+            if class_name is None:
+                class_name = cn
+                class_declaration = cd
+                fields = fs
+            methods.extend(ms)
 
     return {
         "package": structure["package"],
@@ -202,7 +224,7 @@ def main():
         sys.exit(1)
 
     content = filepath.read_text(encoding="utf-8", errors="replace")
-    parsed = parse_methods(content)
+    parsed = parse_methods(content, source_name=filepath)
 
     if sys.argv[2] == "--list":
         print(list_methods(parsed))

@@ -186,6 +186,15 @@ class TestScanJavaFile:
         assert shape["class_type"] == "interface"
         assert shape["method_count"] == 2  # area, perimeter
 
+    def test_implicit_class_scanned(self):
+        path = fixture_path("ImplicitClass.java")
+        infos = scan_java_file(path)
+        assert len(infos) == 1
+        info = infos[0]
+        assert info["class_type"] == "implicit class"
+        assert info["class_name"] == "ImplicitClass"
+        assert info["method_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # find_dependencies
@@ -464,6 +473,29 @@ class TestFormatOutput:
         output = format_output(infos)
         assert "inner:" in output
 
+    def test_implicit_class_output(self):
+        path = fixture_path("ImplicitClass.java")
+        infos = scan_java_file(path)
+        output = format_output(infos)
+        assert "implicit class ImplicitClass" in output
+
+    def test_multi_type_file_totals_count_unique_files(self):
+        path = fixture_path("SealedAndMultiClass.java")
+        infos = scan_java_file(path)
+        output = format_output(infos)
+        assert "Project Map: 1 files, 70 lines" in output
+        assert "com.example.edgecases (1 files, 70 lines)" in output
+
+    def test_interface_extends_output(self, tmp_path):
+        path = tmp_path / "Child.java"
+        path.write_text(
+            "package demo;\npublic interface Child extends ParentA, ParentB {}\n",
+            encoding="utf-8",
+        )
+        infos = scan_java_file(path)
+        output = format_output(infos)
+        assert "interface Child extends ParentA, ParentB" in output
+
 
 # ---------------------------------------------------------------------------
 # Full project scan
@@ -495,3 +527,12 @@ class TestFullProjectScan:
         output = format_output(all_infos, show_endpoints=True)
         # No REST controllers in fixtures, so no endpoints section expected
         assert "Project Map:" in output
+
+    def test_scan_all_fixtures_totals_use_unique_files(self):
+        java_files = sorted(FIXTURES_DIR.rglob("*.java"))
+        all_infos = []
+        for f in java_files:
+            all_infos.extend(scan_java_file(f))
+
+        output = format_output(all_infos)
+        assert "Project Map: 34 files, 2003 lines" in output
