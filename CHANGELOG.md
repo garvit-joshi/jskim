@@ -2,6 +2,18 @@
 
 All notable changes to jskim are documented here.
 
+## [0.2.4] - 2026-04-08
+
+### Fixes
+- **Dependency graph disambiguation** — `--deps` now resolves project references by package and import context instead of collapsing everything to simple class names, so duplicate type names like `Config` no longer produce ambiguous or incorrect dependency edges
+- **Conditional fully-qualified dependency names** — dependency output stays compact when names are unique, and only switches to fully-qualified names when a collision would otherwise make the graph unclear
+
+### Tests
+- Added regression coverage for duplicate dependency target names, duplicate source class names, same-package `extends` resolution, and `--deps` output formatting under name collisions
+
+### Docs
+- Updated `README.md` and `SKILL.md` to document that `--deps` shows fully-qualified names only when simple names are ambiguous
+
 ## [0.2.3] - 2026-04-04
 
 ### Fixes
