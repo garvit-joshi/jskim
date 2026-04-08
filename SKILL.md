@@ -236,7 +236,7 @@ With `--deps`:
 - `lombok:Data,Builder` = Lombok annotations present on the class
 - `inner:Foo,Bar` = inner classes/enums inside this class
 - Enum constants shown inline: `enum Status { ACTIVE, INACTIVE }`
-- Dependencies (`--deps`) = import-based class references
+- Dependencies (`--deps`) = import-based class references; when simple class names are ambiguous, fully-qualified names are shown
 - Endpoints (`--endpoints`) = all `@GetMapping`/`@PostMapping`/etc. with full paths
 - Beans (`--beans`) = DI wiring, `@Bean` factory method producers, and `@ConfigurationProperties`
 

@@ -1,6 +1,7 @@
 """Tests for jskim.project — directory-wide project map."""
 
 import pytest
+from pathlib import Path
 from jskim.project import (
     scan_java_file,
     find_dependencies,
@@ -303,6 +304,98 @@ class TestFindDependencies:
         deps = find_dependencies(infos)
         assert "Foo" not in deps
 
+    def test_duplicate_simple_names_use_qualified_dependency_names(self):
+        infos = [
+            {
+                "class_name": "UseA",
+                "package": "com.example.use",
+                "imports": ["com.example.a.Config"],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "UseB",
+                "package": "com.example.use",
+                "imports": ["com.example.b.Config"],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "Config",
+                "package": "com.example.a",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "Config",
+                "package": "com.example.b",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+            },
+        ]
+        deps = find_dependencies(infos)
+        assert deps["UseA"] == ["com.example.a.Config"]
+        assert deps["UseB"] == ["com.example.b.Config"]
+
+    def test_duplicate_simple_names_use_qualified_source_keys(self):
+        infos = [
+            {
+                "class_name": "Foo",
+                "package": "com.example.a",
+                "imports": ["com.example.shared.Bar"],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "Foo",
+                "package": "com.example.b",
+                "imports": ["com.example.shared.Bar"],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "Bar",
+                "package": "com.example.shared",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+            },
+        ]
+        deps = find_dependencies(infos)
+        assert "com.example.a.Foo" in deps
+        assert "com.example.b.Foo" in deps
+        assert deps["com.example.a.Foo"] == ["Bar"]
+        assert deps["com.example.b.Foo"] == ["Bar"]
+
+    def test_same_package_extends_beats_ambiguous_simple_name(self):
+        infos = [
+            {
+                "class_name": "Foo",
+                "package": "com.example.a",
+                "imports": [],
+                "extends": "BaseConfig",
+                "implements": [],
+            },
+            {
+                "class_name": "BaseConfig",
+                "package": "com.example.a",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+            },
+            {
+                "class_name": "BaseConfig",
+                "package": "com.example.b",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+            },
+        ]
+        deps = find_dependencies(infos)
+        assert deps["Foo"] == ["com.example.a.BaseConfig"]
+
     def test_real_fixtures(self):
         """Test dependency detection on a collection of real fixture files."""
         paths = [
@@ -439,6 +532,63 @@ class TestFormatOutput:
         # Circle and Rectangle extend SealedAndMultiClass
         if "Dependencies" in output:
             assert "→" in output
+
+    def test_show_deps_disambiguates_duplicate_names(self):
+        infos = [
+            {
+                "class_name": "UseA",
+                "package": "com.example.use",
+                "imports": ["com.example.a.Config"],
+                "extends": None,
+                "implements": [],
+                "annotations": [],
+                "class_type": "class",
+                "field_count": 0,
+                "method_count": 0,
+                "lombok": [],
+                "enum_constants": [],
+                "inner_types": [],
+                "total_lines": 10,
+                "filepath": Path("/tmp/UseA.java"),
+                "static_initializers": [],
+            },
+            {
+                "class_name": "Config",
+                "package": "com.example.a",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+                "annotations": [],
+                "class_type": "class",
+                "field_count": 0,
+                "method_count": 0,
+                "lombok": [],
+                "enum_constants": [],
+                "inner_types": [],
+                "total_lines": 10,
+                "filepath": Path("/tmp/a/Config.java"),
+                "static_initializers": [],
+            },
+            {
+                "class_name": "Config",
+                "package": "com.example.b",
+                "imports": [],
+                "extends": None,
+                "implements": [],
+                "annotations": [],
+                "class_type": "class",
+                "field_count": 0,
+                "method_count": 0,
+                "lombok": [],
+                "enum_constants": [],
+                "inner_types": [],
+                "total_lines": 10,
+                "filepath": Path("/tmp/b/Config.java"),
+                "static_initializers": [],
+            },
+        ]
+        output = format_output(infos, show_deps=True)
+        assert "UseA → com.example.a.Config" in output
 
     def test_show_beans(self):
         path = fixture_path("AppConfiguration.java")

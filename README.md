@@ -50,6 +50,7 @@ jskim <src_dir> --implements <Name>     # filter by implemented interface
 - `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number
 - `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
 - `--implements` — filter classes by implemented interface name
+- `--deps` — uses fully-qualified names when simple class names would be ambiguous
 
 ### Diff mode
 

@@ -273,53 +273,135 @@ def scan_java_file(filepath):
     return results
 
 
+def _qualified_name(info):
+    """Build a fully-qualified name for a project type info dict."""
+    name = info.get("class_name")
+    if not name:
+        return None
+    pkg = info.get("package")
+    return f"{pkg}.{name}" if pkg else name
+
+
+def _strip_type_details(type_name):
+    """Strip generics and array suffixes from a type reference."""
+    if not type_name:
+        return None
+    cleaned = type_name.split("<", 1)[0].strip()
+    while cleaned.endswith("[]"):
+        cleaned = cleaned[:-2].strip()
+    return cleaned
+
+
+def _build_dependency_indexes(file_info_list):
+    """Build lookup indexes for dependency resolution."""
+    fq_names = set()
+    package_to_fqns = defaultdict(set)
+    simple_to_fqns = defaultdict(set)
+    explicit_imports = {}
+    wildcard_imports = defaultdict(set)
+
+    for info in file_info_list:
+        fq_name = _qualified_name(info)
+        if fq_name:
+            fq_names.add(fq_name)
+            package = info.get("package") or ""
+            package_to_fqns[package].add(fq_name)
+            simple_to_fqns[info["class_name"]].add(fq_name)
+
+        source_name = _qualified_name(info)
+        if not source_name:
+            continue
+        for imp in info.get("imports", []):
+            if imp.endswith(".*"):
+                wildcard_imports[source_name].add(imp[:-2])
+            else:
+                explicit_imports[source_name] = explicit_imports.get(source_name, {})
+                explicit_imports[source_name][imp.rsplit(".", 1)[-1]] = imp
+
+    return fq_names, package_to_fqns, simple_to_fqns, explicit_imports, wildcard_imports
+
+
+def _resolve_type_reference(type_name, info, indexes):
+    """Resolve a type reference to a fully-qualified project type name."""
+    fq_names, package_to_fqns, simple_to_fqns, explicit_imports, wildcard_imports = indexes
+    stripped = _strip_type_details(type_name)
+    if not stripped:
+        return None
+
+    if stripped in fq_names:
+        return stripped
+
+    source_name = _qualified_name(info)
+    package = info.get("package") or ""
+
+    same_package = f"{package}.{stripped}" if package else stripped
+    if same_package in fq_names:
+        return same_package
+
+    explicit = explicit_imports.get(source_name, {}).get(stripped)
+    if explicit in fq_names:
+        return explicit
+
+    for wildcard_pkg in wildcard_imports.get(source_name, set()):
+        wildcard_match = f"{wildcard_pkg}.{stripped}" if wildcard_pkg else stripped
+        if wildcard_match in fq_names:
+            return wildcard_match
+
+    matches = simple_to_fqns.get(stripped, set())
+    if len(matches) == 1:
+        return next(iter(matches))
+
+    return None
+
+
+def _dependency_display_name(fq_name, simple_to_fqns):
+    """Prefer short names when they are unique in the project."""
+    simple = fq_name.rsplit(".", 1)[-1]
+    return simple if len(simple_to_fqns.get(simple, set())) == 1 else fq_name
+
+
 def find_dependencies(file_info_list):
     """Find which classes reference which other classes in the project (import-based).
 
     Uses import statements to determine dependencies. O(N) instead of O(N²).
     Handles both explicit imports (com.example.Foo) and wildcard imports (com.example.*).
     """
-    # Build lookup: class_name -> set, and package -> set of class names
-    project_classes = set()
-    package_to_classes = defaultdict(set)
-    for info in file_info_list:
-        if info["class_name"]:
-            project_classes.add(info["class_name"])
-            pkg = info["package"] or ""
-            package_to_classes[pkg].add(info["class_name"])
+    indexes = _build_dependency_indexes(file_info_list)
+    _, package_to_fqns, simple_to_fqns, _, _ = indexes
 
     deps = {}
     for info in file_info_list:
-        if not info["class_name"]:
+        source_name = _qualified_name(info)
+        if not source_name:
             continue
-        name = info["class_name"]
         referenced = set()
 
         for imp in info.get("imports", []):
             if imp.endswith(".*"):
                 # Wildcard: match all project classes in that package
                 pkg = imp[:-2]  # strip .*
-                for cls in package_to_classes.get(pkg, []):
-                    if cls != name:
-                        referenced.add(cls)
+                for fq_name in package_to_fqns.get(pkg, []):
+                    if fq_name != source_name:
+                        referenced.add(fq_name)
             else:
-                # Explicit: last segment is the class name
-                cls = imp.rsplit(".", 1)[-1]
-                if cls in project_classes and cls != name:
-                    referenced.add(cls)
+                if imp in indexes[0] and imp != source_name:
+                    referenced.add(imp)
 
         # Also check extends/implements — those are direct references
         if info["extends"]:
-            ext = info["extends"].split("<")[0].strip()
-            if ext in project_classes and ext != name:
+            ext = _resolve_type_reference(info["extends"], info, indexes)
+            if ext and ext != source_name:
                 referenced.add(ext)
         for iface in info.get("implements", []):
-            iface_name = iface.split("<")[0].strip()
-            if iface_name in project_classes and iface_name != name:
+            iface_name = _resolve_type_reference(iface, info, indexes)
+            if iface_name and iface_name != source_name:
                 referenced.add(iface_name)
 
         if referenced:
-            deps[name] = sorted(referenced)
+            display_name = _dependency_display_name(source_name, simple_to_fqns)
+            deps[display_name] = sorted(
+                _dependency_display_name(ref, simple_to_fqns) for ref in referenced
+            )
 
     return deps
 
