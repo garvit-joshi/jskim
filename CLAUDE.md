@@ -29,7 +29,7 @@ The CLI entry point (`cli.py`) auto-detects the operation mode based on input an
 ```
 cli.py (entry point, auto-detection + flag parsing)
 ├── skim.py      — Single file summarization (imports, fields, methods with line ranges)
-├── project.py   — Directory-wide project map (packages, classes, Spring metadata)
+├── project.py   — Directory-wide project map (packages, classes, Spring metadata, call hierarchy)
 ├── method.py    — Method extraction with context (fields, called methods, source)
 └── diff.py      — Git diff mode (summarize only changed Java files/methods)
 
@@ -39,7 +39,7 @@ All modules share: util.py — tree-sitter parsing utilities (65+ functions)
 **Key design patterns:**
 - `util.py` is the shared foundation — all AST parsing, annotation extraction, field/method analysis, and Spring-specific logic lives here. Constants like `LOMBOK_SET`, `HTTP_MAPPING_ANNOTATIONS`, and `SPRING_PARAM_ANNOTATIONS` are centralized here.
 - `skim.py` classifies methods as getter/setter/boilerplate/constructor/business-logic and collapses non-interesting ones to names only.
-- `project.py` aggregates per-file summaries into package-level views and produces Spring-specific reports (`--endpoints`, `--beans`, `--deps`).
+- `project.py` aggregates per-file summaries into package-level views and produces Spring-specific reports (`--endpoints`, `--beans`, `--deps`) plus bounded method-level call hierarchy views (`--callers`, `--impact`). Call hierarchy targets are intentionally class-qualified (`Class.method` or FQN) to avoid ambiguous Java method-name matches.
 - `diff.py` parses unified diff format, tracks changed line numbers, then uses `util.py` to determine which methods overlap with changes. Marks output with `[NEW]`/`[MODIFIED]`/`[DELETED]`.
 
 **Source layout:** All modules are under `src/jskim/`. Version is in `src/jskim/__init__.py` and extracted by hatchling at build time.
@@ -52,9 +52,11 @@ All modules share: util.py — tree-sitter parsing utilities (65+ functions)
 | `jskim File.java methodName` | Method extraction | `method.py` |
 | `jskim File.java --list` | List methods | `method.py` |
 | `jskim src/` | Project map | `project.py` |
+| `jskim src/ --callers Class.method` | Upstream caller hierarchy | `project.py` |
+| `jskim src/ --impact Class.method` | Callers + callees impact view | `project.py` |
 | `jskim --diff HEAD~1` | Diff summary | `diff.py` |
 
-Flags: `--grep`, `--annotation`, `--package`, `--extends`, `--implements`, `--deps`, `--endpoints`, `--beans`, `--diff`.
+Flags: `--grep`, `--annotation`, `--package`, `--extends`, `--implements`, `--deps`, `--endpoints`, `--beans`, `--callers`, `--impact`, `--depth`, `--diff`.
 
 ## Testing
 

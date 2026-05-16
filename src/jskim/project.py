@@ -8,6 +8,9 @@ Options:
   --annotation <@Ann>    Filter by class-level annotation (e.g. @RestController)
   --extends <ClassName>  Filter by superclass name
   --implements <Name>    Filter by implemented interface name
+  --callers <Class.method>  Show upstream callers for a method
+  --impact <Class.method>   Show callers and callees for a method
+  --depth <N>            Traversal depth for --callers/--impact (default: 1)
 """
 
 import sys
@@ -22,6 +25,7 @@ from .util import (
     get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
     extract_mapping_paths, extract_request_method,
     extract_first_annotation_string,
+    build_method_signature, build_method_identity, extract_method_calls, get_method_name,
     INNER_TYPE_NODES, METHOD_NODES, LOMBOK_SET,
 )
 
@@ -59,6 +63,7 @@ def _scan_members(
     bean_deps = []
     bean_produces = []
     fields_detail = []
+    methods_detail = []
     static_initializers = []
 
     for member in members:
@@ -88,6 +93,17 @@ def _scan_members(
             method_count += 1
 
             method_mods = get_modifiers_node(member)
+            method_name = get_method_name(member)
+            start_line = member.start_point[0] + 1
+            end_line = member.end_point[0] + 1
+            methods_detail.append({
+                "name": method_name,
+                "identity": build_method_identity(member),
+                "sig": build_method_signature(member),
+                "start": start_line,
+                "end": end_line,
+                "calls": extract_method_calls(member),
+            })
 
             if is_controller and method_mods:
                 for child in method_mods.children:
@@ -100,9 +116,6 @@ def _scan_members(
                             method_paths = extract_mapping_paths(child)
                             if not method_paths:
                                 method_paths = [""]
-                            name_node = member.child_by_field_name("name")
-                            method_name = name_node.text.decode() if name_node else "?"
-                            start_line = member.start_point[0] + 1
                             for bp in base_paths:
                                 for mp in method_paths:
                                     endpoints.append({
@@ -138,6 +151,7 @@ def _scan_members(
         "bean_deps": bean_deps,
         "bean_produces": bean_produces,
         "fields_detail": fields_detail,
+        "methods_detail": methods_detail,
         "static_initializers": static_initializers,
     }
 
@@ -214,6 +228,7 @@ def _scan_type_declaration(decl):
         "bean_produces": scanned_members["bean_produces"],
         "config_prefix": config_prefix,
         "fields_detail": record_fields + scanned_members["fields_detail"],
+        "methods_detail": scanned_members["methods_detail"],
         "static_initializers": scanned_members["static_initializers"],
     }
 
@@ -406,6 +421,233 @@ def find_dependencies(file_info_list):
     return deps
 
 
+# ---------------------------------------------------------------------------
+# Call hierarchy / impact support
+# ---------------------------------------------------------------------------
+
+def _iter_method_nodes(file_infos):
+    """Yield normalized method nodes from project scan results."""
+    for info in file_infos:
+        fq_class = _qualified_name(info)
+        if not fq_class:
+            continue
+
+        fields_by_name = {
+            field["name"]: field["type"]
+            for field in info.get("fields_detail", [])
+            if field.get("name") and field.get("type")
+        }
+
+        for method in info.get("methods_detail", []):
+            yield {
+                "class_name": info.get("class_name"),
+                "fq_class": fq_class,
+                "name": method["name"],
+                "identity": method["identity"],
+                "sig": method["sig"],
+                "start": method["start"],
+                "end": method["end"],
+                "calls": method.get("calls", []),
+                "filepath": info.get("filepath"),
+                "info": info,
+                "fields_by_name": fields_by_name,
+            }
+
+
+def _method_key(method):
+    """Build a unique key for a normalized method node."""
+    return (
+        str(method.get("filepath")),
+        method["fq_class"],
+        method["identity"],
+        method["start"],
+    )
+
+
+def _method_display(method):
+    """Build a compact display label for a normalized method node."""
+    return f"{method['fq_class']}.{method['identity']}"
+
+
+def _method_location(method):
+    """Build a path:line location string for a normalized method node."""
+    filepath = method.get("filepath")
+    location = str(filepath) if filepath is not None else "?"
+    return f"{location}:L{method['start']}"
+
+
+def _resolve_call_target(call, source_method, indexes):
+    """Resolve one extracted call string to a project class and method name."""
+    if "." not in call:
+        return source_method["fq_class"], call
+
+    owner, method_name = call.rsplit(".", 1)
+    type_name = None
+
+    if owner == "super":
+        type_name = source_method["info"].get("extends")
+    elif owner in source_method["fields_by_name"]:
+        type_name = source_method["fields_by_name"][owner]
+    elif owner and owner[0].isupper():
+        # Static calls such as FooFactory.create() use the class name as owner.
+        type_name = owner
+
+    if not type_name:
+        return None
+
+    fq_class = _resolve_type_reference(type_name, source_method["info"], indexes)
+    if not fq_class:
+        return None
+
+    return fq_class, method_name
+
+
+def _build_call_graph(file_infos):
+    """Build resolved method-level incoming and outgoing call edges."""
+    methods = list(_iter_method_nodes(file_infos))
+    methods_by_key = {_method_key(method): method for method in methods}
+
+    methods_by_class_name = defaultdict(list)
+    for method in methods:
+        methods_by_class_name[(method["fq_class"], method["name"])].append(method)
+
+    indexes = _build_dependency_indexes(file_infos)
+    incoming = defaultdict(list)
+    outgoing = defaultdict(list)
+    seen_edges = set()
+
+    for source in methods:
+        source_key = _method_key(source)
+        for call in source.get("calls", []):
+            resolved = _resolve_call_target(call, source, indexes)
+            if not resolved:
+                continue
+
+            candidates = methods_by_class_name.get(resolved, [])
+            if len(candidates) != 1:
+                continue
+
+            target = candidates[0]
+            target_key = _method_key(target)
+            edge = (source_key, target_key)
+            if edge in seen_edges:
+                continue
+
+            seen_edges.add(edge)
+            outgoing[source_key].append(target_key)
+            incoming[target_key].append(source_key)
+
+    return methods, methods_by_key, incoming, outgoing
+
+
+def _resolve_target_method(methods, target):
+    """Resolve a Class.method target to exactly one method node."""
+    if "." not in target:
+        return None, [], f"Error: target {target!r} requires Class.method"
+
+    class_part, method_name = target.rsplit(".", 1)
+    if not class_part or not method_name:
+        return None, [], f"Error: target {target!r} requires Class.method"
+
+    candidates = [
+        method for method in methods
+        if method["name"] == method_name
+        and (method["class_name"] == class_part or method["fq_class"] == class_part)
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0], [], None
+    if not candidates:
+        return None, [], f"No target found: {target}"
+    return None, candidates, f"Ambiguous target: {target}"
+
+
+def _append_candidate_lines(out, candidates):
+    """Append target candidate lines to output."""
+    out.append("// candidates:")
+    for method in sorted(candidates, key=lambda m: (_method_display(m), _method_location(m))):
+        out.append(f"//   {_method_display(method)}  {_method_location(method)}")
+
+
+def _append_call_tree(out, root, edges, methods_by_key, depth, arrow, indent_level=1, seen=None):
+    """Append a bounded caller/callee tree rooted at a method."""
+    if seen is None:
+        seen = {_method_key(root)}
+
+    if depth <= 0:
+        return
+
+    next_keys = [
+        key for key in edges.get(_method_key(root), [])
+        if key not in seen
+    ]
+    next_methods = sorted(
+        (methods_by_key[key] for key in next_keys),
+        key=lambda m: (_method_display(m), _method_location(m)),
+    )
+
+    if not next_methods and indent_level == 1:
+        out.append("//   (none found)")
+        return
+
+    prefix = "  " * indent_level
+    for method in next_methods:
+        out.append(f"// {prefix}{arrow} {_method_display(method)}  {_method_location(method)}")
+        _append_call_tree(
+            out,
+            method,
+            edges,
+            methods_by_key,
+            depth - 1,
+            arrow,
+            indent_level + 1,
+            seen | {_method_key(method)},
+        )
+
+
+def format_callers_output(file_infos, target, depth=1):
+    """Format a bounded upstream caller hierarchy for a Class.method target."""
+    methods, methods_by_key, incoming, _ = _build_call_graph(file_infos)
+    target_method, candidates, error = _resolve_target_method(methods, target)
+
+    out = [f"// === Callers: {target} (depth {depth}) ==="]
+    if error:
+        out.append(f"// {error}")
+        if candidates:
+            _append_candidate_lines(out, candidates)
+            out.append("// use the fully-qualified class name to disambiguate")
+        return "\n".join(out)
+
+    out.append(f"// target: {_method_display(target_method)}  {_method_location(target_method)}")
+    out.append("//")
+    out.append("// callers:")
+    _append_call_tree(out, target_method, incoming, methods_by_key, depth, "←")
+    return "\n".join(out)
+
+
+def format_impact_output(file_infos, target, depth=1):
+    """Format bounded upstream callers and downstream callees for a target."""
+    methods, methods_by_key, incoming, outgoing = _build_call_graph(file_infos)
+    target_method, candidates, error = _resolve_target_method(methods, target)
+
+    out = [f"// === Impact: {target} (depth {depth}) ==="]
+    if error:
+        out.append(f"// {error}")
+        if candidates:
+            _append_candidate_lines(out, candidates)
+            out.append("// use the fully-qualified class name to disambiguate")
+        return "\n".join(out)
+
+    out.append(f"// target: {_method_display(target_method)}  {_method_location(target_method)}")
+    out.append("//")
+    out.append("// callers:")
+    _append_call_tree(out, target_method, incoming, methods_by_key, depth, "←")
+    out.append("//")
+    out.append("// calls:")
+    _append_call_tree(out, target_method, outgoing, methods_by_key, depth, "→")
+    return "\n".join(out)
+
+
 def _count_unique_files(file_infos):
     """Count files and lines once per filepath, not once per top-level type."""
     unique_files = {}
@@ -592,6 +834,9 @@ def _parse_args(argv):
     ann_filter = None
     ext_filter = None
     impl_filter = None
+    callers_target = None
+    impact_target = None
+    depth = 1
     i = 0
     while i < len(argv):
         if argv[i] == "--deps":
@@ -615,12 +860,28 @@ def _parse_args(argv):
         elif argv[i] == "--implements" and i + 1 < len(argv):
             impl_filter = argv[i + 1]
             i += 2
+        elif argv[i] == "--callers" and i + 1 < len(argv):
+            callers_target = argv[i + 1]
+            i += 2
+        elif argv[i] == "--impact" and i + 1 < len(argv):
+            impact_target = argv[i + 1]
+            i += 2
+        elif argv[i] == "--depth" and i + 1 < len(argv):
+            try:
+                depth = max(0, int(argv[i + 1]))
+            except ValueError:
+                depth = 1
+            i += 2
         elif src_dir is None:
             src_dir = argv[i]
             i += 1
         else:
             i += 1
-    return src_dir, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter, impl_filter
+    return (
+        src_dir, show_deps, show_endpoints, show_beans,
+        pkg_filter, ann_filter, ext_filter, impl_filter,
+        callers_target, impact_target, depth,
+    )
 
 
 def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter=None):
@@ -644,12 +905,17 @@ def main():
     if len(sys.argv) < 2:
         print(
             "Usage: python3 jskim_project.py <src_dir> [--deps] [--endpoints] [--beans]"
-            " [--package pkg] [--annotation @Ann] [--extends Class] [--implements Interface]",
+            " [--package pkg] [--annotation @Ann] [--extends Class] [--implements Interface]"
+            " [--callers Class.method] [--impact Class.method] [--depth N]",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    src_dir_str, show_deps, show_endpoints, show_beans, pkg_filter, ann_filter, ext_filter, impl_filter = (
+    (
+        src_dir_str, show_deps, show_endpoints, show_beans,
+        pkg_filter, ann_filter, ext_filter, impl_filter,
+        callers_target, impact_target, depth,
+    ) = (
         _parse_args(sys.argv[1:])
     )
 
@@ -676,6 +942,18 @@ def main():
 
     if pkg_filter or ann_filter or ext_filter or impl_filter:
         file_infos = _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter)
+
+    if callers_target and impact_target:
+        print("Error: use only one of --callers or --impact", file=sys.stderr)
+        sys.exit(1)
+
+    if callers_target:
+        print(format_callers_output(file_infos, callers_target, depth=depth))
+        return
+
+    if impact_target:
+        print(format_impact_output(file_infos, impact_target, depth=depth))
+        return
 
     print(format_output(file_infos, show_deps, show_endpoints, show_beans))
 

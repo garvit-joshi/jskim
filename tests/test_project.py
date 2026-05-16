@@ -6,6 +6,8 @@ from jskim.project import (
     scan_java_file,
     find_dependencies,
     format_output,
+    format_callers_output,
+    format_impact_output,
     _filter_infos,
     _join_paths,
 )
@@ -645,6 +647,128 @@ class TestFormatOutput:
         infos = scan_java_file(path)
         output = format_output(infos)
         assert "interface Child extends ParentA, ParentB" in output
+
+
+# ---------------------------------------------------------------------------
+# Call hierarchy / impact output
+# ---------------------------------------------------------------------------
+
+class TestCallHierarchyOutput:
+    def _write_project(self, tmp_path):
+        service = tmp_path / "BillingService.java"
+        service.write_text(
+            """
+            package demo;
+
+            public class BillingService {
+                private final BillingRepository repository = new BillingRepository();
+
+                public void processBilling() {
+                    validate();
+                    repository.save();
+                }
+
+                private void validate() {
+                }
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        controller = tmp_path / "BillingController.java"
+        controller.write_text(
+            """
+            package demo;
+
+            public class BillingController {
+                private final BillingService billingService = new BillingService();
+
+                public void create() {
+                    billingService.processBilling();
+                }
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        scheduler = tmp_path / "BillingScheduler.java"
+        scheduler.write_text(
+            """
+            package demo;
+
+            public class BillingScheduler {
+                private final BillingController controller = new BillingController();
+
+                public void run() {
+                    controller.create();
+                }
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        repository = tmp_path / "BillingRepository.java"
+        repository.write_text(
+            """
+            package demo;
+
+            public class BillingRepository {
+                public void save() {
+                }
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        infos = []
+        for path in sorted(tmp_path.glob("*.java")):
+            infos.extend(scan_java_file(path))
+        return infos
+
+    def test_callers_requires_class_qualified_target(self, tmp_path):
+        infos = self._write_project(tmp_path)
+        output = format_callers_output(infos, "processBilling")
+        assert "requires Class.method" in output
+
+    def test_callers_show_upstream_hierarchy(self, tmp_path):
+        infos = self._write_project(tmp_path)
+        output = format_callers_output(infos, "BillingService.processBilling", depth=2)
+        assert "Callers: BillingService.processBilling" in output
+        assert "target: demo.BillingService.processBilling()" in output
+        assert "← demo.BillingController.create()" in output
+        assert "← demo.BillingScheduler.run()" in output
+
+    def test_callers_stop_on_ambiguous_class_name(self, tmp_path):
+        first_dir = tmp_path / "a"
+        second_dir = tmp_path / "b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "Config.java").write_text(
+            "package demo.a; public class Config { public void build() {} }\n",
+            encoding="utf-8",
+        )
+        (second_dir / "Config.java").write_text(
+            "package demo.b; public class Config { public void build() {} }\n",
+            encoding="utf-8",
+        )
+        infos = []
+        for path in sorted(tmp_path.rglob("*.java")):
+            infos.extend(scan_java_file(path))
+
+        output = format_callers_output(infos, "Config.build")
+        assert "Ambiguous target: Config.build" in output
+        assert "demo.a.Config.build()" in output
+        assert "demo.b.Config.build()" in output
+
+    def test_impact_shows_callers_and_callees(self, tmp_path):
+        infos = self._write_project(tmp_path)
+        output = format_impact_output(infos, "BillingService.processBilling", depth=1)
+        assert "Impact: BillingService.processBilling" in output
+        assert "callers:" in output
+        assert "← demo.BillingController.create()" in output
+        assert "calls:" in output
+        assert "→ demo.BillingService.validate()" in output
+        assert "→ demo.BillingRepository.save()" in output
 
 
 # ---------------------------------------------------------------------------

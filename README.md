@@ -40,6 +40,9 @@ jskim <src_dir>
 jskim <src_dir> --deps                 # import-based dependencies
 jskim <src_dir> --endpoints             # REST endpoint map
 jskim <src_dir> --beans                 # Spring bean DI graph + @Bean producers + config properties
+jskim <src_dir> --callers Class.method  # upstream callers for a specific method
+jskim <src_dir> --impact Class.method   # callers + direct callees for a specific method
+jskim <src_dir> --impact Class.method --depth 2  # bounded hierarchy depth
 jskim <src_dir> --package <prefix>      # filter by package
 jskim <src_dir> --annotation <@Ann>     # filter by class annotation
 jskim <src_dir> --extends <ClassName>   # filter by superclass
@@ -49,8 +52,44 @@ jskim <src_dir> --implements <Name>     # filter by implemented interface
 **Spring Boot flags:**
 - `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number
 - `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
+- `--callers Class.method` — shows resolved upstream callers for a specific method; use a fully-qualified class name when class names collide
+- `--impact Class.method` — shows both upstream callers and downstream calls from the target method
+- `--depth N` — controls caller/impact traversal depth; defaults to 1 to keep output compact
 - `--implements` — filter classes by implemented interface name
 - `--deps` — uses fully-qualified names when simple class names would be ambiguous
+
+Call hierarchy mode resolves same-class calls and field calls such as `billingService.create()` when the field type points to a project class. It intentionally skips unresolved local-variable/parameter calls and ambiguous overload edges rather than guessing.
+
+Example:
+
+```bash
+jskim src/ --callers BillingService.create --depth 2
+```
+
+```text
+// === Callers: BillingService.create (depth 2) ===
+// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+//
+// callers:
+//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//     ← com.example.billing.BillingJob.retryFailedBills()  src/.../BillingJob.java:L30
+```
+
+```bash
+jskim src/ --impact BillingService.create
+```
+
+```text
+// === Impact: BillingService.create (depth 1) ===
+// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+//
+// callers:
+//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//
+// calls:
+//   → com.example.billing.BillingRepository.save(Bill)  src/.../BillingRepository.java:L20
+//   → com.example.billing.BillingService.validate(BillDTO)  src/.../BillingService.java:L80
+```
 
 ### Diff mode
 
@@ -114,9 +153,10 @@ In hosts that expose the skill as a slash command, invoke it with `/jskim`:
 3. **Spring context** — `jskim src/ --endpoints --beans` to see REST API + DI wiring
 4. **Understand** — `jskim File.java` to see class structure, fields, methods, and calls
 5. **Trace** — Follow `→` calls by matching field types to find the next class to skim
-6. **Filter** — `jskim File.java --grep billing` for large classes
-7. **Focus** — `jskim File.java methodA methodB` to read specific methods
-8. **Edit** — Read only the specific lines you need from the source file before editing
+6. **Impact** — `jskim src/ --callers Class.method` or `--impact Class.method` to see resolved upstream/downstream method edges
+7. **Filter** — `jskim File.java --grep billing` for large classes
+8. **Focus** — `jskim File.java methodA methodB` to read specific methods
+9. **Edit** — Read only the specific lines you need from the source file before editing
 
 ## Dependencies
 

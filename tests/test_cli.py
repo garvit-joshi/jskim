@@ -118,6 +118,68 @@ class TestProjectMode:
         stdout, _, _ = run_jskim(str(FIXTURES_DIR), "--beans")
         assert "Project Map:" in stdout
 
+    def test_callers_flag_requires_qualified_target(self):
+        stdout, _, _ = run_jskim(str(FIXTURES_DIR), "--callers", "processBilling")
+        assert "requires Class.method" in stdout
+
+    def test_callers_flag_routes_to_call_hierarchy(self, tmp_path):
+        service = tmp_path / "BillingService.java"
+        service.write_text(
+            """
+            package demo;
+            public class BillingService {
+                public void processBilling() {}
+            }
+            """,
+            encoding="utf-8",
+        )
+        controller = tmp_path / "BillingController.java"
+        controller.write_text(
+            """
+            package demo;
+            public class BillingController {
+                private final BillingService billingService = new BillingService();
+                public void create() { billingService.processBilling(); }
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        stdout, _, _ = run_jskim(
+            str(tmp_path), "--callers", "BillingService.processBilling"
+        )
+        assert "Callers: BillingService.processBilling" in stdout
+        assert "demo.BillingController.create()" in stdout
+
+    def test_impact_flag_routes_to_impact_output(self, tmp_path):
+        service = tmp_path / "BillingService.java"
+        service.write_text(
+            """
+            package demo;
+            public class BillingService {
+                private final BillingRepository repository = new BillingRepository();
+                public void processBilling() { repository.save(); }
+            }
+            """,
+            encoding="utf-8",
+        )
+        repository = tmp_path / "BillingRepository.java"
+        repository.write_text(
+            """
+            package demo;
+            public class BillingRepository {
+                public void save() {}
+            }
+            """,
+            encoding="utf-8",
+        )
+
+        stdout, _, _ = run_jskim(
+            str(tmp_path), "--impact", "BillingService.processBilling"
+        )
+        assert "Impact: BillingService.processBilling" in stdout
+        assert "demo.BillingRepository.save()" in stdout
+
 
 class TestOutputFormat:
     def test_all_lines_comment_prefixed_skim(self):

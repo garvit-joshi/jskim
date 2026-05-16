@@ -51,6 +51,9 @@ jskim <src_dir>
 jskim <src_dir> --deps                          # import-based dependencies
 jskim <src_dir> --endpoints                     # REST endpoint map
 jskim <src_dir> --beans                         # Spring bean DI graph + @Bean producers + config properties
+jskim <src_dir> --callers Class.method          # upstream callers for a specific method
+jskim <src_dir> --impact Class.method           # callers + direct callees for a specific method
+jskim <src_dir> --impact Class.method --depth 2 # bounded caller/callee hierarchy depth
 jskim <src_dir> --package <prefix>               # filter by package
 jskim <src_dir> --annotation <@Ann>              # filter by class annotation
 jskim <src_dir> --extends <ClassName>            # filter by superclass
@@ -65,7 +68,16 @@ jskim <src_dir> --implements <Interface>        # filter by implemented interfac
 - `--deps` — show which classes depend on which (uses imports, runs in seconds even on 2000+ files)
 - `--endpoints` — list all REST endpoints: HTTP method, path, handler method, line number
 - `--beans` — show Spring bean DI graph, `@Bean` factory method producers, and `@ConfigurationProperties` with field details
+- `--callers BillingService.create` — show resolved upstream callers for a class-qualified method target
+- `--impact BillingService.create` — show callers plus resolved downstream calls from the target method
+- `--depth 2` — follow caller/callee edges beyond direct neighbors; default is 1 and usually best
 - Filters can be combined: `--package com.example --annotation @Service --deps --endpoints --beans`
+
+**Call hierarchy rules:**
+- Always use a class-qualified target (`Class.method` or `com.example.Class.method`). Bare method names like `create` are intentionally rejected because they are too ambiguous in Java projects.
+- If simple class names collide, rerun with the fully-qualified class name shown in the candidates list.
+- Edges are resolved from same-class calls and field calls where the field type is a project class, such as `billingService.create()`.
+- Calls on local variables, parameters, or overloaded targets may be skipped when they cannot be resolved safely. Treat missing edges as "not proven" rather than "not called."
 
 ### Diff mode
 Summarizes only the Java files and methods changed in a git diff. Ideal for PR reviews — instead of reading full files, get structural context for just the changed parts.
@@ -232,6 +244,29 @@ With `--deps`:
 //   BillingService -> BillingRepository, BillDTO, BillingPort
 ```
 
+With `--callers BillingService.create --depth 2`:
+```
+// === Callers: BillingService.create (depth 2) ===
+// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+//
+// callers:
+//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//     ← com.example.billing.BillingJob.retryFailedBills()  src/.../BillingJob.java:L30
+```
+
+With `--impact BillingService.create`:
+```
+// === Impact: BillingService.create (depth 1) ===
+// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+//
+// callers:
+//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//
+// calls:
+//   → com.example.billing.BillingRepository.save(Bill)  src/.../BillingRepository.java:L20
+//   → com.example.billing.BillingService.validate(BillDTO)  src/.../BillingService.java:L80
+```
+
 - `NF` = N fields, `NM` = N methods, `NL` = N lines in file
 - `lombok:Data,Builder` = Lombok annotations present on the class
 - `inner:Foo,Bar` = inner classes/enums inside this class
@@ -239,6 +274,7 @@ With `--deps`:
 - Dependencies (`--deps`) = import-based class references; when simple class names are ambiguous, fully-qualified names are shown
 - Endpoints (`--endpoints`) = all `@GetMapping`/`@PostMapping`/etc. with full paths
 - Beans (`--beans`) = DI wiring, `@Bean` factory method producers, and `@ConfigurationProperties`
+- Callers/impact (`--callers`, `--impact`) = resolved method call edges only; unresolved local-variable/parameter calls are omitted to avoid false confidence
 
 ### Method extraction output format
 
@@ -281,9 +317,10 @@ Follow this order to minimize tokens:
 3. **Spring context** -> `jskim src/ --endpoints --beans` to see REST API + DI wiring
 4. **Understand** -> `jskim File.java` to see class structure (fields, methods, line ranges, and method calls)
 5. **Trace** -> Use `→` calls to follow execution: match `fieldName.method` against `fields:` to find the target class type, then skim that class to continue
-6. **Filter** -> `jskim File.java --grep billing` if the class has many methods
-7. **Focus** -> `jskim File.java methodA methodB` to read the methods you need
-8. **Edit** -> Read only the lines that matter from the source file, then edit normally
+6. **Impact** -> `jskim src/ --callers Class.method` or `--impact Class.method` to see resolved upstream/downstream method edges
+7. **Filter** -> `jskim File.java --grep billing` if the class has many methods
+8. **Focus** -> `jskim File.java methodA methodB` to read the methods you need
+9. **Edit** -> Read only the lines that matter from the source file, then edit normally
 
 ### Tracing call flow across files (step-by-step example)
 
@@ -307,18 +344,23 @@ reading ~50 lines of skim output instead of ~500 lines of raw Java.
 
 ### Finding callers (reverse lookup)
 
-The `→` calls show what a method calls (downstream). To find what calls a method (upstream), combine a text search tool with `jskim`:
+The `→` calls show what a method calls (downstream). To find what calls a specific method (upstream), prefer call hierarchy mode with a class-qualified target:
 
 ```
 Goal: Who calls billingService.create()?
 
-Step 1: Search for "\.create(" across *.java files → find calling files
-Step 2: jskim each calling file → see which methods contain the call and their full context
+Step 1: jskim src/ --callers BillingService.create
+        → See resolved direct callers
+
+Step 2: jskim src/ --callers BillingService.create --depth 2
+        → See callers of the callers when you need a broader impact view
 ```
 
-For finding all usages of a method within the same project:
-- `jskim src/ --grep create` — scans all files but only shows methods matching "create"
-- `rg "create\\(" -g "*.java"` — finds raw references, then skim the files to understand context
+Use `--impact BillingService.create` when you need both upstream callers and downstream calls from the target in one compact view.
+
+Fallback for unresolved/ambiguous cases:
+- `rg "create\\(" -g "*.java"` — raw text search for local-variable/parameter calls or overload-heavy code
+- `jskim src/ --grep create` — scans all files but only shows methods whose signatures match "create"
 
 ### When to use each tool
 
@@ -334,8 +376,8 @@ For finding all usages of a method within the same project:
 | Find all implementations of an interface | `jskim src/ --implements EventPublisher` |
 | Understand a class structure | `jskim File.java` |
 | Trace call flow downstream | Skim the class → follow `→` field calls → skim the dependency class |
-| Find callers (upstream) | Search for `methodName(` across `*.java`, then skim calling files |
-| Assess impact of a change | Combine downstream (`→`) + upstream (`Grep`) to see full blast radius |
+| Find callers (upstream) | `jskim src/ --callers Class.method` |
+| Assess impact of a change | `jskim src/ --impact Class.method --depth 1` first; increase depth only if needed |
 | Large class (500+ lines), looking for specific methods | `jskim File.java --grep keyword` |
 | Need to read a method's source code | `jskim File.java methodName` |
 | Need method + related methods together | `jskim File.java method1 method2 method3` |
@@ -373,6 +415,7 @@ For finding all usages of a method within the same project:
 - Use the line ranges from skim output to read only the relevant slice of the file — never read the whole file when you only need one method
 - When exploring a new Java project, start with `jskim <src_dir>` to understand the structure
 - For large projects (500+ files), use `--package` to scope project map output
+- For caller/impact checks, use class-qualified targets and keep `--depth` at 1 until you know you need more context
 - For large classes (300+ lines, many methods), use `--grep` or `--annotation` to filter output
 - For editing: read the exact lines you need first, then edit normally — skim is for understanding, not for editing
 - When you need multiple related methods, extract them all in one `jskim File.java method1 method2` call

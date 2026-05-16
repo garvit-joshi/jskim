@@ -13,6 +13,8 @@ def _print_usage():
         "  jskim <file.java> <method> [method2 ...]         Extract method source code\n"
         "  jskim <file.java> --list                         List all methods\n"
         "  jskim <directory> [--deps] [--endpoints] [--beans]  Project structure map\n"
+        "  jskim <directory> --callers Class.method [--depth N]  Show upstream callers\n"
+        "  jskim <directory> --impact Class.method [--depth N]   Show callers + callees\n"
         "  jskim --diff <ref> [directory]                   Summarize changed files/methods\n"
         "  jskim --version                                  Show version",
         file=sys.stderr,
@@ -20,7 +22,10 @@ def _print_usage():
 
 
 # Flags that consume the next argument as a value
-_FLAGS_WITH_VALUE = {"--grep", "--annotation", "--package", "--extends", "--implements", "--diff"}
+_FLAGS_WITH_VALUE = {
+    "--grep", "--annotation", "--package", "--extends", "--implements", "--diff",
+    "--callers", "--impact", "--depth",
+}
 
 
 def main():

@@ -2,6 +2,15 @@
 
 All notable changes to jskim are documented here.
 
+## [Unreleased]
+
+### Features
+- **Method caller/impact mode** — project mode now supports `--callers Class.method` for bounded upstream call hierarchies and `--impact Class.method` for callers plus downstream callees, with `--depth` controlling traversal size
+- **Qualified target safety** — caller/impact mode requires class-qualified method targets and reports ambiguous simple class names instead of guessing
+
+### Docs
+- Updated `README.md`, `SKILL.md`, and `CLAUDE.md` with caller/impact usage, output examples, and agent workflow guidance
+
 ## [0.2.4] - 2026-04-08
 
 ### Fixes

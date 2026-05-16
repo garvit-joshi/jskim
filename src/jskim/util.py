@@ -91,13 +91,7 @@ def build_method_signature(node):
 
 def build_method_identity(node):
     """Build a stable method identity using just the name and parameter types."""
-    name_node = node.child_by_field_name("name")
-    if not name_node:
-        for child in node.children:
-            if child.type == "identifier":
-                name_node = child
-                break
-    name = name_node.text.decode() if name_node else "unknown"
+    name = get_method_name(node)
 
     params_node = node.child_by_field_name("parameters")
     if params_node is None:
@@ -121,6 +115,17 @@ def build_method_identity(node):
                 param_types.append(param.text.decode())
 
     return f"{name}({', '.join(param_types)})"
+
+
+def get_method_name(node):
+    """Extract the simple method/constructor name from a method-like node."""
+    name_node = node.child_by_field_name("name")
+    if not name_node:
+        for child in node.children:
+            if child.type == "identifier":
+                name_node = child
+                break
+    return name_node.text.decode() if name_node else "unknown"
 
 
 def extract_import_path(import_node):
