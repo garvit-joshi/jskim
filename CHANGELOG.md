@@ -2,11 +2,18 @@
 
 All notable changes to jskim are documented here.
 
-## [Unreleased]
+## [0.2.5] - 2026-05-16
 
 ### Features
 - **Method caller/impact mode** — project mode now supports `--callers Class.method` for bounded upstream call hierarchies and `--impact Class.method` for callers plus downstream callees, with `--depth` controlling traversal size
 - **Qualified target safety** — caller/impact mode requires class-qualified method targets and reports ambiguous simple class names instead of guessing
+
+### Tests
+- Added coverage for caller/impact formatting, class-qualified target validation, ambiguous simple class names, CLI routing, and bounded hierarchy output
+- Expanded the suite to 401 tests
+
+### CI
+- Updated `pypa/gh-action-pypi-publish` from `v1.13.0` to `v1.14.0`
 
 ### Docs
 - Updated `README.md`, `SKILL.md`, and `CLAUDE.md` with caller/impact usage, output examples, and agent workflow guidance
