@@ -1,363 +1,199 @@
 """Tests for jskim.skim — single file summarization."""
 
 import pytest
-from jskim.skim import categorize_imports, classify_method, parse_java, format_output
-from tests.conftest import load_fixture, fixture_path
+from jskim.skim import format_output
+from jskim.util import parse_java_source
+from tests.conftest import load_fixture
+
+
+def primary(content, source_name=None):
+    """Parse source and return (parsed, primary type)."""
+    parsed = parse_java_source(content, source_name=source_name)
+    return parsed, parsed["types"][0]
+
+
+def skim(content, filepath="Test.java", **kwargs):
+    parsed = parse_java_source(content, source_name=filepath)
+    return format_output(parsed, filepath, **kwargs)
 
 
 # ---------------------------------------------------------------------------
-# categorize_imports
-# ---------------------------------------------------------------------------
-
-class TestCategorizeImports:
-    def test_empty(self):
-        assert categorize_imports([]) == {}
-
-    def test_java_core(self):
-        imports = ["java.util.List", "java.util.Map", "java.io.IOException"]
-        cats = categorize_imports(imports)
-        assert cats["java.util"] == 2
-        assert cats["java.io"] == 1
-
-    def test_javax_imports(self):
-        imports = ["javax.sql.DataSource"]
-        cats = categorize_imports(imports)
-        assert cats["javax.sql"] == 1
-
-    def test_jakarta_imports(self):
-        imports = ["jakarta.persistence.Entity", "jakarta.persistence.Column"]
-        cats = categorize_imports(imports)
-        assert cats["jakarta.persistence"] == 2
-
-    def test_third_party(self):
-        imports = [
-            "org.springframework.stereotype.Service",
-            "org.springframework.beans.factory.annotation.Autowired",
-            "lombok.extern.slf4j.Slf4j",
-        ]
-        cats = categorize_imports(imports)
-        assert cats["org.springframework.stereotype"] == 1
-        assert cats["org.springframework.beans"] == 1
-        assert cats["lombok.extern.slf4j"] == 1
-
-    def test_short_import(self):
-        imports = ["com"]
-        cats = categorize_imports(imports)
-        assert cats["com"] == 1
-
-
-# ---------------------------------------------------------------------------
-# classify_method
-# ---------------------------------------------------------------------------
-
-class TestClassifyMethod:
-    def test_simple_getter(self):
-        assert classify_method("public String getName()") == "getter"
-
-    def test_boolean_getter(self):
-        assert classify_method("public boolean isActive()") == "getter"
-
-    def test_simple_setter(self):
-        assert classify_method("public void setName(String name)") == "setter"
-
-    def test_constructor(self):
-        assert classify_method("public MyClass(int x)") == "constructor"
-
-    def test_business_method(self):
-        assert classify_method("public void processOrder(Order order)") == "business"
-
-    def test_boilerplate_toString(self):
-        assert classify_method("public String toString()") == "boilerplate"
-
-    def test_boilerplate_equals(self):
-        assert classify_method("public boolean equals(Object o)") == "boilerplate"
-
-    def test_boilerplate_hashCode(self):
-        assert classify_method("public int hashCode()") == "boilerplate"
-
-    def test_getaway_not_getter(self):
-        """getaway() is a word, not get+Away — should be business."""
-        assert classify_method("public String getaway()") == "business"
-
-    def test_isolate_not_getter(self):
-        """isolate() is a word, not is+Olate — should be business."""
-        assert classify_method("public boolean isolate()") == "business"
-
-    def test_setter_with_multiple_params_is_business(self):
-        assert classify_method("public void setCoordinates(int x, int y)") == "business"
-
-    def test_setter_returning_non_void_is_business(self):
-        assert classify_method("public MyClass setName(String name)") == "business"
-
-    def test_getter_with_params_is_business(self):
-        assert classify_method("public String getName(int id)") == "business"
-
-    def test_void_getter_is_business(self):
-        assert classify_method("public void getName()") == "business"
-
-    def test_static_method(self):
-        assert classify_method("public static void main(String[] args)") == "business"
-
-    def test_default_method(self):
-        assert classify_method("default boolean isSingleTrip(Input input)") == "business"
-
-    def test_Boolean_wrapper_getter(self):
-        assert classify_method("public Boolean isValid()") == "getter"
-
-    def test_no_parens_constructor(self):
-        """Compact constructor in records."""
-        assert classify_method("public Coordinate") == "constructor"
-
-
-# ---------------------------------------------------------------------------
-# parse_java — with fixture files
+# parse_java_source through the skim lens
 # ---------------------------------------------------------------------------
 
 class TestParseJava:
     def test_simple_class(self):
-        content = "package com.example; public class Foo { private int x; public void bar() {} }"
-        parsed = parse_java(content)
+        parsed, t = primary("package com.example; public class Foo { private int x; public void bar() {} }")
         assert parsed["package"] == "com.example"
-        assert len(parsed["fields"]) == 1
-        assert len(parsed["methods"]) == 1
+        assert len(t["fields"]) == 1
+        assert len(t["methods"]) == 1
 
     def test_enum_constants(self):
-        content = load_fixture("SimpleDirection.java")
-        parsed = parse_java(content)
+        parsed, t = primary(load_fixture("SimpleDirection.java"))
         assert parsed["package"] == "com.example"
-        assert "NORTH" in parsed["enum_constants"]
-        assert "SOUTH" in parsed["enum_constants"]
-        assert "EAST" in parsed["enum_constants"]
-        assert "WEST" in parsed["enum_constants"]
-        assert len(parsed["methods"]) == 2  # isVertical, isHorizontal
+        assert set(t["enum_constants"]) >= {"NORTH", "SOUTH", "EAST", "WEST"}
+        assert len(t["methods"]) == 2  # isVertical, isHorizontal
 
     def test_enum_with_body_methods(self):
-        content = load_fixture("StatusEnum.java")
-        parsed = parse_java(content)
-        assert "ACTIVE" in parsed["enum_constants"]
-        assert "PENDING" in parsed["enum_constants"]
-        assert "DONE" in parsed["enum_constants"]
-        methods = [m["sig"] for m in parsed["methods"]]
+        _, t = primary(load_fixture("StatusEnum.java"))
+        assert {"ACTIVE", "PENDING", "DONE"} <= set(t["enum_constants"])
+        methods = [m["sig"] for m in t["methods"]]
         assert any("getLabel" in m for m in methods)
         assert any("isTerminal" in m for m in methods)
 
     def test_class_with_lombok(self):
-        content = load_fixture("StaticFieldService.java")
-        parsed = parse_java(content)
-        assert "@Slf4j" in parsed["class_annotations"]
-        assert "@Service" in parsed["class_annotations"]
-        assert "@RequiredArgsConstructor" in parsed["class_annotations"]
-        assert len(parsed["lombok_notes"]) > 0
+        _, t = primary(load_fixture("StaticFieldService.java"))
+        names = t["annotation_names"]
+        assert "@Slf4j" in names
+        assert "@Service" in names
+        assert "@RequiredArgsConstructor" in names
 
     def test_interface_parsing(self):
-        content = load_fixture("BillingCalculator.java")
-        parsed = parse_java(content)
-        assert "interface" in parsed["class_declaration"]
-        methods = [m["sig"] for m in parsed["methods"]]
+        _, t = primary(load_fixture("BillingCalculator.java"))
+        assert "interface" in t["declaration"]
+        methods = [m["sig"] for m in t["methods"]]
         assert any("calculate" in m for m in methods)
         assert any("isSingleEscortTrip" in m for m in methods)
         assert any("zeroCostResult" in m for m in methods)
 
     def test_multi_variable_fields(self):
-        content = load_fixture("EdgeCaseBugs.java")
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "x" in field_names
-        assert "y" in field_names
-        assert "z" in field_names
-        assert "firstName" in field_names
-        assert "lastName" in field_names
+        _, t = primary(load_fixture("EdgeCaseBugs.java"))
+        field_names = [f["name"] for f in t["fields"]]
+        assert {"x", "y", "z", "firstName", "lastName"} <= set(field_names)
 
     def test_inner_types(self):
-        content = load_fixture("EdgeCaseBugs.java")
-        parsed = parse_java(content)
-        inner_decls = [t["declaration"] for t in parsed["inner_types"]]
+        _, t = primary(load_fixture("EdgeCaseBugs.java"))
+        inner_decls = [i["declaration"] for i in t["inner_types"]]
         assert any("Coordinate" in d for d in inner_decls)
         assert any("ValidInput" in d for d in inner_decls)
 
     def test_extra_types(self):
-        content = load_fixture("SealedAndMultiClass.java")
-        parsed = parse_java(content)
-        assert len(parsed["extra_types"]) == 2
-        extra_names = [e["class_declaration"] for e in parsed["extra_types"]]
-        assert any("Circle" in n for n in extra_names)
-        assert any("Rectangle" in n for n in extra_names)
+        parsed, _ = primary(load_fixture("SealedAndMultiClass.java"))
+        extra = parsed["types"][1:]
+        assert len(extra) == 2
+        names = [e["declaration"] for e in extra]
+        assert any("Circle" in n for n in names)
+        assert any("Rectangle" in n for n in names)
 
     def test_sealed_class(self):
-        content = load_fixture("SealedAndMultiClass.java")
-        parsed = parse_java(content)
-        assert "sealed" in parsed["class_declaration"]
-        assert "permits" in parsed["class_declaration"]
+        _, t = primary(load_fixture("SealedAndMultiClass.java"))
+        assert "sealed" in t["declaration"]
+        assert "permits" in t["declaration"]
 
-    def test_lambda_fields(self):
-        content = load_fixture("LambdaFields.java")
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "comp" in field_names
-        assert "task" in field_names
-        assert "parser" in field_names
-        assert "reversed" in field_names
-
-    def test_anon_class_fields(self):
-        content = load_fixture("AnonClassFields.java")
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "task" in field_names
-        assert "map" in field_names
-        assert "custom" in field_names
-
-    def test_text_block_fields(self):
-        content = load_fixture("TextBlockTest.java")
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "query" in field_names
-        assert "simple" in field_names
-        assert "html" in field_names
-
-    def test_switch_expr_fields(self):
-        content = load_fixture("SwitchExprFields.java")
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "x" in field_names
-        assert "label" in field_names
-        assert "category" in field_names
+    @pytest.mark.parametrize("fixture,expected", [
+        ("LambdaFields.java", {"comp", "task", "parser", "reversed"}),
+        ("AnonClassFields.java", {"task", "map", "custom"}),
+        ("TextBlockTest.java", {"query", "simple", "html"}),
+        ("SwitchExprFields.java", {"x", "label", "category"}),
+    ])
+    def test_tricky_field_initializers(self, fixture, expected):
+        _, t = primary(load_fixture(fixture))
+        assert expected <= {f["name"] for f in t["fields"]}
 
     def test_configuration_with_beans(self):
-        content = load_fixture("AppConfiguration.java")
-        parsed = parse_java(content)
-        assert "@Configuration" in parsed["class_annotations"]
-        methods = [m["sig"] for m in parsed["methods"]]
+        _, t = primary(load_fixture("AppConfiguration.java"))
+        assert "@Configuration" in t["annotation_names"]
+        methods = [m["sig"] for m in t["methods"]]
         assert any("objectMapper" in m for m in methods)
         assert any("httpClient" in m for m in methods)
         assert any("taskScheduler" in m for m in methods)
 
     def test_jooq_enum(self):
-        content = load_fixture("ContractType.java")
-        parsed = parse_java(content)
-        assert "PACKAGE" in parsed["enum_constants"]
-        assert "SLAB" in parsed["enum_constants"]
-        assert "TRIP" in parsed["enum_constants"]
-        assert "ZONE" in parsed["enum_constants"]
+        _, t = primary(load_fixture("ContractType.java"))
+        assert {"PACKAGE", "SLAB", "TRIP", "ZONE"} <= set(t["enum_constants"])
 
     def test_static_initializer(self):
-        content = load_fixture("Role.java")
-        parsed = parse_java(content)
-        assert len(parsed["static_initializers"]) > 0
+        _, t = primary(load_fixture("Role.java"))
+        assert len(t["static_initializers"]) > 0
 
     def test_method_calls_extracted(self):
-        content = load_fixture("ScheduleServiceProxy.java")
-        parsed = parse_java(content)
-        # Find the fetchOfficesForBusinessUnitId method
-        method = next(
-            m for m in parsed["methods"]
-            if "fetchOfficesForBusinessUnitId" in m["sig"]
-        )
+        _, t = primary(load_fixture("ScheduleServiceProxy.java"))
+        method = next(m for m in t["methods"] if "fetchOfficesForBusinessUnitId" in m["sig"])
         assert len(method["calls"]) > 0
 
     def test_complex_mixed_file(self):
-        content = load_fixture("ComplexMixed.java")
-        parsed = parse_java(content)
-        assert "@Entity" in parsed["class_annotations"]
-        assert "@Data" in parsed["class_annotations"]
-        field_names = [f["name"] for f in parsed["fields"]]
+        _, t = primary(load_fixture("ComplexMixed.java"))
+        assert "@Entity" in t["annotation_names"]
+        assert "@Data" in t["annotation_names"]
+        field_names = [f["name"] for f in t["fields"]]
         assert "userName" in field_names
         assert "roles" in field_names
 
     def test_method_annotations(self):
-        content = load_fixture("CabUpdateKafkaConsumer.java")
-        parsed = parse_java(content)
-        method = parsed["methods"][0]
-        assert any("@KafkaListener" in a for a in method["annotations"])
+        _, t = primary(load_fixture("CabUpdateKafkaConsumer.java"))
+        assert any(a["name"] == "@KafkaListener" for a in t["methods"][0]["annotations"])
 
-    def test_inline_annotations(self):
-        content = load_fixture("InlineAnnotations.java")
-        parsed = parse_java(content)
-        assert len(parsed["fields"]) > 5
-        assert len(parsed["methods"]) > 0
-
-    def test_nested_annotations(self):
-        content = load_fixture("NestedAnnotations.java")
-        parsed = parse_java(content)
-        assert len(parsed["fields"]) > 3
-        assert len(parsed["methods"]) > 0
+    def test_inline_and_nested_annotations(self):
+        _, t = primary(load_fixture("InlineAnnotations.java"))
+        assert len(t["fields"]) > 5
+        assert len(t["methods"]) > 0
+        _, t = primary(load_fixture("NestedAnnotations.java"))
+        assert len(t["fields"]) > 3
+        assert len(t["methods"]) > 0
 
     def test_total_lines(self):
-        content = "class Foo {\n    int x;\n    void bar() {}\n}"
-        parsed = parse_java(content)
+        parsed, _ = primary("class Foo {\n    int x;\n    void bar() {}\n}")
         assert parsed["total_lines"] == 4
 
     def test_record_components_as_fields(self):
-        content = "package com.example; public record UserDTO(String name, int age) {}"
-        parsed = parse_java(content)
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "name" in field_names
-        assert "age" in field_names
-        field_types = [f["type"] for f in parsed["fields"]]
-        assert "String" in field_types
-        assert "int" in field_types
+        _, t = primary("package com.example; public record UserDTO(String name, int age) {}")
+        assert [(f["type"], f["name"]) for f in t["fields"]] == [("String", "name"), ("int", "age")]
+        assert all(f["component"] for f in t["fields"])
 
     def test_generic_record_components(self):
-        content = "package com.example; public record Response<T>(T data, String message, int code) {}"
-        parsed = parse_java(content)
-        assert len(parsed["fields"]) == 3
-        field_names = [f["name"] for f in parsed["fields"]]
-        assert "data" in field_names
-        assert "message" in field_names
-        assert "code" in field_names
+        _, t = primary("package com.example; public record Response<T>(T data, String message, int code) {}")
+        assert [f["name"] for f in t["fields"]] == ["data", "message", "code"]
 
     def test_record_with_body_methods(self):
-        content = """
+        _, t = primary("""
         package com.example;
         public record Point(int x, int y) {
             public double distance() { return Math.sqrt(x * x + y * y); }
         }
-        """
-        parsed = parse_java(content)
-        assert len(parsed["fields"]) == 2
-        assert len(parsed["methods"]) == 1
-        assert "distance" in parsed["methods"][0]["sig"]
+        """)
+        assert len(t["fields"]) == 2
+        assert len(t["methods"]) == 1
+        assert "distance" in t["methods"][0]["sig"]
 
     def test_implicitly_declared_class(self):
-        content = 'void main() { System.out.println("Hello"); }'
-        parsed = parse_java(content)
-        assert parsed["class_declaration"] == "implicit class"
-        assert len(parsed["methods"]) == 1
-        assert parsed["methods"][0]["sig"] == "void main()"
+        parsed, t = primary('void main() { System.out.println("Hello"); }')
+        assert t["declaration"] == "implicit class"
+        assert t["methods"][0]["sig"] == "void main()"
         assert parsed["total_lines"] == 1
 
     def test_generic_type_in_declaration(self):
-        content = "package com.example; public class Container<T extends Comparable<T>> {}"
-        parsed = parse_java(content)
-        assert "Container<T extends Comparable<T>>" in parsed["class_declaration"]
+        _, t = primary("package com.example; public class Container<T extends Comparable<T>> {}")
+        assert "Container<T extends Comparable<T>>" in t["declaration"]
 
     def test_annotation_type_elements(self):
-        content = load_fixture("AnnotationType.java")
-        parsed = parse_java(content)
-        assert "@interface" in parsed["class_declaration"]
-        sigs = [m["sig"] for m in parsed["methods"]]
-        assert any("value()" in s for s in sigs)
-        assert any("priority()" in s for s in sigs)
-        assert any("tags()" in s for s in sigs)
-        assert any("enabled()" in s for s in sigs)
+        _, t = primary(load_fixture("AnnotationType.java"))
+        assert "@interface" in t["declaration"]
+        sigs = [m["sig"] for m in t["methods"]]
+        for name in ("value()", "priority()", "tags()", "enabled()"):
+            assert any(name in s for s in sigs)
 
     def test_sealed_interface(self):
-        content = """
+        _, t = primary("""
         package com.example;
         public sealed interface Shape permits Circle, Rectangle {
             double area();
         }
-        """
-        parsed = parse_java(content)
-        assert "sealed" in parsed["class_declaration"]
-        assert "interface" in parsed["class_declaration"]
-        assert "permits" in parsed["class_declaration"]
+        """)
+        assert "sealed interface Shape permits Circle, Rectangle" in t["declaration"]
 
     def test_modern_java_features_fixture(self):
-        content = load_fixture("ModernJavaFeatures.java")
-        parsed = parse_java(content)
-        assert "sealed" in parsed["class_declaration"]
-        assert "Shape<T>" in parsed["class_declaration"]
-        assert len(parsed["extra_types"]) >= 3
+        parsed, t = primary(load_fixture("ModernJavaFeatures.java"))
+        assert "sealed" in t["declaration"]
+        assert "Shape<T>" in t["declaration"]
+        assert len(parsed["types"]) >= 4
+
+    def test_package_info_has_no_types(self):
+        parsed = parse_java_source(
+            '@ApplicationModule(displayName = "Evidence")\npackage com.example.evidence;\n'
+            'import org.springframework.modulith.ApplicationModule;\n'
+        )
+        assert parsed["types"] == []
+        assert parsed["package_annotations"][0]["full"] == '@ApplicationModule(displayName = "Evidence")'
 
 
 # ---------------------------------------------------------------------------
@@ -366,153 +202,177 @@ class TestParseJava:
 
 class TestFormatOutput:
     def test_basic_output_structure(self):
-        content = load_fixture("SimpleDirection.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "SimpleDirection.java")
+        output = skim(load_fixture("SimpleDirection.java"), "SimpleDirection.java")
         lines = output.split("\n")
         assert lines[0] == "// SimpleDirection.java"
+        assert lines[1] == "// com.example | 0 imports"
         assert any("total:" in l for l in lines)
 
     def test_enum_constants_in_output(self):
-        content = load_fixture("SimpleDirection.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "SimpleDirection.java")
-        assert "constants:" in output
-        assert "NORTH" in output
+        output = skim(load_fixture("SimpleDirection.java"))
+        assert "// constants: NORTH, SOUTH, EAST, WEST" in output
 
     def test_lombok_in_output(self):
-        content = load_fixture("StaticFieldService.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "StaticFieldService.java")
+        output = skim(load_fixture("StaticFieldService.java"))
         assert "lombok:" in output
 
-    def test_fields_in_output(self):
-        content = load_fixture("StaticFieldService.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "StaticFieldService.java")
-        assert "fields:" in output
+    def test_instance_and_static_fields_split(self):
+        output = skim("""
+        class Foo {
+            private static final String BASE = "/x";
+            private static final int MAX = 3;
+            private final Bar bar;
+            private Baz baz;
+        }
+        """)
+        assert "// fields:\n//   Bar bar\n//   Baz baz" in output
+        assert "// static fields: BASE, MAX" in output
+        assert "String BASE" not in output
 
     def test_methods_in_output(self):
-        content = load_fixture("StaticFieldService.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "StaticFieldService.java")
+        output = skim(load_fixture("StaticFieldService.java"))
         assert "methods:" in output
         assert "processOrder" in output
 
     def test_getter_collapsed(self):
-        content = load_fixture("LambdaEdgeCases.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "LambdaEdgeCases.java")
+        output = skim(load_fixture("LambdaEdgeCases.java"))
         assert "getters:" in output
         assert "getName" in output
 
     def test_boilerplate_collapsed(self):
-        content = load_fixture("EdgeCaseBugs.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "EdgeCaseBugs.java")
+        output = skim(load_fixture("EdgeCaseBugs.java"))
         assert "boilerplate:" in output
         assert "toString" in output
 
     def test_inner_types_in_output(self):
-        content = load_fixture("EdgeCaseBugs.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "EdgeCaseBugs.java")
+        output = skim(load_fixture("EdgeCaseBugs.java"))
         assert "inner types:" in output
 
     def test_extra_types_in_output(self):
-        content = load_fixture("SealedAndMultiClass.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "SealedAndMultiClass.java")
+        output = skim(load_fixture("SealedAndMultiClass.java"))
         assert "other classes in file:" in output
         assert "Circle" in output
         assert "Rectangle" in output
 
     def test_static_initializer_in_output(self):
-        content = load_fixture("Role.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "Role.java")
+        output = skim(load_fixture("Role.java"))
         assert "static initializer" in output
 
     def test_grep_filter(self):
-        content = load_fixture("ScheduleServiceProxy.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "ScheduleServiceProxy.java", grep="fetch")
-        # Only methods matching "fetch" should appear in business methods
-        lines = output.split("\n")
-        method_lines = [l for l in lines if "lines):" in l]
-        assert len(method_lines) > 0, "grep filter should still show matching methods"
+        output = skim(load_fixture("ScheduleServiceProxy.java"), grep="fetch")
+        method_lines = [l for l in output.split("\n") if "lines):" in l]
+        assert method_lines, "grep filter should still show matching methods"
         for ml in method_lines:
             assert "fetch" in ml.lower(), f"Non-matching method leaked through grep filter: {ml}"
 
     def test_annotation_filter(self):
-        content = load_fixture("AppConfiguration.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "AppConfiguration.java", annotation="@Bean")
-        # Only @Bean methods should appear
-        lines = output.split("\n")
-        method_lines = [l for l in lines if "lines):" in l]
+        output = skim(load_fixture("AppConfiguration.java"), annotation="@Bean")
+        method_lines = [l for l in output.split("\n") if "lines):" in l]
+        assert method_lines
         for ml in method_lines:
             assert "@Bean" in ml
 
     def test_method_call_tracing_in_output(self):
-        content = load_fixture("ScheduleServiceProxy.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "ScheduleServiceProxy.java")
-        # Method calls should show with →
+        output = skim(load_fixture("ScheduleServiceProxy.java"))
         assert "→" in output
 
     def test_many_enum_constants_truncated(self):
-        content = load_fixture("Role.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "Role.java")
-        # Role has 12 constants, should truncate
-        assert "more" in output
+        output = skim(load_fixture("Role.java"))
+        assert "...+" in output
 
     def test_class_annotations_in_output(self):
-        content = load_fixture("CabUpdateKafkaConsumer.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "CabUpdateKafkaConsumer.java")
+        output = skim(load_fixture("CabUpdateKafkaConsumer.java"))
         assert "@Slf4j" in output
         assert "@Component" in output
 
     def test_all_comment_prefixed(self):
-        """All output lines should start with //."""
-        content = load_fixture("SimpleDirection.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "SimpleDirection.java")
+        output = skim(load_fixture("SimpleDirection.java"))
         for line in output.split("\n"):
             assert line.startswith("//"), f"Line not prefixed: {line!r}"
 
     def test_record_fields_in_output(self):
-        content = "package com.example; public record UserDTO(String name, int age) {}"
-        parsed = parse_java(content)
-        output = format_output(parsed, "UserDTO.java")
+        output = skim("package com.example; public record UserDTO(String name, int age) {}")
         assert "fields:" in output
         assert "String name" in output
         assert "int age" in output
 
     def test_generic_class_declaration_in_output(self):
-        content = "package com.example; public class Foo<T> extends Bar<T> {}"
-        parsed = parse_java(content)
-        output = format_output(parsed, "Foo.java")
+        output = skim("package com.example; public class Foo<T> extends Bar<T> {}")
         assert "Foo<T>" in output
         assert "extends Bar<T>" in output
 
     def test_annotation_type_elements_in_output(self):
-        content = load_fixture("AnnotationType.java")
-        parsed = parse_java(content)
-        output = format_output(parsed, "AnnotationType.java")
+        output = skim(load_fixture("AnnotationType.java"))
         assert "value()" in output
         assert "priority()" in output
 
     def test_implicit_class_output(self):
-        content = load_fixture("ImplicitClass.java")
-        parsed = parse_java(content, source_name="ImplicitClass.java")
-        output = format_output(parsed, "ImplicitClass.java")
+        output = skim(load_fixture("ImplicitClass.java"), "ImplicitClass.java")
         assert output.startswith("//")
         assert "implicit class ImplicitClass" in output
         assert "void main()" in output
         assert "total:" in output
+
+    def test_package_info_output(self):
+        output = skim(
+            '@ApplicationModule(displayName = "Evidence")\npackage com.example.evidence;\n',
+            "package-info.java",
+        )
+        assert output == (
+            "// package-info.java\n"
+            "// com.example.evidence | 0 imports\n"
+            '// @ApplicationModule(displayName = "Evidence")\n'
+            "//\n"
+            "// total: 3 lines"
+        )
+
+    def test_mapping_paths_resolved_from_constants(self):
+        output = skim("""
+        @RestController
+        @RequestMapping(TripController.BASE_PATH)
+        class TripController {
+            static final String BASE_PATH = "/api/v1/logistics";
+            private static final String TRIPS = "/trips";
+            private static final String ONE_TRIP = TRIPS + "/{tripId}";
+            @PostMapping(path = ONE_TRIP + "/start", consumes = MediaType.APPLICATION_JSON_VALUE)
+            void start() {}
+        }
+        """)
+        assert '@RequestMapping("/api/v1/logistics")' in output
+        assert '@PostMapping("/trips/{tripId}/start")' in output
+        assert "consumes" not in output
+
+    def test_doc_annotations_dropped_and_repeats_deduped(self):
+        output = skim("""
+        class C {
+            @Operation(summary = "x")
+            @ApiResponse(responseCode = "200")
+            @ApiResponse(responseCode = "404")
+            @RequiresPermission(Perms.READ)
+            @ResponseStatus(HttpStatus.CREATED)
+            void go(@Parameter(description = "long text") @RequestParam(required = false) Integer size) {}
+        }
+        """)
+        assert "@Operation" not in output
+        assert "@ApiResponse" not in output
+        assert "@RequiresPermission(Perms.READ) @ResponseStatus(HttpStatus.CREATED) void go(@RequestParam Integer size)" in output
+
+    def test_calls_on_locals_are_dropped(self):
+        output = skim("""
+        class S {
+            private final Repo repo;
+            void run(Request request) {
+                Row row = repo.find(request.id());
+                row.status();
+                Helper.check(row);
+                validate();
+            }
+            void validate() {}
+        }
+        """)
+        assert "→ Helper.check, repo.find, validate" in output
+        assert "request.id" not in output
+        assert "row.status" not in output
 
 
 # ---------------------------------------------------------------------------
@@ -520,51 +380,28 @@ class TestFormatOutput:
 # ---------------------------------------------------------------------------
 
 class TestSkimFixtureFiles:
-    """Test that skim can parse and format every fixture file without errors."""
+    """Every fixture file parses and formats without errors."""
 
     @pytest.fixture(params=[
-        "AnnotationType.java",
-        "AnonClassFields.java",
-        "AppConfiguration.java",
-        "BillingCalculator.java",
-        "BillingTaskDefinitions.java",
-        "BusinessUnitsDao.java",
-        "CabCreationConsumerConfiguration.java",
-        "CabUpdateKafkaConsumer.java",
-        "ComplexMixed.java",
-        "ContractType.java",
-        "EdgeCaseBugs.java",
-        "HealthConfiguration.java",
-        "ImplicitClass.java",
-        "InlineAnnotations.java",
-        "LambdaEdgeCases.java",
-        "LambdaFields.java",
-        "MammothRawTripDataReportTaskDefinitions.java",
-        "MammothRawTripRowMapper.java",
-        "ModernJavaFeatures.java",
-        "NestedAnnotations.java",
-        "RawTripDataReportTaskDefinitions.java",
-        "RawTripRowMapper.java",
-        "RBDResultSetExtractor.java",
-        "ReportStatus.java",
-        "Role.java",
-        "ScheduleServiceProxy.java",
-        "SealedAndMultiClass.java",
-        "SimpleDirection.java",
-        "StaticFieldService.java",
-        "StatusEnum.java",
-        "SwitchExprFields.java",
-        "TextBlockTest.java",
-        "TripEndKafkaConsumer.java",
+        "AnnotationType.java", "AnonClassFields.java", "AppConfiguration.java",
+        "BillingCalculator.java", "BillingTaskDefinitions.java", "BusinessUnitsDao.java",
+        "CabCreationConsumerConfiguration.java", "CabUpdateKafkaConsumer.java",
+        "ComplexMixed.java", "ContractType.java", "EdgeCaseBugs.java",
+        "HealthConfiguration.java", "ImplicitClass.java", "InlineAnnotations.java",
+        "LambdaEdgeCases.java", "LambdaFields.java",
+        "MammothRawTripDataReportTaskDefinitions.java", "MammothRawTripRowMapper.java",
+        "ModernJavaFeatures.java", "NestedAnnotations.java",
+        "RawTripDataReportTaskDefinitions.java", "RawTripRowMapper.java",
+        "RBDResultSetExtractor.java", "ReportStatus.java", "Role.java",
+        "ScheduleServiceProxy.java", "SealedAndMultiClass.java", "SimpleDirection.java",
+        "StaticFieldService.java", "StatusEnum.java", "SwitchExprFields.java",
+        "TextBlockTest.java", "TripEndKafkaConsumer.java",
         "TripEndKafkaConsumerConfiguration.java",
     ])
     def java_file(self, request):
         return request.param
 
     def test_parse_and_format(self, java_file):
-        content = load_fixture(java_file)
-        parsed = parse_java(content)
-        output = format_output(parsed, java_file)
-        assert output  # non-empty
+        output = skim(load_fixture(java_file), java_file)
         assert output.startswith("//")
         assert "total:" in output

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/jskim)](https://pypi.org/project/jskim/)
 [![License](https://img.shields.io/github/license/garvit-joshi/jskim)](https://github.com/garvit-joshi/jskim/blob/main/LICENSE.txt)
 
-Token-saving Java file reader for AI coding agents, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly.
+Token-saving Java file reader for AI coding agents, optimized for Spring Boot. Summarizes Java files compactly using tree-sitter, saving 70-80% of input tokens compared to reading files directly. Zero setup, no index: every run parses the current working tree.
 
 > *A human counted the tokens. An AI counted the getters. Both decided life's too short.*
 
@@ -29,11 +29,13 @@ jskim <file.java> --annotation <@Ann>     # filter methods by annotation
 jskim A.java B.java C.java                # multiple files
 ```
 
-Java simple source files without an explicit type wrapper are summarized as `implicit class <FileStem>`, and their top-level methods are treated like normal class methods.
+Java simple source files without an explicit type wrapper are summarized as `implicit class <FileStem>`. A `package-info.java` shows its package-level annotations (Spring Modulith `@ApplicationModule`).
+
+The summary shows instance fields and static constants separately, keeps annotation arguments that change behaviour (`@RequiresPermission(Perms.X)`, `@Transactional(readOnly = true)`), drops OpenAPI/Swagger documentation annotations, and resolves mapping paths from class constants (`@PostMapping(path = ONE_TRIP + "/start")` → `@PostMapping("/trips/{tripId}/start")`).
 
 ### Project map
 
-Generates a compact map of all Java files in a directory: packages, classes, annotations, field/method counts, Lombok usage, enum constants.
+Generates a compact map of all Java files in a directory: packages (with `package-info.java` annotations), classes, annotations, field/method counts, Lombok usage, enum constants.
 
 ```bash
 jskim <src_dir>
@@ -50,15 +52,15 @@ jskim <src_dir> --implements <Name>     # filter by implemented interface
 ```
 
 **Spring Boot flags:**
-- `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number
-- `--beans` — shows bean DI wiring (via `@Autowired` and `@RequiredArgsConstructor` + final fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
+- `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number. Paths built from constants (`@RequestMapping(BASE_PATH)`, `TRIPS + "/{id}"`, `ApiPaths.ROOT`) are resolved across the project
+- `--beans` — shows bean DI wiring (constructor parameters, or Lombok constructor + final fields, or `@Autowired`/`@Inject` fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
 - `--callers Class.method` — shows resolved upstream callers for a specific method; use a fully-qualified class name when class names collide
 - `--impact Class.method` — shows both upstream callers and downstream calls from the target method
 - `--depth N` — controls caller/impact traversal depth; defaults to 1 to keep output compact
 - `--implements` — filter classes by implemented interface name
 - `--deps` — uses fully-qualified names when simple class names would be ambiguous
 
-Call hierarchy mode resolves same-class calls and field calls such as `billingService.create()` when the field type points to a project class. It intentionally skips unresolved local-variable/parameter calls and ambiguous overload edges rather than guessing.
+Call hierarchy mode resolves same-class calls, static calls on project classes, and field calls such as `billingService.create()` when the field type points to a project class. It intentionally skips unresolved local-variable/parameter calls and ambiguous overload edges rather than guessing. Classes are shown by simple name and fully qualified only when the simple name is ambiguous.
 
 Example:
 
@@ -68,11 +70,11 @@ jskim src/ --callers BillingService.create --depth 2
 
 ```text
 // === Callers: BillingService.create (depth 2) ===
-// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+// target: BillingService.create(BillDTO)  src/.../BillingService.java:L45
 //
 // callers:
-//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
-//     ← com.example.billing.BillingJob.retryFailedBills()  src/.../BillingJob.java:L30
+//   ← BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//     ← BillingJob.retryFailedBills()  src/.../BillingJob.java:L30
 ```
 
 ```bash
@@ -81,14 +83,14 @@ jskim src/ --impact BillingService.create
 
 ```text
 // === Impact: BillingService.create (depth 1) ===
-// target: com.example.billing.BillingService.create(BillDTO)  src/.../BillingService.java:L45
+// target: BillingService.create(BillDTO)  src/.../BillingService.java:L45
 //
 // callers:
-//   ← com.example.billing.BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
+//   ← BillingController.createBill(BillDTO)  src/.../BillingController.java:L62
 //
 // calls:
-//   → com.example.billing.BillingRepository.save(Bill)  src/.../BillingRepository.java:L20
-//   → com.example.billing.BillingService.validate(BillDTO)  src/.../BillingService.java:L80
+//   → BillingRepository.save(Bill)  src/.../BillingRepository.java:L20
+//   → BillingService.validate(BillDTO)  src/.../BillingService.java:L80
 ```
 
 ### Diff mode
@@ -103,7 +105,7 @@ jskim src/ --diff HEAD~1               # scoped to directory
 git diff main | jskim --diff -         # read diff from stdin
 ```
 
-Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`. Getters/setters/boilerplate changes are suppressed.
+Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`, and added/removed instance fields or record components as `[FIELDS] +Type name, -Type name`. Getters/setters/boilerplate changes are suppressed.
 Deleted methods are shown with their previous signature when a base ref is available, so overload removals stay distinguishable.
 
 ### Extract methods
@@ -120,13 +122,13 @@ Each method in the skim output shows its direct method invocations:
 
 ```
 // methods:
-//     L45-L62 ( 18 lines): @PostMapping public Bill createBill(BillDTO dto)
+//     L45-L62 ( 18 lines): @PostMapping("/bills") public Bill createBill(@RequestBody BillDTO dto)
 //                → auditLogger.log, billingService.create, notifyStakeholders, validator.validate
-//     L64-L80 ( 17 lines): @GetMapping("/{id}") public Bill getBill(Long id)
+//     L64-L80 ( 17 lines): @GetMapping("/bills/{id}") public Bill getBill(@PathVariable Long id)
 //                → billingService.findById
 ```
 
-Cross-reference the `→` calls with the `fields:` section to trace call flow across files — if a method calls `billingService.create`, the fields show `BillingService billingService`, so skim `BillingService.java` next. Chained/fluent calls (streams, builders) are excluded to keep output compact.
+Every `→` entry can be followed: an unqualified name is a method in the same class, `field.method` resolves through the `fields:` section (`billingService` → `BillingService`, so skim `BillingService.java` next), and `Class.method` is a static call. Calls on local variables and parameters, chained/fluent calls, logging, and collection plumbing are excluded because they cannot be followed from a summary.
 
 ## Usage in Skill-enabled Agents
 

@@ -1,35 +1,36 @@
-"""jskim_project - Generate a compact project structure map for Java projects.
+"""jskim project - compact project structure map for Java source trees.
 
-Usage: python3 jskim_project.py <src_dir> [options]
+Usage: jskim <src_dir> [options]
 
 Options:
-  --deps                 Show cross-class dependencies (import-based)
-  --package <prefix>     Filter by package prefix (e.g. com.stw.server.tripsheet)
-  --annotation <@Ann>    Filter by class-level annotation (e.g. @RestController)
-  --extends <ClassName>  Filter by superclass name
-  --implements <Name>    Filter by implemented interface name
+  --deps                    Show cross-class dependencies (import-based)
+  --endpoints               Show REST endpoints (resolved paths)
+  --beans                   Show Spring DI wiring, @Bean producers, config properties
+  --package <prefix>        Filter by package prefix
+  --annotation <@Ann>       Filter by class-level annotation
+  --extends <ClassName>     Filter by superclass name
+  --implements <Name>       Filter by implemented interface name
   --callers <Class.method>  Show upstream callers for a method
   --impact <Class.method>   Show callers and callees for a method
-  --depth <N>            Traversal depth for --callers/--impact (default: 1)
+  --depth <N>               Traversal depth for --callers/--impact (default: 1)
 """
 
 import sys
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+
 from .util import (
-    parse_file_structure, get_class_body,
-    get_body_members, get_annotations, get_modifiers_node,
-    extract_field_info, extract_record_components, get_type_keyword,
-    get_declaration_name, get_superclass, get_interfaces,
-    build_class_declaration_text, get_enum_constants, is_field_final, is_field_static,
-    get_annotation_name_from_node, HTTP_MAPPING_ANNOTATIONS,
-    extract_mapping_paths, extract_request_method,
-    extract_first_annotation_string,
-    build_method_signature, build_method_identity, extract_method_calls, get_method_name,
-    INNER_TYPE_NODES, METHOD_NODES, LOMBOK_SET,
+    parse_java_source, instance_fields, format_enum_constants,
+    extract_mapping_paths, extract_request_method, extract_first_annotation_string,
+    HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
+    SPRING_STEREOTYPES, CONTROLLER_ANNOTATIONS, INJECTION_ANNOTATIONS,
+    KEY_CLASS_ANNOTATIONS, ENUM_CONSTANTS_MAP_MAX,
 )
 
 
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
 
 def _join_paths(base, method_path):
     """Join a base path and method path into a full endpoint path."""
@@ -42,261 +43,6 @@ def _join_paths(base, method_path):
     return base.rstrip("/") + "/" + method_path.lstrip("/")
 
 
-def _scan_members(
-    members,
-    class_type,
-    class_name,
-    annotations,
-    is_controller=False,
-    is_spring_bean=False,
-    has_constructor_injection=False,
-    base_paths=None,
-):
-    """Scan fields, methods, and nested types from a member list."""
-    if not base_paths:
-        base_paths = [""]
-
-    field_count = 0
-    method_count = 0
-    inner_types = []
-    endpoints = []
-    bean_deps = []
-    bean_produces = []
-    fields_detail = []
-    methods_detail = []
-    static_initializers = []
-
-    for member in members:
-        if member.type == "field_declaration":
-            field_entries = extract_field_info(member)
-            field_count += len(field_entries)
-
-            for ftype, fname in field_entries:
-                fields_detail.append({"type": ftype, "name": fname})
-
-            if is_spring_bean:
-                field_mods = get_modifiers_node(member)
-                field_anns = get_annotations(field_mods) if field_mods else []
-                field_final = is_field_final(member)
-                field_static = is_field_static(member)
-                is_injected = (
-                    "@Autowired" in field_anns or "@Inject" in field_anns
-                    or (has_constructor_injection and field_final and not field_static)
-                )
-                if is_injected:
-                    for ftype, fname in field_entries:
-                        if ftype:
-                            dep_type = ftype.split("<")[0].strip()
-                            bean_deps.append(dep_type)
-
-        elif member.type in METHOD_NODES:
-            method_count += 1
-
-            method_mods = get_modifiers_node(member)
-            method_name = get_method_name(member)
-            start_line = member.start_point[0] + 1
-            end_line = member.end_point[0] + 1
-            methods_detail.append({
-                "name": method_name,
-                "identity": build_method_identity(member),
-                "sig": build_method_signature(member),
-                "start": start_line,
-                "end": end_line,
-                "calls": extract_method_calls(member),
-            })
-
-            if is_controller and method_mods:
-                for child in method_mods.children:
-                    if child.type in ("marker_annotation", "annotation"):
-                        ann_name = get_annotation_name_from_node(child)
-                        if ann_name in HTTP_MAPPING_ANNOTATIONS:
-                            http_method = HTTP_MAPPING_ANNOTATIONS[ann_name]
-                            if http_method is None:
-                                http_method = extract_request_method(child) or "REQUEST"
-                            method_paths = extract_mapping_paths(child)
-                            if not method_paths:
-                                method_paths = [""]
-                            for bp in base_paths:
-                                for mp in method_paths:
-                                    endpoints.append({
-                                        "method": http_method,
-                                        "path": _join_paths(bp, mp),
-                                        "handler": f"{class_name}.{method_name}()",
-                                        "line": start_line,
-                                    })
-
-            if method_mods:
-                method_anns = get_annotations(method_mods)
-                if "@Bean" in method_anns:
-                    type_node = member.child_by_field_name("type")
-                    if type_node:
-                        bean_type = type_node.text.decode().split("<")[0].strip()
-                        bean_produces.append(bean_type)
-
-        elif member.type == "static_initializer":
-            start = member.start_point[0] + 1
-            end = member.end_point[0] + 1
-            static_initializers.append({"start": start, "end": end})
-
-        elif member.type in INNER_TYPE_NODES:
-            kw = get_type_keyword(member)
-            nm = get_declaration_name(member)
-            inner_types.append(f"{kw} {nm}")
-
-    return {
-        "field_count": field_count,
-        "method_count": method_count,
-        "inner_types": inner_types,
-        "endpoints": endpoints,
-        "bean_deps": bean_deps,
-        "bean_produces": bean_produces,
-        "fields_detail": fields_detail,
-        "methods_detail": methods_detail,
-        "static_initializers": static_initializers,
-    }
-
-
-def _scan_type_declaration(decl):
-    """Extract structural info from a single type declaration node."""
-    class_type = get_type_keyword(decl)
-    class_name = get_declaration_name(decl)
-    extends = get_superclass(decl)
-    if extends:
-        extends = " ".join(extends.split())
-    ifaces = get_interfaces(decl)
-    ifaces = [" ".join(i.split()) for i in ifaces]
-
-    mods = get_modifiers_node(decl)
-    annotations = get_annotations(mods)
-    lombok_anns = [a for a in annotations if a in LOMBOK_SET]
-
-    # --- Spring Boot detection ---
-    is_controller = any(a in ("@RestController", "@Controller") for a in annotations)
-    is_spring_bean = any(a in (
-        "@Service", "@Component", "@Repository",
-        "@Controller", "@RestController", "@Configuration",
-    ) for a in annotations)
-    has_constructor_injection = any(a in ("@RequiredArgsConstructor", "@AllArgsConstructor") for a in annotations)
-
-    # Class-level base path and config prefix from annotation params
-    base_paths = []
-    config_prefix = None
-    if mods:
-        for child in mods.children:
-            if child.type in ("marker_annotation", "annotation"):
-                ann_name = get_annotation_name_from_node(child)
-                if ann_name == "@RequestMapping":
-                    base_paths = extract_mapping_paths(child)
-                elif ann_name == "@ConfigurationProperties":
-                    config_prefix = extract_first_annotation_string(child)
-    if not base_paths:
-        base_paths = [""]
-
-    enum_constants_list = []
-
-    body = get_class_body(decl)
-    scanned_members = _scan_members(
-        get_body_members(body),
-        class_type,
-        class_name,
-        annotations,
-        is_controller=is_controller,
-        is_spring_bean=is_spring_bean,
-        has_constructor_injection=has_constructor_injection,
-        base_paths=base_paths,
-    )
-
-    if class_type == "enum" and body:
-        enum_constants_list = get_enum_constants(body)
-
-    record_components = extract_record_components(decl)
-    record_fields = [{"type": ftype, "name": fname} for ftype, fname in record_components]
-
-    return {
-        "class_type": class_type,
-        "class_name": class_name,
-        "annotations": annotations,
-        "lombok": lombok_anns,
-        "extends": extends,
-        "implements": ifaces,
-        "field_count": len(record_fields) + scanned_members["field_count"],
-        "method_count": scanned_members["method_count"],
-        "inner_types": scanned_members["inner_types"],
-        "enum_constants": enum_constants_list,
-        "endpoints": scanned_members["endpoints"],
-        "bean_deps": scanned_members["bean_deps"],
-        "bean_produces": scanned_members["bean_produces"],
-        "config_prefix": config_prefix,
-        "fields_detail": record_fields + scanned_members["fields_detail"],
-        "methods_detail": scanned_members["methods_detail"],
-        "static_initializers": scanned_members["static_initializers"],
-    }
-
-
-def _scan_implicit_source_file(filepath, program_members):
-    """Scan the implicit class produced by a Java simple source file."""
-    class_name = filepath.stem
-    scanned_members = _scan_members(
-        program_members,
-        "implicit class",
-        class_name,
-        [],
-    )
-    return {
-        "class_type": "implicit class",
-        "class_name": class_name,
-        "annotations": [],
-        "lombok": [],
-        "extends": None,
-        "implements": [],
-        "enum_constants": [],
-        "config_prefix": None,
-        **scanned_members,
-    }
-
-
-def scan_java_file(filepath):
-    """Extract structural info from a Java file using tree-sitter.
-
-    Returns a list of info dicts — one per top-level type declaration.
-    """
-    content = filepath.read_text(encoding="utf-8", errors="replace")
-    structure = parse_file_structure(content.encode("utf-8"))
-    total_lines = len(content.split("\n"))
-
-    results = []
-    if structure["program_members"]:
-        info = _scan_implicit_source_file(filepath, structure["program_members"])
-        results.append({
-            "filepath": filepath,
-            "package": structure["package"],
-            "imports": structure["imports"],
-            "total_lines": total_lines,
-            **info,
-        })
-    else:
-        for node in structure["type_nodes"]:
-            info = _scan_type_declaration(node)
-            results.append({
-                "filepath": filepath,
-                "package": structure["package"],
-                "imports": structure["imports"],
-                "total_lines": total_lines,
-                **info,
-            })
-
-    return results
-
-
-def _qualified_name(info):
-    """Build a fully-qualified name for a project type info dict."""
-    name = info.get("class_name")
-    if not name:
-        return None
-    pkg = info.get("package")
-    return f"{pkg}.{name}" if pkg else name
-
-
 def _strip_type_details(type_name):
     """Strip generics and array suffixes from a type reference."""
     if not type_name:
@@ -307,7 +53,155 @@ def _strip_type_details(type_name):
     return cleaned
 
 
-def _build_dependency_indexes(file_info_list):
+def _bean_dependencies(t, is_bean):
+    """Derive a Spring bean's injected dependencies from a parsed type.
+
+    Constructor parameters are the dependency list. Without an explicit
+    constructor, a Lombok constructor annotation makes every final instance
+    field a dependency. Fields annotated @Autowired/@Inject always count.
+    """
+    if not is_bean:
+        return []
+    deps = []
+
+    def _add(type_text):
+        if type_text and type_text not in deps:
+            deps.append(type_text)
+
+    constructors = [m for m in t["methods"] if m["kind"] == "constructor" and m["params"]]
+    for m in constructors:
+        for p in m["params"]:
+            _add(p["type"])
+    if not constructors and any(a in LOMBOK_CONSTRUCTOR_ANNOTATIONS for a in t["annotation_names"]):
+        for f in instance_fields(t):
+            if f["final"]:
+                _add(f["type"])
+    for f in instance_fields(t):
+        if any(a in INJECTION_ANNOTATIONS for a in f["annotations"]):
+            _add(f["type"])
+    return deps
+
+
+def _type_info(t, filepath, parsed):
+    """Flatten one parsed type plus its file context into a project row dict."""
+    anns = t["annotation_names"]
+    is_bean = any(a in SPRING_STEREOTYPES for a in anns)
+    config_prefix = None
+    for a in t["annotations"]:
+        if a["name"] == "@ConfigurationProperties":
+            config_prefix = extract_first_annotation_string(a["node"])
+    fields = instance_fields(t)
+
+    return {
+        "filepath": filepath,
+        "package": parsed["package"],
+        "imports": parsed["imports"],
+        "total_lines": parsed["total_lines"],
+        "class_type": t["kind"],
+        "class_name": t["name"],
+        "annotations": anns,
+        "type_annotations": t["annotations"],
+        "lombok": [a for a in anns if a in LOMBOK_SET],
+        "extends": t["extends"],
+        "implements": t["implements"],
+        "field_count": len(fields),
+        "method_count": len(t["methods"]),
+        "inner_types": [f"{i['kind']} {i['name']}" for i in t["inner_types"]],
+        "enum_constants": t["enum_constants"],
+        "static_initializers": t["static_initializers"],
+        "constants": t["constants"],
+        "is_controller": any(a in CONTROLLER_ANNOTATIONS for a in anns),
+        "endpoints": [],
+        "bean_deps": _bean_dependencies(t, is_bean),
+        "bean_produces": [
+            _strip_type_details(m["return_type"])
+            for m in t["methods"]
+            if m["return_type"] and any(a["name"] == "@Bean" for a in m["annotations"])
+        ],
+        "config_prefix": config_prefix,
+        "fields_detail": [{"type": f["type"], "name": f["name"]} for f in fields],
+        "methods_detail": t["methods"],
+    }
+
+
+def scan_java_file(filepath):
+    """Parse one Java file into a file dict with one row per top-level type."""
+    content = filepath.read_text(encoding="utf-8", errors="replace")
+    parsed = parse_java_source(content, source_name=filepath)
+    return {
+        "filepath": filepath,
+        "package": parsed["package"],
+        "package_annotations": [a["full"] for a in parsed["package_annotations"]],
+        "imports": parsed["imports"],
+        "total_lines": parsed["total_lines"],
+        "types": [_type_info(t, filepath, parsed) for t in parsed["types"]],
+    }
+
+
+def flatten_types(file_infos):
+    """Return every type row across a list of scanned files."""
+    return [t for f in file_infos for t in f["types"]]
+
+
+def _global_constants(type_infos):
+    """Map ``Class.CONSTANT`` to its value across the whole project."""
+    result = {}
+    for info in type_infos:
+        for name, value in info["constants"].items():
+            result[f"{info['class_name']}.{name}"] = value
+    return result
+
+
+def collect_endpoints(type_infos):
+    """Resolve REST endpoints for every controller, filling ``info["endpoints"]``.
+
+    Paths referencing constants in other classes resolve through the
+    project-wide constant table, so this must run after all files are scanned.
+    """
+    global_constants = _global_constants(type_infos)
+    for info in type_infos:
+        if not info["is_controller"]:
+            continue
+        constants = {**global_constants, **info["constants"]}
+        base_paths = [""]
+        for a in info["type_annotations"]:
+            if a["name"] == "@RequestMapping":
+                base_paths = extract_mapping_paths(a["node"], constants) or [""]
+
+        endpoints = []
+        for m in info["methods_detail"]:
+            for a in m["annotations"]:
+                if a["name"] not in HTTP_MAPPING_ANNOTATIONS:
+                    continue
+                http_method = HTTP_MAPPING_ANNOTATIONS[a["name"]]
+                if http_method is None:
+                    http_method = extract_request_method(a["node"]) or "REQUEST"
+                method_paths = extract_mapping_paths(a["node"], constants) or [""]
+                for bp in base_paths:
+                    for mp in method_paths:
+                        endpoints.append({
+                            "method": http_method,
+                            "path": _join_paths(bp, mp),
+                            "handler": f"{info['class_name']}.{m['name']}()",
+                            "line": m["start"],
+                        })
+        info["endpoints"] = endpoints
+
+
+# ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+def _qualified_name(info):
+    """Build a fully-qualified name for a project type info dict."""
+    name = info.get("class_name")
+    if not name:
+        return None
+    pkg = info.get("package")
+    return f"{pkg}.{name}" if pkg else name
+
+
+def _build_dependency_indexes(type_infos):
     """Build lookup indexes for dependency resolution."""
     fq_names = set()
     package_to_fqns = defaultdict(set)
@@ -315,23 +209,18 @@ def _build_dependency_indexes(file_info_list):
     explicit_imports = {}
     wildcard_imports = defaultdict(set)
 
-    for info in file_info_list:
+    for info in type_infos:
         fq_name = _qualified_name(info)
-        if fq_name:
-            fq_names.add(fq_name)
-            package = info.get("package") or ""
-            package_to_fqns[package].add(fq_name)
-            simple_to_fqns[info["class_name"]].add(fq_name)
-
-        source_name = _qualified_name(info)
-        if not source_name:
+        if not fq_name:
             continue
+        fq_names.add(fq_name)
+        package_to_fqns[info.get("package") or ""].add(fq_name)
+        simple_to_fqns[info["class_name"]].add(fq_name)
         for imp in info.get("imports", []):
             if imp.endswith(".*"):
-                wildcard_imports[source_name].add(imp[:-2])
+                wildcard_imports[fq_name].add(imp[:-2])
             else:
-                explicit_imports[source_name] = explicit_imports.get(source_name, {})
-                explicit_imports[source_name][imp.rsplit(".", 1)[-1]] = imp
+                explicit_imports.setdefault(fq_name, {})[imp.rsplit(".", 1)[-1]] = imp
 
     return fq_names, package_to_fqns, simple_to_fqns, explicit_imports, wildcard_imports
 
@@ -375,17 +264,17 @@ def _dependency_display_name(fq_name, simple_to_fqns):
     return simple if len(simple_to_fqns.get(simple, set())) == 1 else fq_name
 
 
-def find_dependencies(file_info_list):
+def find_dependencies(type_infos):
     """Find which classes reference which other classes in the project (import-based).
 
     Uses import statements to determine dependencies. O(N) instead of O(N²).
     Handles both explicit imports (com.example.Foo) and wildcard imports (com.example.*).
     """
-    indexes = _build_dependency_indexes(file_info_list)
-    _, package_to_fqns, simple_to_fqns, _, _ = indexes
+    indexes = _build_dependency_indexes(type_infos)
+    fq_names, package_to_fqns, simple_to_fqns, _, _ = indexes
 
     deps = {}
-    for info in file_info_list:
+    for info in type_infos:
         source_name = _qualified_name(info)
         if not source_name:
             continue
@@ -393,24 +282,18 @@ def find_dependencies(file_info_list):
 
         for imp in info.get("imports", []):
             if imp.endswith(".*"):
-                # Wildcard: match all project classes in that package
-                pkg = imp[:-2]  # strip .*
-                for fq_name in package_to_fqns.get(pkg, []):
+                for fq_name in package_to_fqns.get(imp[:-2], []):
                     if fq_name != source_name:
                         referenced.add(fq_name)
-            else:
-                if imp in indexes[0] and imp != source_name:
-                    referenced.add(imp)
+            elif imp in fq_names and imp != source_name:
+                referenced.add(imp)
 
-        # Also check extends/implements — those are direct references
-        if info["extends"]:
-            ext = _resolve_type_reference(info["extends"], info, indexes)
-            if ext and ext != source_name:
-                referenced.add(ext)
-        for iface in info.get("implements", []):
-            iface_name = _resolve_type_reference(iface, info, indexes)
-            if iface_name and iface_name != source_name:
-                referenced.add(iface_name)
+        for ref in [info["extends"]] + list(info.get("implements", [])):
+            if not ref:
+                continue
+            resolved = _resolve_type_reference(ref, info, indexes)
+            if resolved and resolved != source_name:
+                referenced.add(resolved)
 
         if referenced:
             display_name = _dependency_display_name(source_name, simple_to_fqns)
@@ -425,28 +308,24 @@ def find_dependencies(file_info_list):
 # Call hierarchy / impact support
 # ---------------------------------------------------------------------------
 
-def _iter_method_nodes(file_infos):
+def _iter_method_nodes(type_infos):
     """Yield normalized method nodes from project scan results."""
-    for info in file_infos:
+    for info in type_infos:
         fq_class = _qualified_name(info)
         if not fq_class:
             continue
-
         fields_by_name = {
             field["name"]: field["type"]
             for field in info.get("fields_detail", [])
             if field.get("name") and field.get("type")
         }
-
         for method in info.get("methods_detail", []):
             yield {
                 "class_name": info.get("class_name"),
                 "fq_class": fq_class,
                 "name": method["name"],
                 "identity": method["identity"],
-                "sig": method["sig"],
                 "start": method["start"],
-                "end": method["end"],
                 "calls": method.get("calls", []),
                 "filepath": info.get("filepath"),
                 "info": info,
@@ -456,17 +335,7 @@ def _iter_method_nodes(file_infos):
 
 def _method_key(method):
     """Build a unique key for a normalized method node."""
-    return (
-        str(method.get("filepath")),
-        method["fq_class"],
-        method["identity"],
-        method["start"],
-    )
-
-
-def _method_display(method):
-    """Build a compact display label for a normalized method node."""
-    return f"{method['fq_class']}.{method['identity']}"
+    return (str(method.get("filepath")), method["fq_class"], method["identity"], method["start"])
 
 
 def _method_location(method):
@@ -482,36 +351,40 @@ def _resolve_call_target(call, source_method, indexes):
         return source_method["fq_class"], call
 
     owner, method_name = call.rsplit(".", 1)
-    type_name = None
-
     if owner == "super":
         type_name = source_method["info"].get("extends")
     elif owner in source_method["fields_by_name"]:
         type_name = source_method["fields_by_name"][owner]
-    elif owner and owner[0].isupper():
+    elif owner[:1].isupper():
         # Static calls such as FooFactory.create() use the class name as owner.
         type_name = owner
+    else:
+        type_name = None
 
     if not type_name:
         return None
-
     fq_class = _resolve_type_reference(type_name, source_method["info"], indexes)
     if not fq_class:
         return None
-
     return fq_class, method_name
 
 
-def _build_call_graph(file_infos):
-    """Build resolved method-level incoming and outgoing call edges."""
-    methods = list(_iter_method_nodes(file_infos))
+def _build_call_graph(type_infos):
+    """Build resolved method-level incoming and outgoing call edges.
+
+    Returns ``(methods, methods_by_key, incoming, outgoing, display)`` where
+    ``display`` renders a method as ``Class.identity``, fully qualified only
+    when the simple class name is ambiguous in the project.
+    """
+    methods = list(_iter_method_nodes(type_infos))
     methods_by_key = {_method_key(method): method for method in methods}
 
     methods_by_class_name = defaultdict(list)
     for method in methods:
         methods_by_class_name[(method["fq_class"], method["name"])].append(method)
 
-    indexes = _build_dependency_indexes(file_infos)
+    indexes = _build_dependency_indexes(type_infos)
+    simple_to_fqns = indexes[2]
     incoming = defaultdict(list)
     outgoing = defaultdict(list)
     seen_edges = set()
@@ -522,22 +395,22 @@ def _build_call_graph(file_infos):
             resolved = _resolve_call_target(call, source, indexes)
             if not resolved:
                 continue
-
             candidates = methods_by_class_name.get(resolved, [])
             if len(candidates) != 1:
                 continue
-
-            target = candidates[0]
-            target_key = _method_key(target)
+            target_key = _method_key(candidates[0])
             edge = (source_key, target_key)
             if edge in seen_edges:
                 continue
-
             seen_edges.add(edge)
             outgoing[source_key].append(target_key)
             incoming[target_key].append(source_key)
 
-    return methods, methods_by_key, incoming, outgoing
+    def display(method):
+        cls = _dependency_display_name(method["fq_class"], simple_to_fqns)
+        return f"{cls}.{method['identity']}"
+
+    return methods, methods_by_key, incoming, outgoing, display
 
 
 def _resolve_target_method(methods, target):
@@ -562,28 +435,17 @@ def _resolve_target_method(methods, target):
     return None, candidates, f"Ambiguous target: {target}"
 
 
-def _append_candidate_lines(out, candidates):
-    """Append target candidate lines to output."""
-    out.append("// candidates:")
-    for method in sorted(candidates, key=lambda m: (_method_display(m), _method_location(m))):
-        out.append(f"//   {_method_display(method)}  {_method_location(method)}")
-
-
-def _append_call_tree(out, root, edges, methods_by_key, depth, arrow, indent_level=1, seen=None):
+def _append_call_tree(out, root, edges, methods_by_key, display, depth, arrow, indent_level=1, seen=None):
     """Append a bounded caller/callee tree rooted at a method."""
     if seen is None:
         seen = {_method_key(root)}
-
     if depth <= 0:
         return
 
-    next_keys = [
-        key for key in edges.get(_method_key(root), [])
-        if key not in seen
-    ]
+    next_keys = [key for key in edges.get(_method_key(root), []) if key not in seen]
     next_methods = sorted(
         (methods_by_key[key] for key in next_keys),
-        key=lambda m: (_method_display(m), _method_location(m)),
+        key=lambda m: (display(m), _method_location(m)),
     )
 
     if not next_methods and indent_level == 1:
@@ -592,164 +454,166 @@ def _append_call_tree(out, root, edges, methods_by_key, depth, arrow, indent_lev
 
     prefix = "  " * indent_level
     for method in next_methods:
-        out.append(f"// {prefix}{arrow} {_method_display(method)}  {_method_location(method)}")
+        out.append(f"// {prefix}{arrow} {display(method)}  {_method_location(method)}")
         _append_call_tree(
-            out,
-            method,
-            edges,
-            methods_by_key,
-            depth - 1,
-            arrow,
-            indent_level + 1,
-            seen | {_method_key(method)},
+            out, method, edges, methods_by_key, display, depth - 1, arrow,
+            indent_level + 1, seen | {_method_key(method)},
         )
 
 
-def format_callers_output(file_infos, target, depth=1):
+def _format_hierarchy(type_infos, target, depth, title, include_callees):
+    """Shared renderer for --callers and --impact."""
+    methods, methods_by_key, incoming, outgoing, display = _build_call_graph(type_infos)
+    target_method, candidates, error = _resolve_target_method(methods, target)
+
+    out = [f"// === {title}: {target} (depth {depth}) ==="]
+    if error:
+        out.append(f"// {error}")
+        if candidates:
+            out.append("// candidates:")
+            for method in sorted(candidates, key=lambda m: (m["fq_class"], _method_location(m))):
+                out.append(f"//   {method['fq_class']}.{method['identity']}  {_method_location(method)}")
+            out.append("// use the fully-qualified class name to disambiguate")
+        return "\n".join(out)
+
+    out.append(f"// target: {display(target_method)}  {_method_location(target_method)}")
+    out.append("//")
+    out.append("// callers:")
+    _append_call_tree(out, target_method, incoming, methods_by_key, display, depth, "←")
+    if include_callees:
+        out.append("//")
+        out.append("// calls:")
+        _append_call_tree(out, target_method, outgoing, methods_by_key, display, depth, "→")
+    return "\n".join(out)
+
+
+def format_callers_output(type_infos, target, depth=1):
     """Format a bounded upstream caller hierarchy for a Class.method target."""
-    methods, methods_by_key, incoming, _ = _build_call_graph(file_infos)
-    target_method, candidates, error = _resolve_target_method(methods, target)
-
-    out = [f"// === Callers: {target} (depth {depth}) ==="]
-    if error:
-        out.append(f"// {error}")
-        if candidates:
-            _append_candidate_lines(out, candidates)
-            out.append("// use the fully-qualified class name to disambiguate")
-        return "\n".join(out)
-
-    out.append(f"// target: {_method_display(target_method)}  {_method_location(target_method)}")
-    out.append("//")
-    out.append("// callers:")
-    _append_call_tree(out, target_method, incoming, methods_by_key, depth, "←")
-    return "\n".join(out)
+    return _format_hierarchy(type_infos, target, depth, "Callers", include_callees=False)
 
 
-def format_impact_output(file_infos, target, depth=1):
+def format_impact_output(type_infos, target, depth=1):
     """Format bounded upstream callers and downstream callees for a target."""
-    methods, methods_by_key, incoming, outgoing = _build_call_graph(file_infos)
-    target_method, candidates, error = _resolve_target_method(methods, target)
-
-    out = [f"// === Impact: {target} (depth {depth}) ==="]
-    if error:
-        out.append(f"// {error}")
-        if candidates:
-            _append_candidate_lines(out, candidates)
-            out.append("// use the fully-qualified class name to disambiguate")
-        return "\n".join(out)
-
-    out.append(f"// target: {_method_display(target_method)}  {_method_location(target_method)}")
-    out.append("//")
-    out.append("// callers:")
-    _append_call_tree(out, target_method, incoming, methods_by_key, depth, "←")
-    out.append("//")
-    out.append("// calls:")
-    _append_call_tree(out, target_method, outgoing, methods_by_key, depth, "→")
-    return "\n".join(out)
+    return _format_hierarchy(type_infos, target, depth, "Impact", include_callees=True)
 
 
-def _count_unique_files(file_infos):
-    """Count files and lines once per filepath, not once per top-level type."""
-    unique_files = {}
-    fallback_count = 0
-    fallback_lines = 0
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
-    for info in file_infos:
-        filepath = info.get("filepath")
-        if filepath is None:
-            fallback_count += 1
-            fallback_lines += info.get("total_lines", 0)
-            continue
+def _type_row(info):
+    """Render one project-map row for a type."""
+    name = info["class_name"] or "(unknown)"
+    ctype = info["class_type"] or "?"
 
-        if filepath not in unique_files:
-            unique_files[filepath] = info.get("total_lines", 0)
+    if ctype == "enum" and info["enum_constants"]:
+        desc = f"{ctype} {name} {{ {format_enum_constants(info['enum_constants'], ENUM_CONSTANTS_MAP_MAX)} }}"
+    else:
+        desc = f"{ctype} {name}"
+    if info["extends"]:
+        desc += f" extends {info['extends']}"
+    if info["implements"]:
+        keyword = "extends" if ctype == "interface" else "implements"
+        desc += f" {keyword} {', '.join(info['implements'])}"
 
-    return len(unique_files) + fallback_count, sum(unique_files.values()) + fallback_lines
+    key_anns = [a for a in info["annotations"] if a in KEY_CLASS_ANNOTATIONS]
+    ann_str = f" {' '.join(key_anns)}" if key_anns else ""
+
+    extras = []
+    if info["field_count"]:
+        extras.append(f"{info['field_count']}F")
+    if info["method_count"]:
+        extras.append(f"{info['method_count']}M")
+    extras.append(f"{info['total_lines']}L")
+    if info["lombok"]:
+        extras.append(f"lombok:{','.join(a.lstrip('@') for a in info['lombok'])}")
+    if info["static_initializers"]:
+        ranges = ", ".join(f"L{s['start']}-L{s['end']}" for s in info["static_initializers"])
+        extras.append(f"static-init:{ranges}")
+    if info["inner_types"]:
+        extras.append(f"inner:{','.join(t.split()[-1] for t in info['inner_types'])}")
+
+    return f"//   {desc}{ann_str} [{' | '.join(extras)}]"
+
+
+def _stereotype(info):
+    """Return the Spring stereotype annotation of a type, or an empty string."""
+    return next((a for a in info["annotations"] if a in SPRING_STEREOTYPES), "")
+
+
+def _format_beans(out, type_infos):
+    """Append the --beans sections: DI wiring, @Bean producers, config properties."""
+    bean_entries = sorted(
+        (info["class_name"], _stereotype(info), info["bean_deps"])
+        for info in type_infos if info["bean_deps"]
+    )
+    if bean_entries:
+        out.append("// === Bean Dependencies ===")
+        for name, ann, deps in bean_entries:
+            ann_str = f" {ann}" if ann else ""
+            out.append(f"//   {name}{ann_str} ← {', '.join(deps)}")
+        out.append("//")
+
+    producer_entries = sorted(
+        (info["class_name"], _stereotype(info), info["bean_produces"])
+        for info in type_infos if info["bean_produces"]
+    )
+    if producer_entries:
+        out.append("// === Bean Producers (@Bean) ===")
+        for name, ann, produces in producer_entries:
+            ann_str = f" {ann}" if ann else ""
+            counts = {}
+            for p in produces:
+                counts[p] = counts.get(p, 0) + 1
+            deduped = [f"{p}(x{c})" if c > 1 else p for p, c in counts.items()]
+            out.append(f"//   {name}{ann_str} → {', '.join(deduped)}")
+        out.append("//")
+
+    config_entries = sorted(
+        (info["config_prefix"], info["class_name"],
+         [f"{f['type']} {f['name']}" for f in info["fields_detail"]])
+        for info in type_infos if info["config_prefix"]
+    )
+    if config_entries:
+        out.append("// === Configuration Properties ===")
+        for prefix, name, fields in config_entries:
+            suffix = f": {', '.join(fields)}" if fields else ""
+            out.append(f"//   {prefix}.* ({name}){suffix}")
+        out.append("//")
 
 
 def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=False):
     """Format the project map."""
-    out = []
+    type_infos = flatten_types(file_infos)
+    out = [f"// Project Map: {len(file_infos)} files, {sum(f['total_lines'] for f in file_infos)} lines", "//"]
 
     packages = defaultdict(list)
-    for info in file_infos:
-        pkg = info["package"] or "(default)"
-        packages[pkg].append(info)
+    for f in file_infos:
+        packages[f["package"] or "(default)"].append(f)
 
-    total_files, total_lines = _count_unique_files(file_infos)
-
-    out.append(f"// Project Map: {total_files} files, {total_lines} lines")
-    out.append("//")
-
-    for pkg in sorted(packages.keys()):
-        infos = sorted(packages[pkg], key=lambda x: x["class_name"] or "")
-        pkg_files, pkg_lines = _count_unique_files(infos)
-        out.append(f"// {pkg} ({pkg_files} files, {pkg_lines} lines)")
-
-        for info in infos:
-            name = info["class_name"] or "(unknown)"
-            ctype = info["class_type"] or "?"
-
-            parts = []
-            if info["annotations"]:
-                key_anns = [a for a in info["annotations"] if a in (
-                    "@Entity", "@Service", "@Component", "@Controller",
-                    "@RestController", "@Configuration", "@Repository",
-                    "@Data", "@Value", "@Builder",
-                )]
-                if key_anns:
-                    parts.append(" ".join(key_anns))
-
-            # For enums, show constants inline
-            if ctype == "enum" and info.get("enum_constants"):
-                constants = info["enum_constants"]
-                if len(constants) <= 6:
-                    desc = f"{ctype} {name} {{ {', '.join(constants)} }}"
-                else:
-                    desc = f"{ctype} {name} {{ {', '.join(constants[:5])}, ...+{len(constants) - 5} }}"
-            else:
-                desc = f"{ctype} {name}"
-            if info["extends"]:
-                desc += f" extends {info['extends']}"
-            if info["implements"]:
-                keyword = "extends" if ctype == "interface" else "implements"
-                desc += f" {keyword} {', '.join(info['implements'])}"
-
-            extras = []
-            if info["field_count"]:
-                extras.append(f"{info['field_count']}F")
-            if info["method_count"]:
-                extras.append(f"{info['method_count']}M")
-            extras.append(f"{info['total_lines']}L")
-            if info["lombok"]:
-                extras.append(f"lombok:{','.join(a.lstrip('@') for a in info['lombok'])}")
-            if info.get("static_initializers"):
-                si = info["static_initializers"]
-                ranges = ", ".join(f"L{s['start']}-L{s['end']}" for s in si)
-                extras.append(f"static-init:{ranges}")
-            if info["inner_types"]:
-                extras.append(f"inner:{','.join(t.split()[-1] for t in info['inner_types'])}")
-
-            extra_str = " | ".join(extras)
-            ann_str = f" {' '.join(parts)}" if parts else ""
-            out.append(f"//   {desc}{ann_str} [{extra_str}]")
-
+    for pkg in sorted(packages):
+        files = packages[pkg]
+        pkg_lines = sum(f["total_lines"] for f in files)
+        pkg_anns = [a for f in files for a in f["package_annotations"]]
+        header = f"// {pkg} ({len(files)} files, {pkg_lines} lines)"
+        if pkg_anns:
+            header += f" {' '.join(pkg_anns)}"
+        out.append(header)
+        rows = sorted(flatten_types(files), key=lambda x: x["class_name"] or "")
+        out.extend(_type_row(info) for info in rows)
         out.append("//")
 
     if show_deps:
-        deps = find_dependencies(file_infos)
+        deps = find_dependencies(type_infos)
         if deps:
             out.append("// === Dependencies ===")
-            for name in sorted(deps.keys()):
-                refs = deps[name]
-                out.append(f"//   {name} → {', '.join(refs)}")
+            for name in sorted(deps):
+                out.append(f"//   {name} → {', '.join(deps[name])}")
             out.append("//")
 
     if show_endpoints:
-        all_endpoints = []
-        for info in file_infos:
-            for ep in info.get("endpoints", []):
-                all_endpoints.append(ep)
+        collect_endpoints(type_infos)
+        all_endpoints = [ep for info in type_infos for ep in info["endpoints"]]
         if all_endpoints:
             all_endpoints.sort(key=lambda e: (e["path"], e["method"]))
             max_method = max(len(e["method"]) for e in all_endpoints)
@@ -763,200 +627,75 @@ def format_output(file_infos, show_deps=False, show_endpoints=False, show_beans=
             out.append("//")
 
     if show_beans:
-        bean_entries = []
-        for info in file_infos:
-            if info.get("bean_deps"):
-                ann = next(
-                    (a for a in info["annotations"] if a in (
-                        "@Service", "@Component", "@Repository",
-                        "@Controller", "@RestController", "@Configuration",
-                    )),
-                    "",
-                )
-                bean_entries.append((info["class_name"], ann, info["bean_deps"]))
-        if bean_entries:
-            out.append("// === Bean Dependencies ===")
-            for name, ann, deps in sorted(bean_entries):
-                ann_str = f" {ann}" if ann else ""
-                out.append(f"//   {name}{ann_str} ← {', '.join(deps)}")
-            out.append("//")
-
-        # Bean producers (@Bean factory methods)
-        producer_entries = []
-        for info in file_infos:
-            if info.get("bean_produces"):
-                ann = next(
-                    (a for a in info["annotations"] if a in (
-                        "@Configuration", "@Component", "@Service",
-                    )),
-                    "",
-                )
-                producer_entries.append((info["class_name"], ann, info["bean_produces"]))
-        if producer_entries:
-            out.append("// === Bean Producers (@Bean) ===")
-            for name, ann, produces in sorted(producer_entries):
-                ann_str = f" {ann}" if ann else ""
-                # Deduplicate while preserving order; show count for repeated types
-                seen = {}
-                for p in produces:
-                    seen[p] = seen.get(p, 0) + 1
-                deduped = []
-                for p, count in seen.items():
-                    deduped.append(f"{p}(x{count})" if count > 1 else p)
-                out.append(f"//   {name}{ann_str} → {', '.join(deduped)}")
-            out.append("//")
-
-        # Configuration properties
-        config_entries = []
-        for info in file_infos:
-            if info.get("config_prefix"):
-                fields = [f"{f['type']} {f['name']}" for f in info.get("fields_detail", [])]
-                config_entries.append((info["config_prefix"], info["class_name"], fields))
-        if config_entries:
-            out.append("// === Configuration Properties ===")
-            for prefix, name, fields in sorted(config_entries):
-                if fields:
-                    out.append(f"//   {prefix}.* ({name}): {', '.join(fields)}")
-                else:
-                    out.append(f"//   {prefix}.* ({name})")
-            out.append("//")
+        _format_beans(out, type_infos)
 
     return "\n".join(out)
 
 
-def _parse_args(argv):
-    """Parse CLI arguments."""
-    src_dir = None
-    show_deps = False
-    show_endpoints = False
-    show_beans = False
-    pkg_filter = None
-    ann_filter = None
-    ext_filter = None
-    impl_filter = None
-    callers_target = None
-    impact_target = None
-    depth = 1
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--deps":
-            show_deps = True
-            i += 1
-        elif argv[i] == "--endpoints":
-            show_endpoints = True
-            i += 1
-        elif argv[i] == "--beans":
-            show_beans = True
-            i += 1
-        elif argv[i] == "--package" and i + 1 < len(argv):
-            pkg_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == "--annotation" and i + 1 < len(argv):
-            ann_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == "--extends" and i + 1 < len(argv):
-            ext_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == "--implements" and i + 1 < len(argv):
-            impl_filter = argv[i + 1]
-            i += 2
-        elif argv[i] == "--callers" and i + 1 < len(argv):
-            callers_target = argv[i + 1]
-            i += 2
-        elif argv[i] == "--impact" and i + 1 < len(argv):
-            impact_target = argv[i + 1]
-            i += 2
-        elif argv[i] == "--depth" and i + 1 < len(argv):
-            try:
-                depth = max(0, int(argv[i + 1]))
-            except ValueError:
-                depth = 1
-            i += 2
-        elif src_dir is None:
-            src_dir = argv[i]
-            i += 1
-        else:
-            i += 1
-    return (
-        src_dir, show_deps, show_endpoints, show_beans,
-        pkg_filter, ann_filter, ext_filter, impl_filter,
-        callers_target, impact_target, depth,
-    )
+# ---------------------------------------------------------------------------
+# Filtering and entry point
+# ---------------------------------------------------------------------------
 
-
-def _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter=None):
-    """Filter file infos by package, annotation, superclass, or implemented interface."""
-    result = file_infos
-    if pkg_filter:
-        result = [i for i in result if i["package"] and i["package"].startswith(pkg_filter)]
+def _matches_type(info, ann_filter, ext_filter, impl_filter):
     if ann_filter:
         ann = ann_filter if ann_filter.startswith("@") else "@" + ann_filter
-        result = [i for i in result if any(a.startswith(ann) for a in i["annotations"])]
-    if ext_filter:
-        result = [i for i in result if i["extends"] and ext_filter in i["extends"]]
-    if impl_filter:
-        result = [i for i in result if any(
-            impl_filter in iface.split("<")[0] for iface in i.get("implements", [])
-        )]
+        if not any(a.startswith(ann) for a in info["annotations"]):
+            return False
+    if ext_filter and not (info["extends"] and ext_filter in info["extends"]):
+        return False
+    if impl_filter and not any(
+        impl_filter in iface.split("<")[0] for iface in info.get("implements", [])
+    ):
+        return False
+    return True
+
+
+def filter_files(file_infos, pkg_filter=None, ann_filter=None, ext_filter=None, impl_filter=None):
+    """Filter scanned files by package prefix and their types by class-level filters.
+
+    Files left with no matching type are dropped when a type-level filter
+    is active; otherwise every file in the package (package-info included)
+    is kept.
+    """
+    type_filter_active = bool(ann_filter or ext_filter or impl_filter)
+    result = []
+    for f in file_infos:
+        if pkg_filter and not (f["package"] or "").startswith(pkg_filter):
+            continue
+        types = [t for t in f["types"] if _matches_type(t, ann_filter, ext_filter, impl_filter)]
+        if type_filter_active and not types:
+            continue
+        result.append({**f, "types": types})
     return result
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python3 jskim_project.py <src_dir> [--deps] [--endpoints] [--beans]"
-            " [--package pkg] [--annotation @Ann] [--extends Class] [--implements Interface]"
-            " [--callers Class.method] [--impact Class.method] [--depth N]",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    (
-        src_dir_str, show_deps, show_endpoints, show_beans,
-        pkg_filter, ann_filter, ext_filter, impl_filter,
-        callers_target, impact_target, depth,
-    ) = (
-        _parse_args(sys.argv[1:])
-    )
-
-    if not src_dir_str:
-        print("Error: no source directory specified", file=sys.stderr)
-        sys.exit(1)
-
-    src_dir = Path(src_dir_str)
-
+def main(args):
+    """Scan the directory in ``args.paths[0]`` and print the requested view."""
+    src_dir = Path(args.paths[0])
     if not src_dir.is_dir():
         print(f"Error: {src_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
     java_files = sorted(src_dir.rglob("*.java"))
-
     if not java_files:
         print(f"No .java files found in {src_dir}", file=sys.stderr)
         sys.exit(1)
 
-    file_infos = []
-    for f in java_files:
-        infos = scan_java_file(f)
-        file_infos.extend(infos)
+    file_infos = [scan_java_file(f) for f in java_files]
+    if args.package or args.annotation or args.extends or args.implements:
+        file_infos = filter_files(file_infos, args.package, args.annotation, args.extends, args.implements)
 
-    if pkg_filter or ann_filter or ext_filter or impl_filter:
-        file_infos = _filter_infos(file_infos, pkg_filter, ann_filter, ext_filter, impl_filter)
-
-    if callers_target and impact_target:
+    if args.callers and args.impact:
         print("Error: use only one of --callers or --impact", file=sys.stderr)
         sys.exit(1)
 
-    if callers_target:
-        print(format_callers_output(file_infos, callers_target, depth=depth))
+    depth = max(0, args.depth)
+    type_infos = flatten_types(file_infos)
+    if args.callers:
+        print(format_callers_output(type_infos, args.callers, depth=depth))
+        return
+    if args.impact:
+        print(format_impact_output(type_infos, args.impact, depth=depth))
         return
 
-    if impact_target:
-        print(format_impact_output(file_infos, impact_target, depth=depth))
-        return
-
-    print(format_output(file_infos, show_deps, show_endpoints, show_beans))
-
-
-if __name__ == "__main__":
-    main()
+    print(format_output(file_infos, args.deps, args.endpoints, args.beans))

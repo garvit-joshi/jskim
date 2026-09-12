@@ -1273,3 +1273,271 @@ class TestRecordWithImplements:
         text = build_class_declaration_text(decl)
         assert "record Point" in text
         assert "implements" in text
+
+
+# ---------------------------------------------------------------------------
+# Structured parsing: parse_java_source / parse_type
+# ---------------------------------------------------------------------------
+
+from jskim.util import (
+    parse_java_source,
+    parse_parameters,
+    resolve_string_expression,
+    extract_string_constants,
+    classify_method,
+    instance_fields,
+    static_fields,
+    NOISE_ANNOTATIONS,
+    SPRING_STEREOTYPES,
+)
+
+
+def _first_type(source):
+    return parse_java_source(source)["types"][0]
+
+
+class TestParseJavaSource:
+    def test_shape(self):
+        parsed = parse_java_source("package a.b; import x.Y; class C {}")
+        assert parsed["package"] == "a.b"
+        assert parsed["imports"] == ["x.Y"]
+        assert parsed["package_annotations"] == []
+        assert [t["name"] for t in parsed["types"]] == ["C"]
+        assert parsed["total_lines"] == 1
+
+    def test_accepts_bytes(self):
+        assert parse_java_source(b"class C {}")["types"][0]["name"] == "C"
+
+    def test_type_dict_keys(self):
+        t = _first_type("@Service class C extends B implements I { }")
+        assert t["kind"] == "class"
+        assert t["declaration"] == "class C extends B implements I"
+        assert t["annotation_names"] == ["@Service"]
+        assert t["annotations"][0]["full"] == "@Service"
+        assert t["extends"] == "B"
+        assert t["implements"] == ["I"]
+
+    def test_fields_carry_static_and_final(self):
+        t = _first_type("class C { static final String A = \"a\"; final Foo foo; Bar bar; }")
+        assert [(f["name"], f["static"], f["final"]) for f in t["fields"]] == [
+            ("A", True, True), ("foo", False, True), ("bar", False, False),
+        ]
+        assert [f["name"] for f in instance_fields(t)] == ["foo", "bar"]
+        assert [f["name"] for f in static_fields(t)] == ["A"]
+
+    def test_record_components_first_and_flagged(self):
+        t = _first_type("record R(int x) { static final int MAX = 1; }")
+        assert t["fields"][0]["name"] == "x"
+        assert t["fields"][0]["component"] is True
+        assert t["fields"][1]["static"] is True
+
+    def test_string_constants_collected(self):
+        t = _first_type("""
+        class C {
+            static final String BASE = "/api";
+            static final String ONE = BASE + "/{id}";
+            static final String LATER = EARLY + "!";
+            static final String EARLY = "e";
+            static final int N = 3;
+            static final String UNRESOLVED = Other.X;
+        }
+        """)
+        assert t["constants"] == {"BASE": "/api", "ONE": "/api/{id}", "LATER": "e!", "EARLY": "e"}
+
+    def test_method_dict(self):
+        t = _first_type("class C { @Transactional public List<X> find(int id, String... names) { repo.get(id); } }")
+        m = t["methods"][0]
+        assert m["name"] == "find"
+        assert m["kind"] == "method"
+        assert m["identity"] == "find(int, String...)"
+        assert m["sig"] == "public List<X> find(int id, String... names)"
+        assert m["return_type"] == "List<X>"
+        assert [p["name"] for p in m["params"]] == ["id", "names"]
+        assert m["annotations"][0]["full"] == "@Transactional"
+
+    def test_constructor_kind(self):
+        t = _first_type("class C { C(int x) {} }")
+        assert t["methods"][0]["kind"] == "constructor"
+        assert t["methods"][0]["return_type"] is None
+
+    def test_calls_filtered_to_fields_and_classes(self):
+        t = _first_type("""
+        class C {
+            private final Repo repo;
+            void run(Req req) {
+                Row row = repo.find(req.id());
+                row.status();
+                Util.check(row);
+                this.repo.save(row);
+                helper();
+                super.run(req);
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["Util.check", "helper", "repo.find", "repo.save", "super.run"]
+
+    def test_inner_types(self):
+        t = _first_type("class C { @Data static class Inner {} enum E { A } }")
+        inner = t["inner_types"]
+        assert [(i["kind"], i["name"]) for i in inner] == [("class", "Inner"), ("enum", "E")]
+        assert inner[0]["annotations"][0]["full"] == "@Data"
+        assert inner[0]["declaration"] == "static class Inner"
+
+    def test_package_annotations(self):
+        parsed = parse_java_source('@ApplicationModule(displayName = "X")\npackage a;\n')
+        assert parsed["package_annotations"][0]["full"] == '@ApplicationModule(displayName = "X")'
+        assert parsed["types"] == []
+
+    def test_implicit_class(self):
+        parsed = parse_java_source("void main() {}", source_name="Script.java")
+        t = parsed["types"][0]
+        assert t["kind"] == "implicit class"
+        assert t["name"] == "Script"
+        assert t["declaration"] == "implicit class Script"
+
+
+class TestAnnotationRendering:
+    def test_noise_annotations_dropped(self):
+        t = _first_type('@Operation(summary = "s") @Tag(name = "t") @Service class C {}')
+        assert [a["full"] for a in t["annotations"]] == ["@Service"]
+        assert t["annotation_names"] == ["@Operation", "@Tag", "@Service"]
+
+    def test_repeated_annotations_deduped(self):
+        t = _first_type("class C { @Deprecated @Deprecated void f() {} }")
+        assert [a["full"] for a in t["methods"][0]["annotations"]] == ["@Deprecated"]
+
+    def test_arguments_shown_for_any_annotation(self):
+        t = _first_type("class C { @RequiresPermission(Perms.READ) @ResponseStatus(HttpStatus.CREATED) void f() {} }")
+        assert [a["full"] for a in t["methods"][0]["annotations"]] == [
+            "@RequiresPermission(Perms.READ)", "@ResponseStatus(HttpStatus.CREATED)",
+        ]
+
+    def test_multiline_arguments_normalized_and_capped(self):
+        t = _first_type("""
+        class C {
+            @ConditionalOnProperty(
+                name = "feature.flag",
+                havingValue = "true")
+            @Scheduled(cron = "0 0 * * * *", zone = "UTC", fixedDelayString = "${x}", initialDelayString = "${yyyyyyyyyyyyyyyyyyyy}")
+            void f() {}
+        }
+        """)
+        anns = [a["full"] for a in t["methods"][0]["annotations"]]
+        assert anns[0] == '@ConditionalOnProperty(name = "feature.flag", havingValue = "true")'
+        assert "\n" not in anns[1]
+        assert anns[1].endswith("...)")
+        assert len(anns[1]) <= len("@Scheduled") + 80
+
+    def test_mapping_annotations_show_resolved_path_only(self):
+        t = _first_type("""
+        @RequestMapping(C.BASE)
+        class C {
+            static final String BASE = "/api";
+            static final String ONE = "/{id}";
+            @GetMapping(path = ONE, produces = "application/json") void get() {}
+            @RequestMapping(method = RequestMethod.DELETE, value = ONE) void del() {}
+            @PostMapping void post() {}
+        }
+        """)
+        assert t["annotations"][0]["full"] == '@RequestMapping("/api")'
+        anns = [m["annotations"][0]["full"] for m in t["methods"]]
+        assert anns == ['@GetMapping("/{id}")', '@RequestMapping(DELETE "/{id}")', "@PostMapping"]
+
+    def test_parameter_annotations_keep_marker_only(self):
+        t = _first_type("""
+        class C {
+            void f(@Parameter(description = "doc") @RequestParam(required = false) final Integer size,
+                   @PathVariable UUID id, @Valid @RequestBody Body body) {}
+        }
+        """)
+        assert t["methods"][0]["sig"] == "void f(@RequestParam Integer size, @PathVariable UUID id, @Valid @RequestBody Body body)"
+
+
+class TestResolveStringExpression:
+    def _expr(self, java_expr):
+        root = parse_java_bytes(f'class C {{ String x = {java_expr}; }}'.encode())
+        decl = find_first_type_declaration(root)
+        field = get_body_members(get_class_body(decl))[0]
+        for child in field.named_children:
+            if child.type == "variable_declarator":
+                return child.child_by_field_name("value")
+
+    def test_literal(self):
+        assert resolve_string_expression(self._expr('"/a"')) == "/a"
+
+    def test_identifier_and_concat(self):
+        assert resolve_string_expression(self._expr('BASE + "/b"'), {"BASE": "/a"}) == "/a/b"
+
+    def test_qualified_and_parenthesized(self):
+        assert resolve_string_expression(self._expr('(Api.BASE + "/b")'), {"Api.BASE": "/a"}) == "/a/b"
+        assert resolve_string_expression(self._expr('Api.BASE'), {"BASE": "/a"}) == "/a"
+
+    def test_unresolvable(self):
+        assert resolve_string_expression(self._expr('BASE + "/b"')) is None
+        assert resolve_string_expression(self._expr('foo()')) is None
+        assert resolve_string_expression(self._expr('a - b'), {"a": "1", "b": "2"}) is None
+
+    def test_mapping_paths_with_constants_and_raw_fallback(self):
+        root = parse_java_bytes(b'@GetMapping({BASE + "/x", Unknown.Y}) class C {}')
+        ann = get_modifiers_node(find_first_type_declaration(root)).children[0]
+        assert extract_mapping_paths(ann, {"BASE": "/a"}) == ["/a/x", "Unknown.Y"]
+
+
+class TestParseParameters:
+    def _params(self, params):
+        root = parse_java_bytes(f"class C {{ void f({params}) {{}} }}".encode())
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
+        return parse_parameters(method.child_by_field_name("parameters"))
+
+    def test_plain(self):
+        assert self._params("int a, List<String> b")[1] == {"type": "List<String>", "name": "b", "annotations": []}
+
+    def test_varargs(self):
+        assert self._params("String... rest")[0] == {"type": "String...", "name": "rest", "annotations": []}
+
+    def test_annotations_and_final(self):
+        p = self._params("@Valid @RequestBody final Body body")[0]
+        assert p == {"type": "Body", "name": "body", "annotations": ["@Valid", "@RequestBody"]}
+
+    def test_array_dimensions_after_name(self):
+        assert self._params("String args[]")[0]["name"] == "args"
+
+
+class TestClassifyMethod:
+    def _method(self, source):
+        return _first_type(f"class C {{ {source} }}")["methods"][0]
+
+    @pytest.mark.parametrize("source,expected", [
+        ("public String getName() { return null; }", "getter"),
+        ("public boolean isActive() { return true; }", "getter"),
+        ("public Boolean isActive() { return true; }", "getter"),
+        ("public void setName(String n) {}", "setter"),
+        ("public C(int x) {}", "constructor"),
+        ("public void process() {}", "business"),
+        ("public String toString() { return null; }", "boilerplate"),
+        ("public boolean equals(Object o) { return false; }", "boilerplate"),
+        ("public int hashCode() { return 0; }", "boilerplate"),
+        ("public void getaway() {}", "business"),
+        ("public boolean isolate() { return true; }", "business"),
+        ("public void setName(String a, String b) {}", "business"),
+        ("public C setName(String n) { return this; }", "business"),
+        ("public String getName(int idx) { return null; }", "business"),
+        ("public void getName() {}", "business"),
+        ("public static Foo getInstance() { return null; }", "getter"),
+        ("default String getLabel() { return null; }", "getter"),
+    ])
+    def test_classification(self, source, expected):
+        assert classify_method(self._method(source)) == expected
+
+    def test_compact_constructor(self):
+        t = _first_type("record R(int x) { R { } }")
+        assert classify_method(t["methods"][0]) == "constructor"
+
+
+class TestNewConstants:
+    def test_noise_annotations_are_swagger_docs(self):
+        assert {"@Operation", "@ApiResponse", "@Schema", "@Parameter", "@Tag"} <= NOISE_ANNOTATIONS
+        assert "@Transactional" not in NOISE_ANNOTATIONS
+
+    def test_spring_stereotypes(self):
+        assert {"@Service", "@Component", "@Repository", "@RestController", "@Configuration"} <= SPRING_STEREOTYPES

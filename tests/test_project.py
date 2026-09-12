@@ -4,14 +4,60 @@ import pytest
 from pathlib import Path
 from jskim.project import (
     scan_java_file,
+    flatten_types,
+    collect_endpoints,
     find_dependencies,
     format_output,
     format_callers_output,
     format_impact_output,
-    _filter_infos,
+    filter_files,
     _join_paths,
 )
 from tests.conftest import fixture_path, FIXTURES_DIR
+
+
+def types_of(path):
+    return scan_java_file(path)["types"]
+
+
+def files_of(*paths):
+    return [scan_java_file(p) for p in paths]
+
+
+def synthetic_file(*type_infos, package="com.example", filepath=Path("/tmp/X.java"), lines=10):
+    """Wrap hand-built type dicts into a scanned-file dict."""
+    for t in type_infos:
+        t.setdefault("filepath", filepath)
+        t.setdefault("package", package)
+        t.setdefault("total_lines", lines)
+    return {
+        "filepath": filepath,
+        "package": package,
+        "package_annotations": [],
+        "imports": [],
+        "total_lines": lines,
+        "types": list(type_infos),
+    }
+
+
+def synthetic_type(name, package="com.example", imports=(), extends=None, implements=(), anns=()):
+    return {
+        "class_name": name,
+        "class_type": "class",
+        "package": package,
+        "imports": list(imports),
+        "extends": extends,
+        "implements": list(implements),
+        "annotations": list(anns),
+        "field_count": 0,
+        "method_count": 0,
+        "lombok": [],
+        "enum_constants": [],
+        "inner_types": [],
+        "static_initializers": [],
+        "total_lines": 10,
+        "filepath": Path(f"/tmp/{package.replace('.', '/')}/{name}.java"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -19,23 +65,16 @@ from tests.conftest import fixture_path, FIXTURES_DIR
 # ---------------------------------------------------------------------------
 
 class TestJoinPaths:
-    def test_both_empty(self):
-        assert _join_paths("", "") == "/"
-
-    def test_base_only(self):
-        assert _join_paths("/api", "") == "/api"
-
-    def test_method_only(self):
-        assert _join_paths("", "/users") == "/users"
-
-    def test_both_paths(self):
-        assert _join_paths("/api", "/users") == "/api/users"
-
-    def test_trailing_slash_stripped(self):
-        assert _join_paths("/api/", "/users") == "/api/users"
-
-    def test_no_leading_slash(self):
-        assert _join_paths("api", "users") == "api/users"
+    @pytest.mark.parametrize("base,method,expected", [
+        ("", "", "/"),
+        ("/api", "", "/api"),
+        ("", "/users", "/users"),
+        ("/api", "/users", "/api/users"),
+        ("/api/", "/users", "/api/users"),
+        ("api", "users", "api/users"),
+    ])
+    def test_join(self, base, method, expected):
+        assert _join_paths(base, method) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -44,159 +83,166 @@ class TestJoinPaths:
 
 class TestScanJavaFile:
     def test_simple_class(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        assert len(infos) == 1
-        info = infos[0]
+        f = scan_java_file(fixture_path("SimpleDirection.java"))
+        assert f["package"] == "com.example"
+        assert f["total_lines"] > 0
+        assert f["filepath"] == fixture_path("SimpleDirection.java")
+        assert len(f["types"]) == 1
+        info = f["types"][0]
         assert info["class_name"] == "SimpleDirection"
         assert info["class_type"] == "enum"
-        assert info["package"] == "com.example"
-
-    def test_enum_constants(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        info = infos[0]
         assert set(info["enum_constants"]) == {"NORTH", "SOUTH", "EAST", "WEST"}
 
     def test_spring_service(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert "@Service" in info["annotations"]
-        assert "@Slf4j" in info["annotations"]
-        assert "@RequiredArgsConstructor" in info["annotations"]
+        info = types_of(fixture_path("StaticFieldService.java"))[0]
+        assert {"@Service", "@Slf4j", "@RequiredArgsConstructor"} <= set(info["annotations"])
         assert info["field_count"] > 0
         assert info["method_count"] > 0
+        assert "@Slf4j" in info["lombok"]
+
+    def test_field_count_excludes_statics(self):
+        f = scan_java_file(fixture_path("StaticFieldService.java"))
+        info = f["types"][0]
+        assert info["field_count"] == 4  # 3 injected repositories/clients + lastOrderId; 6 statics excluded
 
     def test_configuration_bean_producers(self):
-        path = fixture_path("AppConfiguration.java")
-        infos = scan_java_file(path)
-        info = infos[0]
+        info = types_of(fixture_path("AppConfiguration.java"))[0]
         assert "@Configuration" in info["annotations"]
-        assert len(info["bean_produces"]) > 0
         assert "ObjectMapper" in info["bean_produces"]
         assert "OkHttpClient" in info["bean_produces"]
 
-    def test_bean_dependencies(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        # Should detect final fields as constructor-injected deps
-        assert "OrderRepository" in info["bean_deps"]
-        assert "PaymentRepository" in info["bean_deps"]
-        assert "NotificationClient" in info["bean_deps"]
+    def test_lombok_constructor_injection(self):
+        info = types_of(fixture_path("StaticFieldService.java"))[0]
+        assert info["bean_deps"] == ["OrderRepository", "PaymentRepository", "NotificationClient"]
 
-    def test_static_fields_not_deps(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        # Static fields should NOT be bean deps
-        assert "String" not in info["bean_deps"]
-        assert "int" not in info["bean_deps"]
-        assert "long" not in info["bean_deps"]
+    def test_explicit_constructor_injection(self, tmp_path):
+        path = tmp_path / "TripService.java"
+        path.write_text("""
+        package demo;
+        @Service
+        class TripService {
+            private static final String X = "x";
+            private final TripRepository trips;
+            private final Clock clock;
+            TripService(TripRepository trips, Clock clock) { this.trips = trips; this.clock = clock; }
+        }
+        """, encoding="utf-8")
+        info = types_of(path)[0]
+        assert info["bean_deps"] == ["TripRepository", "Clock"]
 
-    def test_lombok_detection(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert "@Slf4j" in info["lombok"]
-        assert "@RequiredArgsConstructor" in info["lombok"]
+    def test_field_injection(self, tmp_path):
+        path = tmp_path / "S.java"
+        path.write_text("@Component class S { @Autowired private Foo foo; private Bar bar; }", encoding="utf-8")
+        assert types_of(path)[0]["bean_deps"] == ["Foo"]
+
+    def test_non_bean_has_no_deps(self, tmp_path):
+        path = tmp_path / "P.java"
+        path.write_text("class P { P(Foo foo) {} }", encoding="utf-8")
+        assert types_of(path)[0]["bean_deps"] == []
 
     def test_extends_detection(self):
-        path = fixture_path("BusinessUnitsDao.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert info["extends"] is not None
+        info = types_of(fixture_path("BusinessUnitsDao.java"))[0]
         assert "DAOImpl" in info["extends"]
 
     def test_implements_detection(self):
-        path = fixture_path("RBDResultSetExtractor.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert len(info["implements"]) > 0
+        info = types_of(fixture_path("RBDResultSetExtractor.java"))[0]
         assert any("ResultSetExtractor" in i for i in info["implements"])
 
     def test_multiple_type_declarations(self):
-        path = fixture_path("SealedAndMultiClass.java")
-        infos = scan_java_file(path)
-        assert len(infos) == 3  # SealedAndMultiClass, Circle, Rectangle
-        names = [i["class_name"] for i in infos]
-        assert "SealedAndMultiClass" in names
-        assert "Circle" in names
-        assert "Rectangle" in names
+        names = [i["class_name"] for i in types_of(fixture_path("SealedAndMultiClass.java"))]
+        assert names == ["SealedAndMultiClass", "Circle", "Rectangle"]
 
     def test_jooq_enum(self):
-        path = fixture_path("ContractType.java")
-        infos = scan_java_file(path)
-        info = infos[0]
+        info = types_of(fixture_path("ContractType.java"))[0]
         assert info["class_type"] == "enum"
         assert set(info["enum_constants"]) == {"PACKAGE", "SLAB", "TRIP", "ZONE"}
 
-    def test_total_lines(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        assert infos[0]["total_lines"] > 0
-
-    def test_filepath_stored(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        assert infos[0]["filepath"] == path
-
-    def test_inner_types(self):
-        path = fixture_path("EdgeCaseBugs.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert len(info["inner_types"]) > 0
-
-    def test_static_initializer(self):
-        path = fixture_path("Role.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert len(info["static_initializers"]) > 0
+    def test_inner_types_and_static_initializer(self):
+        assert types_of(fixture_path("EdgeCaseBugs.java"))[0]["inner_types"]
+        assert types_of(fixture_path("Role.java"))[0]["static_initializers"]
 
     def test_kafka_config_beans(self):
-        path = fixture_path("CabCreationConsumerConfiguration.java")
-        infos = scan_java_file(path)
-        info = infos[0]
-        assert len(info["bean_produces"]) > 0
+        assert types_of(fixture_path("CabCreationConsumerConfiguration.java"))[0]["bean_produces"]
 
     def test_record_components_counted(self):
-        path = fixture_path("ModernJavaFeatures.java")
-        infos = scan_java_file(path)
-        # Find the Point record
+        infos = types_of(fixture_path("ModernJavaFeatures.java"))
         point = next(i for i in infos if i["class_name"] == "Point")
         assert point["class_type"] == "record"
-        assert point["field_count"] == 2  # x, y
-
-    def test_generic_record_components(self):
-        path = fixture_path("ModernJavaFeatures.java")
-        infos = scan_java_file(path)
+        assert point["field_count"] == 2
         response = next(i for i in infos if i["class_name"] == "Response")
-        assert response["class_type"] == "record"
-        assert response["field_count"] == 3  # data, message, code
+        assert response["field_count"] == 3
 
     def test_annotation_type_methods_counted(self):
-        path = fixture_path("AnnotationType.java")
-        infos = scan_java_file(path)
-        info = infos[0]
+        info = types_of(fixture_path("AnnotationType.java"))[0]
         assert info["class_type"] == "@interface"
-        assert info["method_count"] == 4  # value, priority, tags, enabled
+        assert info["method_count"] == 4
 
     def test_sealed_interface_scanned(self):
-        path = fixture_path("ModernJavaFeatures.java")
-        infos = scan_java_file(path)
-        shape = next(i for i in infos if i["class_name"] == "Shape")
+        shape = next(i for i in types_of(fixture_path("ModernJavaFeatures.java")) if i["class_name"] == "Shape")
         assert shape["class_type"] == "interface"
-        assert shape["method_count"] == 2  # area, perimeter
+        assert shape["method_count"] == 2
 
     def test_implicit_class_scanned(self):
-        path = fixture_path("ImplicitClass.java")
-        infos = scan_java_file(path)
+        infos = types_of(fixture_path("ImplicitClass.java"))
         assert len(infos) == 1
-        info = infos[0]
-        assert info["class_type"] == "implicit class"
-        assert info["class_name"] == "ImplicitClass"
-        assert info["method_count"] == 1
+        assert infos[0]["class_type"] == "implicit class"
+        assert infos[0]["class_name"] == "ImplicitClass"
+        assert infos[0]["method_count"] == 1
+
+    def test_package_info_scanned(self, tmp_path):
+        path = tmp_path / "package-info.java"
+        path.write_text(
+            '@ApplicationModule(displayName = "Evidence")\npackage demo.evidence;\n', encoding="utf-8"
+        )
+        f = scan_java_file(path)
+        assert f["types"] == []
+        assert f["package_annotations"] == ['@ApplicationModule(displayName = "Evidence")']
+
+
+# ---------------------------------------------------------------------------
+# collect_endpoints
+# ---------------------------------------------------------------------------
+
+class TestCollectEndpoints:
+    def _controller(self, tmp_path):
+        (tmp_path / "ApiPaths.java").write_text("""
+        package demo;
+        final class ApiPaths { static final String BASE = "/api/v1"; }
+        """, encoding="utf-8")
+        (tmp_path / "TripController.java").write_text("""
+        package demo;
+        @RestController
+        @RequestMapping(ApiPaths.BASE)
+        class TripController {
+            private static final String TRIPS = "/trips";
+            private static final String ONE_TRIP = TRIPS + "/{tripId}";
+            @PostMapping(path = TRIPS, consumes = "application/json") void create() {}
+            @GetMapping(ONE_TRIP + "/track") void track() {}
+            @RequestMapping(method = RequestMethod.DELETE, value = ONE_TRIP) void remove() {}
+            @GetMapping({"/a", "/b"}) void multi() {}
+            @GetMapping(Unknown.PATH) void unresolved() {}
+        }
+        """, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        collect_endpoints(types)
+        return next(t for t in types if t["class_name"] == "TripController")["endpoints"]
+
+    def test_paths_resolved_through_constants(self, tmp_path):
+        eps = {(e["method"], e["path"]): e["handler"] for e in self._controller(tmp_path)}
+        assert eps[("POST", "/api/v1/trips")] == "TripController.create()"
+        assert eps[("GET", "/api/v1/trips/{tripId}/track")] == "TripController.track()"
+        assert eps[("DELETE", "/api/v1/trips/{tripId}")] == "TripController.remove()"
+        assert ("GET", "/api/v1/a") in eps and ("GET", "/api/v1/b") in eps
+
+    def test_unresolved_constant_stays_visible(self, tmp_path):
+        paths = [e["path"] for e in self._controller(tmp_path)]
+        assert "/api/v1/Unknown.PATH" in paths
+
+    def test_endpoint_section_in_output(self, tmp_path):
+        self._controller(tmp_path)
+        output = format_output(files_of(*sorted(tmp_path.glob("*.java"))), show_endpoints=True)
+        assert "=== REST Endpoints ===" in output
+        assert "POST    /api/v1/trips " in output
 
 
 # ---------------------------------------------------------------------------
@@ -205,272 +251,101 @@ class TestScanJavaFile:
 
 class TestFindDependencies:
     def test_no_deps(self):
-        infos = [
-            {"class_name": "Foo", "package": "com.example", "imports": [], "extends": None, "implements": []},
-            {"class_name": "Bar", "package": "com.example", "imports": [], "extends": None, "implements": []},
-        ]
-        deps = find_dependencies(infos)
-        assert deps == {}
+        assert find_dependencies([synthetic_type("Foo"), synthetic_type("Bar")]) == {}
 
     def test_import_based_dep(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example",
-                "imports": ["com.example.Bar"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Bar",
-                "package": "com.example",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "Foo" in deps
-        assert "Bar" in deps["Foo"]
+        deps = find_dependencies([synthetic_type("Foo", imports=["com.example.Bar"]), synthetic_type("Bar")])
+        assert deps == {"Foo": ["Bar"]}
 
     def test_extends_dep(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example",
-                "imports": [],
-                "extends": "Bar",
-                "implements": [],
-            },
-            {
-                "class_name": "Bar",
-                "package": "com.example",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "Bar" in deps.get("Foo", [])
+        deps = find_dependencies([synthetic_type("Foo", extends="Bar"), synthetic_type("Bar")])
+        assert deps["Foo"] == ["Bar"]
 
     def test_implements_dep(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example",
-                "imports": [],
-                "extends": None,
-                "implements": ["Baz"],
-            },
-            {
-                "class_name": "Baz",
-                "package": "com.example",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "Baz" in deps.get("Foo", [])
+        deps = find_dependencies([synthetic_type("Foo", implements=["Baz"]), synthetic_type("Baz")])
+        assert deps["Foo"] == ["Baz"]
 
     def test_wildcard_import(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example.a",
-                "imports": ["com.example.b.*"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Bar",
-                "package": "com.example.b",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "Bar" in deps.get("Foo", [])
+        deps = find_dependencies([
+            synthetic_type("Foo", package="com.example.a", imports=["com.example.b.*"]),
+            synthetic_type("Bar", package="com.example.b"),
+        ])
+        assert deps["Foo"] == ["Bar"]
 
     def test_self_reference_excluded(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example",
-                "imports": ["com.example.Foo"],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "Foo" not in deps
+        assert find_dependencies([synthetic_type("Foo", imports=["com.example.Foo"])]) == {}
 
     def test_duplicate_simple_names_use_qualified_dependency_names(self):
-        infos = [
-            {
-                "class_name": "UseA",
-                "package": "com.example.use",
-                "imports": ["com.example.a.Config"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "UseB",
-                "package": "com.example.use",
-                "imports": ["com.example.b.Config"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Config",
-                "package": "com.example.a",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Config",
-                "package": "com.example.b",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
+        deps = find_dependencies([
+            synthetic_type("UseA", package="com.example.use", imports=["com.example.a.Config"]),
+            synthetic_type("UseB", package="com.example.use", imports=["com.example.b.Config"]),
+            synthetic_type("Config", package="com.example.a"),
+            synthetic_type("Config", package="com.example.b"),
+        ])
         assert deps["UseA"] == ["com.example.a.Config"]
         assert deps["UseB"] == ["com.example.b.Config"]
 
     def test_duplicate_simple_names_use_qualified_source_keys(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example.a",
-                "imports": ["com.example.shared.Bar"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Foo",
-                "package": "com.example.b",
-                "imports": ["com.example.shared.Bar"],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "Bar",
-                "package": "com.example.shared",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
-        assert "com.example.a.Foo" in deps
-        assert "com.example.b.Foo" in deps
+        deps = find_dependencies([
+            synthetic_type("Foo", package="com.example.a", imports=["com.example.shared.Bar"]),
+            synthetic_type("Foo", package="com.example.b", imports=["com.example.shared.Bar"]),
+            synthetic_type("Bar", package="com.example.shared"),
+        ])
         assert deps["com.example.a.Foo"] == ["Bar"]
         assert deps["com.example.b.Foo"] == ["Bar"]
 
     def test_same_package_extends_beats_ambiguous_simple_name(self):
-        infos = [
-            {
-                "class_name": "Foo",
-                "package": "com.example.a",
-                "imports": [],
-                "extends": "BaseConfig",
-                "implements": [],
-            },
-            {
-                "class_name": "BaseConfig",
-                "package": "com.example.a",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-            {
-                "class_name": "BaseConfig",
-                "package": "com.example.b",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-            },
-        ]
-        deps = find_dependencies(infos)
+        deps = find_dependencies([
+            synthetic_type("Foo", package="com.example.a", extends="BaseConfig"),
+            synthetic_type("BaseConfig", package="com.example.a"),
+            synthetic_type("BaseConfig", package="com.example.b"),
+        ])
         assert deps["Foo"] == ["com.example.a.BaseConfig"]
 
     def test_real_fixtures(self):
-        """Test dependency detection on a collection of real fixture files."""
-        paths = [
-            fixture_path("StaticFieldService.java"),
-            fixture_path("AppConfiguration.java"),
+        types = flatten_types(files_of(fixture_path("StaticFieldService.java"), fixture_path("AppConfiguration.java")))
+        assert isinstance(find_dependencies(types), dict)
+
+
+# ---------------------------------------------------------------------------
+# filter_files
+# ---------------------------------------------------------------------------
+
+class TestFilterFiles:
+    def _files(self):
+        return [
+            synthetic_file(synthetic_type("Foo", package="com.example.services", anns=["@Service"],
+                                          extends="BaseService", implements=["Serializable"]),
+                           package="com.example.services"),
+            synthetic_file(synthetic_type("Bar", package="com.example.web", anns=["@Controller"]),
+                           package="com.example.web"),
         ]
-        all_infos = []
-        for p in paths:
-            all_infos.extend(scan_java_file(p))
-        deps = find_dependencies(all_infos)
-        # These may or may not have deps depending on import overlap
-        assert isinstance(deps, dict)
 
-
-# ---------------------------------------------------------------------------
-# _filter_infos
-# ---------------------------------------------------------------------------
-
-class TestFilterInfos:
-    def _make_info(self, name, pkg="com.example", anns=None, extends=None, implements=None):
-        return {
-            "class_name": name,
-            "package": pkg,
-            "annotations": anns or [],
-            "extends": extends,
-            "implements": implements or [],
-        }
+    def _names(self, files):
+        return [t["class_name"] for t in flatten_types(files)]
 
     def test_no_filter(self):
-        infos = [self._make_info("Foo"), self._make_info("Bar")]
-        result = _filter_infos(infos, None, None, None)
-        assert len(result) == 2
+        assert self._names(filter_files(self._files())) == ["Foo", "Bar"]
 
     def test_package_filter(self):
-        infos = [
-            self._make_info("Foo", pkg="com.example.services"),
-            self._make_info("Bar", pkg="com.example.web"),
-        ]
-        result = _filter_infos(infos, "com.example.services", None, None)
-        assert len(result) == 1
-        assert result[0]["class_name"] == "Foo"
+        assert self._names(filter_files(self._files(), pkg_filter="com.example.services")) == ["Foo"]
 
     def test_annotation_filter(self):
-        infos = [
-            self._make_info("Foo", anns=["@Service"]),
-            self._make_info("Bar", anns=["@Controller"]),
-        ]
-        result = _filter_infos(infos, None, "@Service", None)
-        assert len(result) == 1
-        assert result[0]["class_name"] == "Foo"
-
-    def test_annotation_filter_without_at(self):
-        infos = [self._make_info("Foo", anns=["@Service"])]
-        result = _filter_infos(infos, None, "Service", None)
-        assert len(result) == 1
+        assert self._names(filter_files(self._files(), ann_filter="@Service")) == ["Foo"]
+        assert self._names(filter_files(self._files(), ann_filter="Service")) == ["Foo"]
 
     def test_extends_filter(self):
-        infos = [
-            self._make_info("Foo", extends="BaseService"),
-            self._make_info("Bar", extends=None),
-        ]
-        result = _filter_infos(infos, None, None, "BaseService")
-        assert len(result) == 1
-        assert result[0]["class_name"] == "Foo"
+        assert self._names(filter_files(self._files(), ext_filter="BaseService")) == ["Foo"]
 
     def test_implements_filter(self):
-        infos = [
-            self._make_info("Foo", implements=["Serializable"]),
-            self._make_info("Bar", implements=[]),
-        ]
-        result = _filter_infos(infos, None, None, None, impl_filter="Serializable")
-        assert len(result) == 1
-        assert result[0]["class_name"] == "Foo"
+        assert self._names(filter_files(self._files(), impl_filter="Serializable")) == ["Foo"]
+
+    def test_type_filter_drops_empty_files(self):
+        assert len(filter_files(self._files(), ann_filter="@Service")) == 1
+
+    def test_package_filter_keeps_typeless_files(self):
+        files = self._files() + [synthetic_file(package="com.example.services")]
+        assert len(filter_files(files, pkg_filter="com.example.services")) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -479,174 +354,84 @@ class TestFilterInfos:
 
 class TestFormatOutput:
     def test_basic_output(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "Project Map:" in output
-        assert "SimpleDirection" in output
+        output = format_output(files_of(fixture_path("SimpleDirection.java")))
+        assert "Project Map: 1 files" in output
+        assert "enum SimpleDirection { NORTH, SOUTH, EAST, WEST }" in output
 
     def test_packages_grouped(self):
-        paths = [
-            fixture_path("SimpleDirection.java"),
-            fixture_path("StaticFieldService.java"),
-        ]
-        all_infos = []
-        for p in paths:
-            all_infos.extend(scan_java_file(p))
-        output = format_output(all_infos)
-        assert "com.example" in output
+        output = format_output(files_of(fixture_path("SimpleDirection.java"), fixture_path("StaticFieldService.java")))
+        assert "// com.example (1 files," in output
+        assert "// com.example.services (1 files," in output
 
-    def test_field_and_method_counts(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "F" in output  # field count
-        assert "M" in output  # method count
-        assert "L" in output  # line count
-
-    def test_enum_constants_inline(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "NORTH" in output
-        assert "SOUTH" in output
-
-    def test_key_annotations_shown(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "@Service" in output
-
-    def test_lombok_shown(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "lombok:" in output
+    def test_field_method_line_counts(self):
+        output = format_output(files_of(fixture_path("StaticFieldService.java")))
+        assert "class StaticFieldService @Service [4F | 2M | 44L | " in output
+        assert "lombok:Slf4j,RequiredArgsConstructor" in output
 
     def test_show_deps(self):
-        paths = [
-            fixture_path("SealedAndMultiClass.java"),
-        ]
-        all_infos = []
-        for p in paths:
-            all_infos.extend(scan_java_file(p))
-        output = format_output(all_infos, show_deps=True)
-        # Circle and Rectangle extend SealedAndMultiClass
-        if "Dependencies" in output:
-            assert "→" in output
+        output = format_output(files_of(fixture_path("SealedAndMultiClass.java")), show_deps=True)
+        assert "=== Dependencies ===" in output
+        assert "Circle → SealedAndMultiClass" in output
 
     def test_show_deps_disambiguates_duplicate_names(self):
-        infos = [
-            {
-                "class_name": "UseA",
-                "package": "com.example.use",
-                "imports": ["com.example.a.Config"],
-                "extends": None,
-                "implements": [],
-                "annotations": [],
-                "class_type": "class",
-                "field_count": 0,
-                "method_count": 0,
-                "lombok": [],
-                "enum_constants": [],
-                "inner_types": [],
-                "total_lines": 10,
-                "filepath": Path("/tmp/UseA.java"),
-                "static_initializers": [],
-            },
-            {
-                "class_name": "Config",
-                "package": "com.example.a",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-                "annotations": [],
-                "class_type": "class",
-                "field_count": 0,
-                "method_count": 0,
-                "lombok": [],
-                "enum_constants": [],
-                "inner_types": [],
-                "total_lines": 10,
-                "filepath": Path("/tmp/a/Config.java"),
-                "static_initializers": [],
-            },
-            {
-                "class_name": "Config",
-                "package": "com.example.b",
-                "imports": [],
-                "extends": None,
-                "implements": [],
-                "annotations": [],
-                "class_type": "class",
-                "field_count": 0,
-                "method_count": 0,
-                "lombok": [],
-                "enum_constants": [],
-                "inner_types": [],
-                "total_lines": 10,
-                "filepath": Path("/tmp/b/Config.java"),
-                "static_initializers": [],
-            },
+        files = [
+            synthetic_file(synthetic_type("UseA", package="com.example.use", imports=["com.example.a.Config"]),
+                           package="com.example.use"),
+            synthetic_file(synthetic_type("Config", package="com.example.a"), package="com.example.a"),
+            synthetic_file(synthetic_type("Config", package="com.example.b"), package="com.example.b"),
         ]
-        output = format_output(infos, show_deps=True)
+        output = format_output(files, show_deps=True)
         assert "UseA → com.example.a.Config" in output
 
     def test_show_beans(self):
-        path = fixture_path("AppConfiguration.java")
-        infos = scan_java_file(path)
-        output = format_output(infos, show_beans=True)
+        output = format_output(files_of(fixture_path("AppConfiguration.java")), show_beans=True)
         assert "Bean Producers" in output
         assert "ObjectMapper" in output
 
     def test_bean_dependencies_shown(self):
-        path = fixture_path("StaticFieldService.java")
-        infos = scan_java_file(path)
-        output = format_output(infos, show_beans=True)
-        assert "Bean Dependencies" in output
-        assert "OrderRepository" in output
+        output = format_output(files_of(fixture_path("StaticFieldService.java")), show_beans=True)
+        assert "StaticFieldService @Service ← OrderRepository, PaymentRepository, NotificationClient" in output
+
+    def test_config_properties_exclude_statics(self, tmp_path):
+        path = tmp_path / "P.java"
+        path.write_text("""
+        @ConfigurationProperties("app.x")
+        record P(String bucket, Duration expiry) {
+            static final String DEFAULT = "d";
+        }
+        """, encoding="utf-8")
+        output = format_output(files_of(path), show_beans=True)
+        assert "app.x.* (P): String bucket, Duration expiry" in output
+        assert "DEFAULT" not in output
 
     def test_all_comment_prefixed(self):
-        path = fixture_path("SimpleDirection.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        for line in output.split("\n"):
+        for line in format_output(files_of(fixture_path("SimpleDirection.java"))).split("\n"):
             assert line.startswith("//"), f"Line not prefixed: {line!r}"
 
-    def test_static_initializer_shown(self):
-        path = fixture_path("Role.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "static-init:" in output
-
-    def test_inner_types_shown(self):
-        path = fixture_path("EdgeCaseBugs.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "inner:" in output
+    def test_static_initializer_and_inner_types_shown(self):
+        assert "static-init:" in format_output(files_of(fixture_path("Role.java")))
+        assert "inner:" in format_output(files_of(fixture_path("EdgeCaseBugs.java")))
 
     def test_implicit_class_output(self):
-        path = fixture_path("ImplicitClass.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "implicit class ImplicitClass" in output
+        assert "implicit class ImplicitClass" in format_output(files_of(fixture_path("ImplicitClass.java")))
 
-    def test_multi_type_file_totals_count_unique_files(self):
-        path = fixture_path("SealedAndMultiClass.java")
-        infos = scan_java_file(path)
-        output = format_output(infos)
+    def test_multi_type_file_totals_count_files_once(self):
+        output = format_output(files_of(fixture_path("SealedAndMultiClass.java")))
         assert "Project Map: 1 files, 70 lines" in output
         assert "com.example.edgecases (1 files, 70 lines)" in output
 
     def test_interface_extends_output(self, tmp_path):
         path = tmp_path / "Child.java"
-        path.write_text(
-            "package demo;\npublic interface Child extends ParentA, ParentB {}\n",
-            encoding="utf-8",
+        path.write_text("package demo;\npublic interface Child extends ParentA, ParentB {}\n", encoding="utf-8")
+        assert "interface Child extends ParentA, ParentB" in format_output(files_of(path))
+
+    def test_package_annotations_on_header(self, tmp_path):
+        (tmp_path / "package-info.java").write_text(
+            '@ApplicationModule(displayName = "Evidence")\npackage demo.evidence;\n', encoding="utf-8"
         )
-        infos = scan_java_file(path)
-        output = format_output(infos)
-        assert "interface Child extends ParentA, ParentB" in output
+        (tmp_path / "Api.java").write_text("package demo.evidence; interface Api {}", encoding="utf-8")
+        output = format_output(files_of(*sorted(tmp_path.glob("*.java"))))
+        assert '// demo.evidence (2 files, 4 lines) @ApplicationModule(displayName = "Evidence")' in output
 
 
 # ---------------------------------------------------------------------------
@@ -655,120 +440,81 @@ class TestFormatOutput:
 
 class TestCallHierarchyOutput:
     def _write_project(self, tmp_path):
-        service = tmp_path / "BillingService.java"
-        service.write_text(
-            """
+        (tmp_path / "BillingService.java").write_text("""
             package demo;
-
             public class BillingService {
                 private final BillingRepository repository = new BillingRepository();
-
                 public void processBilling() {
                     validate();
                     repository.save();
                 }
-
-                private void validate() {
-                }
+                private void validate() {}
             }
-            """,
-            encoding="utf-8",
-        )
-
-        controller = tmp_path / "BillingController.java"
-        controller.write_text(
-            """
+            """, encoding="utf-8")
+        (tmp_path / "BillingController.java").write_text("""
             package demo;
-
             public class BillingController {
                 private final BillingService billingService = new BillingService();
-
-                public void create() {
-                    billingService.processBilling();
-                }
+                public void create() { billingService.processBilling(); }
             }
-            """,
-            encoding="utf-8",
-        )
-
-        scheduler = tmp_path / "BillingScheduler.java"
-        scheduler.write_text(
-            """
+            """, encoding="utf-8")
+        (tmp_path / "BillingScheduler.java").write_text("""
             package demo;
-
             public class BillingScheduler {
                 private final BillingController controller = new BillingController();
-
-                public void run() {
-                    controller.create();
-                }
+                public void run() { controller.create(); }
             }
-            """,
-            encoding="utf-8",
-        )
-
-        repository = tmp_path / "BillingRepository.java"
-        repository.write_text(
-            """
+            """, encoding="utf-8")
+        (tmp_path / "BillingRepository.java").write_text("""
             package demo;
-
             public class BillingRepository {
-                public void save() {
-                }
+                public void save() {}
             }
-            """,
-            encoding="utf-8",
-        )
-
-        infos = []
-        for path in sorted(tmp_path.glob("*.java")):
-            infos.extend(scan_java_file(path))
-        return infos
+            """, encoding="utf-8")
+        return flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
 
     def test_callers_requires_class_qualified_target(self, tmp_path):
-        infos = self._write_project(tmp_path)
-        output = format_callers_output(infos, "processBilling")
-        assert "requires Class.method" in output
+        assert "requires Class.method" in format_callers_output(self._write_project(tmp_path), "processBilling")
 
     def test_callers_show_upstream_hierarchy(self, tmp_path):
-        infos = self._write_project(tmp_path)
-        output = format_callers_output(infos, "BillingService.processBilling", depth=2)
+        output = format_callers_output(self._write_project(tmp_path), "BillingService.processBilling", depth=2)
         assert "Callers: BillingService.processBilling" in output
-        assert "target: demo.BillingService.processBilling()" in output
-        assert "← demo.BillingController.create()" in output
-        assert "← demo.BillingScheduler.run()" in output
+        assert "target: BillingService.processBilling()  " in output
+        assert "//   ← BillingController.create()  " in output
+        assert "//     ← BillingScheduler.run()  " in output
 
     def test_callers_stop_on_ambiguous_class_name(self, tmp_path):
-        first_dir = tmp_path / "a"
-        second_dir = tmp_path / "b"
-        first_dir.mkdir()
-        second_dir.mkdir()
-        (first_dir / "Config.java").write_text(
-            "package demo.a; public class Config { public void build() {} }\n",
-            encoding="utf-8",
-        )
-        (second_dir / "Config.java").write_text(
-            "package demo.b; public class Config { public void build() {} }\n",
-            encoding="utf-8",
-        )
-        infos = []
-        for path in sorted(tmp_path.rglob("*.java")):
-            infos.extend(scan_java_file(path))
-
-        output = format_callers_output(infos, "Config.build")
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        (tmp_path / "a" / "Config.java").write_text(
+            "package demo.a; public class Config { public void build() {} }\n", encoding="utf-8")
+        (tmp_path / "b" / "Config.java").write_text(
+            "package demo.b; public class Config { public void build() {} }\n", encoding="utf-8")
+        output = format_callers_output(flatten_types(files_of(*sorted(tmp_path.rglob("*.java")))), "Config.build")
         assert "Ambiguous target: Config.build" in output
         assert "demo.a.Config.build()" in output
         assert "demo.b.Config.build()" in output
 
+    def test_ambiguous_simple_names_display_qualified(self, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        (tmp_path / "a" / "Config.java").write_text(
+            "package demo.a; public class Config { public void build() {} }\n", encoding="utf-8")
+        (tmp_path / "b" / "Config.java").write_text(
+            "package demo.b; public class Config { public void build() {} }\n", encoding="utf-8")
+        (tmp_path / "User.java").write_text(
+            "package demo; import demo.a.Config; class User { Config c; void go() { c.build(); } }\n",
+            encoding="utf-8")
+        output = format_callers_output(flatten_types(files_of(*sorted(tmp_path.rglob("*.java")))), "demo.a.Config.build")
+        assert "target: demo.a.Config.build()" in output
+        assert "← User.go()" in output
+
     def test_impact_shows_callers_and_callees(self, tmp_path):
-        infos = self._write_project(tmp_path)
-        output = format_impact_output(infos, "BillingService.processBilling", depth=1)
+        output = format_impact_output(self._write_project(tmp_path), "BillingService.processBilling", depth=1)
         assert "Impact: BillingService.processBilling" in output
-        assert "callers:" in output
-        assert "← demo.BillingController.create()" in output
-        assert "calls:" in output
-        assert "→ demo.BillingService.validate()" in output
-        assert "→ demo.BillingRepository.save()" in output
+        assert "← BillingController.create()" in output
+        assert "→ BillingService.validate()" in output
+        assert "→ BillingRepository.save()" in output
 
 
 # ---------------------------------------------------------------------------
@@ -777,36 +523,8 @@ class TestCallHierarchyOutput:
 
 class TestFullProjectScan:
     def test_scan_all_fixtures(self):
-        """Scan the entire fixtures directory like a real project."""
-        java_files = sorted(FIXTURES_DIR.rglob("*.java"))
-        assert len(java_files) > 20
-
-        all_infos = []
-        for f in java_files:
-            infos = scan_java_file(f)
-            all_infos.extend(infos)
-
-        assert len(all_infos) > 20
-
-        output = format_output(all_infos, show_deps=True, show_endpoints=False, show_beans=True)
-        assert "Project Map:" in output
+        files = files_of(*sorted(FIXTURES_DIR.rglob("*.java")))
+        assert len(files) > 20
+        output = format_output(files, show_deps=True, show_endpoints=True, show_beans=True)
         assert output.startswith("//")
-
-    def test_scan_all_fixtures_with_endpoints(self):
-        java_files = sorted(FIXTURES_DIR.rglob("*.java"))
-        all_infos = []
-        for f in java_files:
-            all_infos.extend(scan_java_file(f))
-
-        output = format_output(all_infos, show_endpoints=True)
-        # No REST controllers in fixtures, so no endpoints section expected
-        assert "Project Map:" in output
-
-    def test_scan_all_fixtures_totals_use_unique_files(self):
-        java_files = sorted(FIXTURES_DIR.rglob("*.java"))
-        all_infos = []
-        for f in java_files:
-            all_infos.extend(scan_java_file(f))
-
-        output = format_output(all_infos)
         assert "Project Map: 34 files, 2003 lines" in output

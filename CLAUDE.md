@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**jskim** is a token-saving Java file reader for Claude Code. It uses tree-sitter to parse and summarize Java files compactly, reducing token usage by 70-80%. Optimized for Spring Boot projects with Lombok, REST controllers, DI wiring, and configuration properties.
+**jskim** is a token-saving Java file reader for Claude Code. It uses tree-sitter to parse and summarize Java files compactly, reducing token usage by 70-80%. Optimized for Spring Boot projects: REST controllers, DI wiring, configuration properties, Lombok, records, Spring Modulith packages.
 
 **You are both the builder and the primary user of this tool.** Every output format decision, every new feature, every piece of information included or excluded — evaluate it from the perspective of "does this help me (Claude) understand Java codebases faster with fewer tokens?" If a feature sounds good in theory but won't change how you actually work with code, it's not worth building.
 
@@ -13,7 +13,7 @@ Published as a PyPI package (`pip install jskim`). Python 3.10+ required.
 ## Build & Development Commands
 
 ```bash
-pip install -e .              # Install locally in editable mode
+pip install -e .              # Install locally in editable mode (the .venv otherwise pins an old wheel)
 python -m build               # Build distribution artifacts
 pytest                        # Run all tests
 pytest tests/test_diff.py     # Run specific test file
@@ -24,23 +24,31 @@ pytest tests/test_diff.py::TestParseDiffOutput::test_modified_file  # Run single
 
 ## Architecture
 
-The CLI entry point (`cli.py`) auto-detects the operation mode based on input and routes to one of four modules:
+`cli.py` owns the single argparse parser and picks the mode from the positional arguments. Every mode module exposes `main(args)` taking the parsed namespace and only formats output; all parsing lives in `util.py`.
 
 ```
-cli.py (entry point, auto-detection + flag parsing)
-├── skim.py      — Single file summarization (imports, fields, methods with line ranges)
-├── project.py   — Directory-wide project map (packages, classes, Spring metadata, call hierarchy)
-├── method.py    — Method extraction with context (fields, called methods, source)
-└── diff.py      — Git diff mode (summarize only changed Java files/methods)
+cli.py (argparse, mode auto-detection, warns about flags the mode does not use)
+├── skim.py      — Single file summary
+├── project.py   — Directory-wide project map, Spring reports, call hierarchy
+├── method.py    — Method listing / extraction with context
+└── diff.py      — Git diff mode (changed files, fields, methods)
 
-All modules share: util.py — tree-sitter parsing utilities (65+ functions)
+util.py — the only module that imports tree_sitter:
+  parse_java_source(content) -> {"package", "package_annotations", "imports", "types", "total_lines"}
+    parse_type(decl)         -> {"kind", "name", "declaration", "annotations", "annotation_names",
+                                 "fields", "methods", "inner_types", "static_initializers",
+                                 "enum_constants", "constants", "extends", "implements", ...}
+      parse_type_members()   -> fields (parse_field), methods (parse_method), inner types
 ```
 
 **Key design patterns:**
-- `util.py` is the shared foundation — all AST parsing, annotation extraction, field/method analysis, and Spring-specific logic lives here. Constants like `LOMBOK_SET`, `HTTP_MAPPING_ANNOTATIONS`, and `SPRING_PARAM_ANNOTATIONS` are centralized here.
-- `skim.py` classifies methods as getter/setter/boilerplate/constructor/business-logic and collapses non-interesting ones to names only.
-- `project.py` aggregates per-file summaries into package-level views and produces Spring-specific reports (`--endpoints`, `--beans`, `--deps`) plus bounded method-level call hierarchy views (`--callers`, `--impact`). Call hierarchy targets are intentionally class-qualified (`Class.method` or FQN) to avoid ambiguous Java method-name matches.
-- `diff.py` parses unified diff format, tracks changed line numbers, then uses `util.py` to determine which methods overlap with changes. Marks output with `[NEW]`/`[MODIFIED]`/`[DELETED]`.
+- `util.parse_java_source` is the one parse chain. skim/method/project/diff consume its dicts and never walk the AST themselves. Adding information to the output means adding a key in `parse_type`/`parse_method`/`parse_field`, then rendering it in the modules that care.
+- Annotation rendering is centralized in `util.get_annotations_rich`: noise annotations (`NOISE_ANNOTATIONS`) are dropped, repeats deduped, arguments whitespace-normalized and capped at `ANNOTATION_ARGS_MAX`. HTTP mapping annotations render only their path, resolved through `resolve_string_expression` against the class's `static final String` constants (`extract_string_constants`).
+- `extract_method_calls(node, field_names)` keeps only calls that can be followed from a summary: same-class, `field.method`, `Class.method`, `super.method`. Calls on locals/parameters are dropped.
+- `fields` carry `static`/`final`/`component` flags. Every consumer separates instance fields from constants via `instance_fields()`/`static_fields()`.
+- `project.py` keeps file-level dicts (`scan_java_file` → `{"filepath", "package", "package_annotations", "types": [...]}`) so `package-info.java` annotations reach the package header; `flatten_types()` gives the per-type rows used by dependency, endpoint and call-graph code. Endpoints are resolved in a post-pass (`collect_endpoints`) so constants in other classes resolve.
+- Bean dependencies come from constructor parameters; Lombok constructor annotations fall back to final fields; `@Autowired`/`@Inject` fields always count.
+- `diff.py` compares old vs new `parse_java_source` results: methods by `Type.identity`, instance fields by `Type:type name`.
 
 **Source layout:** All modules are under `src/jskim/`. Version is in `src/jskim/__init__.py` and extracted by hatchling at build time.
 
@@ -56,11 +64,13 @@ All modules share: util.py — tree-sitter parsing utilities (65+ functions)
 | `jskim src/ --impact Class.method` | Callers + callees impact view | `project.py` |
 | `jskim --diff HEAD~1` | Diff summary | `diff.py` |
 
-Flags: `--grep`, `--annotation`, `--package`, `--extends`, `--implements`, `--deps`, `--endpoints`, `--beans`, `--callers`, `--impact`, `--depth`, `--diff`.
+Flags: `--grep`, `--annotation`, `--package`, `--extends`, `--implements`, `--deps`, `--endpoints`, `--beans`, `--callers`, `--impact`, `--depth`, `--diff`, `--list`. `cli.MODE_FLAGS` says which flags each mode uses; the rest produce a stderr warning.
 
 ## Testing
 
-Tests are in `tests/` using pytest. Currently covers `diff.py` (`test_diff.py`) with test classes for `parse_diff_output`, `_changes_overlap`, `format_diff_output`, `_resolve_base_ref`, and deletion line tracking edge cases. No linting or formatting tools are configured.
+Tests are in `tests/` using pytest, one file per module (`test_util.py`, `test_skim.py`, `test_method.py`, `test_project.py`, `test_diff.py`, `test_cli.py`) plus Java fixtures in `tests/fixtures/`. `test_cli.py` runs the CLI as a subprocess. No linting or formatting tools are configured.
+
+After changing output, also run against a real Spring Boot codebase (hundreds of files, constructor injection, constant-based `@RequestMapping` paths, records, Spring Modulith `package-info.java`) and read the result as the consumer. Toy fixtures pass easily but miss the cases that made the output wrong before 0.3.0.
 
 ## CI/CD
 
@@ -71,17 +81,17 @@ GitHub Actions workflow (`.github/workflows/publish.yml`) publishes to PyPI on r
 The user is meticulous about code quality and will reject sloppy work. Follow these principles without exception:
 
 - **No code duplication** — never copy-paste logic across modules. If a helper exists in `util.py`, use it. If you need something that doesn't exist yet but is reusable, add it to `util.py` — not inline in a feature module.
-- **All constants live in `util.py`** — node type sets (`INNER_TYPE_NODES`, `METHOD_NODES`), annotation sets (`LOMBOK_SET`, `SPRING_PARAM_ANNOTATIONS`, `HTTP_MAPPING_ANNOTATIONS`), and any new domain constants belong in `util.py`. Do not scatter literals across modules. If the value represents a domain concept, it goes in a constant.
-- **All tree-sitter parsing goes through `util.py`** — no module should import `tree_sitter` or `tree_sitter_java` directly. `util.py` owns the parser instance, the `Language` object, and all AST traversal helpers. Feature modules consume parsed results only.
-- **One module per CLI mode** — each operational mode (skim, project, method, diff) has its own module with a `main()` entry point. New modes follow this pattern: add a module, route from `cli.py`. Do not pile unrelated modes into an existing module.
-- **CLI routing stays in `cli.py`** — auto-detection and flag routing logic lives exclusively in `cli.py`. Individual modules parse their own flags but never decide which mode to run.
-- **Private functions are prefixed with `_`** — internal helpers not meant for cross-module use (e.g., `_get_modifier_keywords`, `_strip_quotes`, `_find_string_literals`) must be underscore-prefixed. Public `util.py` functions are the module API.
+- **All constants live in `util.py`** — node type sets (`INNER_TYPE_NODES`, `METHOD_NODES`), annotation sets (`LOMBOK_SET`, `SPRING_STEREOTYPES`, `NOISE_ANNOTATIONS`, `HTTP_MAPPING_ANNOTATIONS`), display limits (`CALLS_DISPLAY_MAX`) and any new domain constants belong in `util.py`. Do not scatter literals across modules.
+- **All tree-sitter parsing goes through `util.py`** — no module should import `tree_sitter` or `tree_sitter_java` directly, and feature modules never import each other. `util.py` owns the parser instance, the `Language` object, and all AST traversal helpers. Feature modules consume parsed dicts only.
+- **One module per CLI mode** — each operational mode (skim, project, method, diff) has its own module with a `main(args)` entry point. New modes follow this pattern: add a module, add its flags to `cli.build_parser` and `cli.MODE_FLAGS`, route from `cli.py`.
+- **CLI parsing stays in `cli.py`** — flags are declared once in `build_parser`. Modules read the namespace; they never parse `sys.argv`.
+- **Private functions are prefixed with `_`** — internal helpers not meant for cross-module use must be underscore-prefixed. Public `util.py` functions are the module API.
 - **Functions return plain dicts, not custom classes** — the codebase uses dicts for parsed data structures (fields, methods, type info). Keep this convention. Don't introduce dataclasses or named tuples unless there's a compelling reason discussed with the user.
-- **Don't assume — ask, but bring your perspective** — when requirements are ambiguous or there are multiple valid approaches, ask the user before implementing. But don't just ask — offer your opinion as the consumer of this tool. "This feature would/wouldn't help me because..." is more useful than "which approach do you prefer?" The user values being consulted, but also values your informed perspective on what actually makes the skill more effective.
-- **Push back when something is wrong** — you are a user of this skill, not just a builder. If a proposed feature won't actually help you (the AI) work more effectively with Java codebases, say so bluntly. Evaluate feature requests from the perspective of "will this save me tokens, reduce tool calls, or give me information I can't get another way?" If the answer is no, push back and suggest what would actually help. Similarly, push back on code changes that introduce code smells, break separation of concerns, or duplicate existing logic. The user respects honest technical disagreement.
-- **Always use existing helper functions** — if `util.py` has a function for an operation (e.g., `get_annotations()`, `extract_field_info()`, `build_method_signature()`), use it. Never reimplement the same AST traversal inline. Check `util.py` before writing new tree-sitter traversal code.
-- **No magic strings for node types or annotations** — use the constant sets in `util.py` (`METHOD_NODES`, `INNER_TYPE_NODES`, `LOMBOK_SET`, etc.). If you need a new node type or annotation set, add it as a named constant.
-- **New tree-sitter node support requires full-chain updates** — when adding support for a new Java construct (e.g., a new annotation type, a new declaration kind), update the entire chain: constant set in `util.py` → extraction helper in `util.py` → consumption in every module that handles that category (skim, project, method, diff). Missing any module causes silent omission in output.
-- **Always update SKILL.md when changing output** — `SKILL.md` is what teaches future Claude instances how to use and interpret the tool's output. If you change output format, add a feature, or alter behavior, update `SKILL.md` to match. An outdated SKILL.md means future instances will misinterpret results or miss capabilities entirely. This includes: output format examples, interpretation guidance, workflow recommendations, and the "when to use" table.
-- **Test on real codebases, not just toy examples** — after making changes, test on a real Spring Boot project with hundreds of files, large controllers, deep service layers, and Lombok-heavy DTOs. Toy 20-line examples pass easily but miss edge cases like massive import lists, deeply nested generics, enum services, and methods with 15+ calls. If the user has a project available, use it.
+- **Don't assume — ask, but bring your perspective** — when requirements are ambiguous or there are multiple valid approaches, ask the user before implementing. But don't just ask — offer your opinion as the consumer of this tool. "This feature would/wouldn't help me because..." is more useful than "which approach do you prefer?"
+- **Push back when something is wrong** — you are a user of this skill, not just a builder. If a proposed feature won't actually help you (the AI) work more effectively with Java codebases, say so bluntly. Evaluate feature requests from the perspective of "will this save me tokens, reduce tool calls, or give me information I can't get another way?" Similarly, push back on code changes that introduce code smells, break separation of concerns, or duplicate existing logic.
+- **Always use existing helper functions** — check `util.py` before writing new tree-sitter traversal code.
+- **No magic strings for node types or annotations** — use the constant sets in `util.py`.
+- **New tree-sitter node support requires full-chain updates** — when adding support for a new Java construct, update `util.py` (constant set → extraction → key in the parsed dict) and then every module that renders that category (skim, project, method, diff). Missing a module causes silent omission in output.
+- **Always update SKILL.md when changing output** — `SKILL.md` is what teaches future Claude instances how to use and interpret the tool's output. If you change output format, add a feature, or alter behavior, update `SKILL.md` to match, including output examples, interpretation guidance, workflow recommendations, and the "when to use" table.
+- **Test on real codebases, not just toy examples** — after making changes, test on a real Spring Boot project with hundreds of files, large controllers, deep service layers, and Lombok-heavy or record-heavy DTOs.
 - **No `@` mentions in commit messages** — GitHub interprets `@word` in commit messages as user mentions and sends notifications. Avoid bare `@` in commit subjects/bodies (e.g., write `annotation-type interface` instead of `@interface`). The `Co-Authored-By` trailer is fine since GitHub handles it specially.

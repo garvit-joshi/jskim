@@ -1,142 +1,85 @@
-"""jskim_method - Extract methods from a Java file with context.
+"""jskim method - extract methods from a Java file with context.
 
-Usage: python3 jskim_method.py <file.java> <method_name> [method2 ...]
-       python3 jskim_method.py <file.java> --list
-
-Options:
-  --list    List all methods with line ranges (no bodies)
+Usage: jskim <file.java> <method_name> [method2 ...]
+       jskim <file.java> --list
 
 Outputs method bodies with surrounding context:
-  - Class name and relevant fields
-  - The full method source code
+  - Class declaration and instance fields
+  - The full method source code (with preceding annotations/Javadoc)
   - Other methods called within the same class (signatures only)
 """
 
-import sys
 import re
+import sys
 from pathlib import Path
-from .util import (
-    parse_file_structure, get_class_body,
-    get_body_members, get_annotations, get_modifiers_node,
-    build_method_signature, build_class_declaration_text,
-    extract_field_info, extract_record_components, get_declaration_name,
-    build_implicit_class_declaration,
-    METHOD_NODES,
-)
 
-
-
-def _parse_members(class_name, class_declaration, members, record_components=None):
-    """Parse methods and fields from a member list."""
-    fields = []
-    methods = []
-
-    # Record components (shown as fields)
-    for ftype, fname in record_components or []:
-        fields.append(f"{ftype} {fname}" if fname else ftype)
-
-    for member in members:
-        if member.type == "field_declaration":
-            field_entries = extract_field_info(member)
-            for ftype, fname in field_entries:
-                fields.append(f"{ftype} {fname}" if fname else ftype)
-
-        elif member.type in METHOD_NODES:
-            sig = build_method_signature(member)
-            anns = get_annotations(get_modifiers_node(member))
-            name_node = member.child_by_field_name("name")
-            if not name_node:
-                for c in member.children:
-                    if c.type == "identifier":
-                        name_node = c
-                        break
-            mname = name_node.text.decode() if name_node else "unknown"
-            start = member.start_point[0] + 1
-            end = member.end_point[0] + 1
-            methods.append({
-                "name": mname,
-                "sig": sig,
-                "start": start,
-                "end": end,
-                "annotations": anns,
-                "class_name": class_name,
-            })
-
-    return class_name, class_declaration, fields, methods
-
-
-def _parse_type_methods(decl):
-    """Parse methods and fields from a single type declaration node."""
-    class_name = get_declaration_name(decl)
-    class_declaration = build_class_declaration_text(decl)
-    return _parse_members(
-        class_name,
-        class_declaration,
-        get_body_members(get_class_body(decl)),
-        extract_record_components(decl),
-    )
-
-
-def _parse_implicit_methods(program_members, source_name=None):
-    """Parse the implicit class members of a Java simple source file."""
-    class_name = Path(source_name).stem if source_name else "implicit class"
-    class_declaration = build_implicit_class_declaration(source_name)
-    return _parse_members(class_name, class_declaration, program_members)
+from .util import parse_java_source, instance_fields, format_method_annotations
 
 
 def parse_methods(content, source_name=None):
-    """Parse all methods from a Java file using tree-sitter."""
-    structure = parse_file_structure(content.encode("utf-8"))
-    lines = content.split("\n")
+    """Parse all methods (across every top-level type) from a Java file."""
+    parsed = parse_java_source(content, source_name=source_name)
+    types = parsed["types"]
+    primary = types[0] if types else None
 
-    if structure["program_members"]:
-        class_name, class_declaration, fields, methods = _parse_implicit_methods(
-            structure["program_members"], source_name
-        )
-    else:
-        class_name = None
-        class_declaration = None
-        fields = []
-        methods = []
-
-        for node in structure["type_nodes"]:
-            cn, cd, fs, ms = _parse_type_methods(node)
-            if class_name is None:
-                class_name = cn
-                class_declaration = cd
-                fields = fs
-            methods.extend(ms)
+    methods = []
+    for t in types:
+        for m in t["methods"]:
+            methods.append({
+                "name": m["name"],
+                "sig": m["sig"],
+                "start": m["start"],
+                "end": m["end"],
+                "annotations": format_method_annotations(m),
+                "class_name": t["name"],
+            })
 
     return {
-        "package": structure["package"],
-        "class_name": class_name,
-        "class_declaration": class_declaration,
-        "fields": fields,
+        "package": parsed["package"],
+        "class_name": primary["name"] if primary else None,
+        "class_declaration": primary["declaration"] if primary else None,
+        "fields": [
+            f"{f['type']} {f['name']}" if f["name"] else f["type"]
+            for f in (instance_fields(primary) if primary else [])
+        ],
         "methods": methods,
-        "lines": lines,
+        "lines": content.split("\n"),
     }
+
+
+def _header(parsed):
+    return f"// {parsed['class_declaration'] or parsed['class_name']}"
+
+
+def _method_line(m, prefix="//   "):
+    lines = m["end"] - m["start"] + 1
+    loc = f"L{m['start']}-L{m['end']}"
+    ann_str = f"{m['annotations']} " if m["annotations"] else ""
+    return f"{prefix}{loc:>12} ({lines:>3} lines): {ann_str}{m['sig']}"
 
 
 def list_methods(parsed):
     """List all methods with line ranges."""
-    out = []
-    out.append(f"// {parsed['class_declaration'] or parsed['class_name']}")
-    out.append("//")
-    for m in parsed["methods"]:
-        lines = m["end"] - m["start"] + 1
-        loc = f"L{m['start']}-L{m['end']}"
-        ann_str = " ".join(m["annotations"]) + " " if m["annotations"] else ""
-        out.append(f"//   {loc:>12} ({lines:>3} lines): {ann_str}{m['sig']}")
+    out = [_header(parsed), "//"]
+    out.extend(_method_line(m) for m in parsed["methods"])
     return "\n".join(out)
+
+
+def _walk_back_start(all_lines, start):
+    """Include preceding annotation and comment lines above a method."""
+    while start > 1:
+        prev = all_lines[start - 2].strip()
+        if prev.startswith(("@", "*", "/*", "//")):
+            start -= 1
+        else:
+            break
+    return start
 
 
 def extract_methods(parsed, method_names):
     """Extract one or more methods and their context."""
     all_lines = parsed["lines"]
-    out = []
     not_found = []
-
-    # Collect matches for all requested names, dedup by start line
     matches = []
     seen = set()
     for method_name in method_names:
@@ -155,49 +98,31 @@ def extract_methods(parsed, method_names):
         names = ", ".join(f"'{n}'" for n in method_names)
         return f"// Methods {names} not found in {parsed['class_name']}"
 
-    out.append(f"// {parsed['class_declaration'] or parsed['class_name']}")
-
+    out = [_header(parsed)]
     if parsed["fields"]:
         out.append("// fields: " + ", ".join(parsed["fields"]))
-
     if not_found:
         out.append(f"// not found: {', '.join(not_found)}")
-
     out.append("//")
 
     for m in matches:
-        ann_str = " ".join(m["annotations"]) + " " if m["annotations"] else ""
+        ann_str = f"{m['annotations']} " if m["annotations"] else ""
         out.append(f"// {ann_str}{m['sig']} (L{m['start']}-L{m['end']})")
         out.append("")
-
-        start = m["start"]
-        while start > 1:
-            prev = all_lines[start - 2].strip()
-            if prev.startswith("@") or prev.startswith("*") or prev.startswith("/*") or prev.startswith("//"):
-                start -= 1
-            else:
-                break
-
+        start = _walk_back_start(all_lines, m["start"])
         for i in range(start - 1, m["end"]):
             out.append(f"{i + 1:>5} | {all_lines[i]}")
         out.append("")
 
-    method_bodies = ""
-    for m in matches:
-        for i in range(m["start"] - 1, m["end"]):
-            method_bodies += all_lines[i] + "\n"
-
+    method_bodies = "\n".join(
+        all_lines[i] for m in matches for i in range(m["start"] - 1, m["end"])
+    )
     matched_names = {m["name"] for m in matches}
-    other_methods = [
+    called = [
         om for om in parsed["methods"]
         if om["name"] not in matched_names
+        and re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies)
     ]
-
-    called = []
-    for om in other_methods:
-        if re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies):
-            called.append(om)
-
     if called:
         out.append("// --- called methods in same class ---")
         for c in called:
@@ -206,19 +131,9 @@ def extract_methods(parsed, method_names):
     return "\n".join(out)
 
 
-def main():
-    if len(sys.argv) < 3:
-        print(
-            "Usage: python3 jskim_method.py <file.java> <method> [method2 ...]",
-            file=sys.stderr,
-        )
-        print(
-            "       python3 jskim_method.py <file.java> --list",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    filepath = Path(sys.argv[1])
+def main(args):
+    """List or extract methods from the first .java path in ``args.paths``."""
+    filepath = Path(args.paths[0])
     if not filepath.exists():
         print(f"Error: {filepath} not found", file=sys.stderr)
         sys.exit(1)
@@ -226,12 +141,8 @@ def main():
     content = filepath.read_text(encoding="utf-8", errors="replace")
     parsed = parse_methods(content, source_name=filepath)
 
-    if sys.argv[2] == "--list":
+    method_names = [p for p in args.paths[1:] if not p.endswith(".java")]
+    if args.list or not method_names:
         print(list_methods(parsed))
     else:
-        method_names = sys.argv[2:]
         print(extract_methods(parsed, method_names))
-
-
-if __name__ == "__main__":
-    main()

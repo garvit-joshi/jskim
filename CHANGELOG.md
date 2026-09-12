@@ -2,6 +2,41 @@
 
 All notable changes to jskim are documented here.
 
+## [0.3.0] - 2026-09-12
+
+Output format changed throughout; no backward compatibility is kept. Every change was driven by running the tool against a 470-file Spring Boot 4 / Java 25 backend and reading the result as the consumer.
+
+### Fixes
+- **REST endpoint paths were wrong whenever a controller used constants** — `@RequestMapping(TripController.BASE_PATH)` and `path = ONE_TRIP + "/assign"` produced `/` and `/assign`. Paths now resolve `static final String` constants, `Class.CONSTANT` references and `+` concatenation across the whole project; unresolvable expressions stay visible as source text
+- **Bean dependencies were empty without Lombok** — constructor injection is now read from constructor parameters; Lombok constructor annotations fall back to final fields; `@Autowired`/`@Inject` fields still count
+- **`package-info.java` was dropped** — package-level annotations (Spring Modulith `@ApplicationModule`, `@NamedInterface`) now appear on the project-map package header and in the file summary
+- **`@ConfigurationProperties` listings included static constants** — only instance fields and record components are shown
+- **`--grep` on a directory was silently ignored** — every mode now warns on stderr about flags it does not use
+- **Varargs identities** — `String... names` renders as `String...` instead of `?`
+
+### Output
+- `fields:` lists instance fields only; a new `static fields:` line lists constants by name
+- Annotation arguments are shown for every behaviour-changing annotation (`@RequiresPermission(...)`, `@ResponseStatus(...)`, `@Transactional(readOnly = true)`), whitespace-normalized and capped; repeats are deduped; the old whitelist is gone
+- OpenAPI/Swagger documentation annotations (`@Operation`, `@ApiResponse`, `@Parameter`, `@Schema`, `@Tag`, ...) are dropped everywhere
+- Mapping annotations render only their (resolved) path: `@PostMapping("/trips/{tripId}/start")`; `@RequestMapping(GET "/x")` when a method is given
+- Parameter annotations keep the marker and lose their arguments: `@RequestParam Integer size`
+- `→` calls list only followable calls: same-class, `field.method`, `Class.method`, `super.method`. Calls on locals and parameters (46% of all entries on the reference backend) are dropped
+- Import category breakdown replaced by a bare count: `// com.example | 45 imports`
+- `--callers`/`--impact` show simple class names (fully qualified only on collision) next to the file path
+- Diff mode reports added/removed instance fields and record components as `[FIELDS] +Type name, -Type name`; `(non-method changes only)` became `(no field or method changes)`
+- Project-map `NF` counts instance fields only
+
+### Internals
+- One parse chain in `util.py` (`parse_java_source` → `parse_type` → `parse_type_members`); skim, method, project and diff only format. Three duplicated member walkers, the regex-based `classify_method`, and the module-to-module import from `diff.py` to `skim.py` are gone
+- Single argparse parser in `cli.py`; modules take the parsed namespace via `main(args)`
+- Spring stereotype, Lombok and noise-annotation constants centralized in `util.py`
+
+### Dependencies
+- Verified against `tree-sitter` 0.26.0 (its removed APIs were never used) and 0.25.2, with `tree-sitter-java` 0.23.5; the declared ranges are unchanged
+
+### Tests
+- Suite rewritten for the new API and extended to 435 tests covering constant resolution, annotation rendering, call filtering, constructor injection, endpoint resolution, package annotations, mode-flag warnings and field diffs
+
 ## [0.2.5] - 2026-05-16
 
 ### Features

@@ -149,7 +149,7 @@ class TestProjectMode:
             str(tmp_path), "--callers", "BillingService.processBilling"
         )
         assert "Callers: BillingService.processBilling" in stdout
-        assert "demo.BillingController.create()" in stdout
+        assert "← BillingController.create()" in stdout
 
     def test_impact_flag_routes_to_impact_output(self, tmp_path):
         service = tmp_path / "BillingService.java"
@@ -178,7 +178,7 @@ class TestProjectMode:
             str(tmp_path), "--impact", "BillingService.processBilling"
         )
         assert "Impact: BillingService.processBilling" in stdout
-        assert "demo.BillingRepository.save()" in stdout
+        assert "→ BillingRepository.save()" in stdout
 
 
 class TestOutputFormat:
@@ -198,3 +198,25 @@ class TestOutputFormat:
         stdout, _, _ = run_jskim(path, "--list")
         for line in stdout.strip().split("\n"):
             assert line.startswith("//"), f"Non-comment line: {line!r}"
+
+
+class TestArgumentParsing:
+    def test_unknown_flag_is_an_error(self):
+        _, stderr, code = run_jskim(str(fixture_path("SimpleDirection.java")), "--bogus", expect_error=True)
+        assert code != 0
+        assert "unrecognized" in stderr
+
+    def test_project_grep_warns(self):
+        """--grep belongs to file mode; project mode must not silently ignore it."""
+        stdout, stderr, _ = run_jskim(str(FIXTURES_DIR), "--grep", "process")
+        assert "Project Map:" in stdout
+        assert "Warning: --grep not used in project mode" in stderr
+
+    def test_skim_project_flags_warn(self):
+        _, stderr, _ = run_jskim(str(fixture_path("SimpleDirection.java")), "--deps", "--depth", "2")
+        assert "Warning: --deps, --depth not used in skim mode" in stderr
+
+    def test_method_names_after_flags(self):
+        path = str(fixture_path("StaticFieldService.java"))
+        stdout, _, _ = run_jskim(path, "--grep", "process", "processOrder")
+        assert "|" in stdout  # method extraction, not skim

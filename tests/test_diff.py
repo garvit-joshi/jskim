@@ -456,3 +456,42 @@ class TestDiffOverloads:
         assert "void foo(String x)" in output
         assert "void foo(int x)" in output
         assert "[MODIFIED]" not in output
+
+
+class TestDiffFieldChanges:
+    def _format_repo_diff(self, tmp_path, old_source, new_source):
+        return TestDiffOverloads._format_repo_diff(self, tmp_path, old_source, new_source)
+
+    def test_record_component_change_is_reported(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "record Foo(int a, String b) {}\n",
+            "record Foo(int a, String b, Boolean mock) {}\n",
+        )
+        assert "[FIELDS]   +Boolean mock" in output
+        assert "no field or method changes" not in output
+
+    def test_removed_and_renamed_fields(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    private final Repo repo;\n    private int count;\n    static final int MAX = 1;\n}\n",
+            "class Foo {\n    private final Repo repository;\n    static final int MAX = 2;\n}\n",
+        )
+        assert "[FIELDS]   +Repo repository, -Repo repo, -int count" in output
+        assert "MAX" not in output  # static constant edits are not field changes
+
+    def test_only_body_changes_reports_no_field_or_method_changes(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    // a\n}\n",
+            "class Foo {\n    // b\n}\n",
+        )
+        assert "(no field or method changes)" in output
+
+    def test_multi_type_file_prefixes_field_with_type(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {}\nclass Bar { int x; }\n",
+            "class Foo {}\nclass Bar { int x; int y; }\n",
+        )
+        assert "[FIELDS]   +Bar.int y" in output

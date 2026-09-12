@@ -6,11 +6,15 @@ Usage:
     git diff main | jskim --diff -  Read diff from stdin
 """
 
-import sys
 import re
 import subprocess
+import sys
 from pathlib import Path
-from .skim import parse_java, classify_method
+
+from .util import (
+    parse_java_source, classify_method, instance_fields,
+    format_method_annotations, format_calls,
+)
 
 
 def parse_diff_output(diff_text):
@@ -56,9 +60,7 @@ def parse_diff_output(diff_text):
         elif line.startswith("rename from "):
             current["old_path"] = line[len("rename from "):]
         elif line.startswith("@@ "):
-            hunk_match = re.match(
-                r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line
-            )
+            hunk_match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
             if hunk_match:
                 new_line_num = int(hunk_match.group(1))
                 in_hunk = True
@@ -72,8 +74,7 @@ def parse_diff_output(diff_text):
             elif line.startswith("\\"):
                 pass  # "\ No newline at end of file"
             else:
-                # Context line
-                new_line_num += 1
+                new_line_num += 1  # context line
 
     if current is not None:
         files.append(current)
@@ -83,10 +84,7 @@ def parse_diff_output(diff_text):
 
 def _changes_overlap(changed_lines, start, end):
     """Check if any changed lines fall within [start, end]."""
-    for ln in changed_lines:
-        if start <= ln <= end:
-            return True
-    return False
+    return any(start <= ln <= end for ln in changed_lines)
 
 
 def _find_git_root(start_dir=None):
@@ -116,16 +114,38 @@ def _resolve_base_ref(ref, cwd=None):
         if result.returncode == 0:
             return result.stdout.strip()
         return parts[0]
-    elif ".." in ref:
+    if ".." in ref:
         return ref.split("..", 1)[0]
     return ref
 
 
-def _get_old_methods(base_ref, path, cwd=None):
-    """Get method identities and signatures from the old version of a file.
+def _method_keys(parsed):
+    """Map ``Type.identity`` to the method dict for every method in a file."""
+    return {
+        f"{t['name']}.{m['identity']}": m
+        for t in parsed["types"] for m in t["methods"]
+    }
 
-    Returns a dict {identity: signature}, or None if the old file cannot be retrieved.
+
+def _field_keys(parsed):
+    """Return ``{key: label}`` for every instance field in a file.
+
+    The label is prefixed with the type name only when the file declares
+    more than one top-level type.
     """
+    multi = len(parsed["types"]) > 1
+    result = {}
+    for t in parsed["types"]:
+        for f in instance_fields(t):
+            label = f"{f['type']} {f['name']}" if f["name"] else f["type"]
+            if multi:
+                label = f"{t['name']}.{label}"
+            result[f"{t['name']}:{label}"] = label
+    return result
+
+
+def _get_old_structure(base_ref, path, cwd=None):
+    """Parse the old version of a file, or None if it cannot be retrieved."""
     result = subprocess.run(
         ["git", "show", f"{base_ref}:{path}"],
         capture_output=True, text=True, cwd=cwd, check=False,
@@ -133,21 +153,16 @@ def _get_old_methods(base_ref, path, cwd=None):
     if result.returncode != 0:
         return None
     try:
-        parsed = parse_java(result.stdout, source_name=path)
-        methods = {}
-        for m in parsed["methods"]:
-            methods[m["identity"]] = m["sig"]
-        return methods
+        return parse_java_source(result.stdout, source_name=path)
     except Exception:
         return None
 
 
 def run_git_diff(ref, cwd=None):
     """Run git diff and return the output text."""
-    cmd = ["git", "diff", ref]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=cwd, check=False,
+            ["git", "diff", ref], capture_output=True, text=True, cwd=cwd, check=False,
         )
     except FileNotFoundError:
         print("Error: git not found", file=sys.stderr)
@@ -156,8 +171,43 @@ def run_git_diff(ref, cwd=None):
     if result.returncode != 0:
         print(f"Error: git diff failed: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
-
     return result.stdout
+
+
+def _is_trivial(method):
+    return classify_method(method) in ("getter", "setter", "boilerplate")
+
+
+def _append_method(out, tag, m):
+    """Append a ``[TAG] L..-L.. (n lines): @Ann sig`` line plus its calls."""
+    lines = m["end"] - m["start"] + 1
+    ann_str = format_method_annotations(m)
+    ann_str = f" {ann_str}" if ann_str else ""
+    out.append(f"//   {tag:<10} L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}")
+    if m["calls"]:
+        out.append(f"//     → {format_calls(m['calls'])}")
+
+
+def _append_header(out, parsed):
+    """Append the primary type's annotations and declaration."""
+    if not parsed["types"]:
+        return
+    primary = parsed["types"][0]
+    if primary["annotations"]:
+        out.append(f"//   {' '.join(a['full'] for a in primary['annotations'])}")
+    out.append(f"//   {primary['declaration']}")
+
+
+def _load_parsed(git_root, path):
+    """Parse the working-tree file at ``path``; returns (parsed, reason) on failure."""
+    filepath = git_root / path
+    if not filepath.exists():
+        return None, "file not on disk"
+    try:
+        content = filepath.read_text(encoding="utf-8", errors="replace")
+        return parse_java_source(content, source_name=path), None
+    except Exception:
+        return None, "parse error"
 
 
 def format_diff_output(changed_files, git_root, base_ref, scope=None):
@@ -176,10 +226,7 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
             java_files = [f for f in java_files if f["path"] == scope]
         else:
             prefix = scope.rstrip("/") + "/"
-            java_files = [
-                f for f in java_files
-                if f["path"].startswith(prefix) or f["path"] == scope
-            ]
+            java_files = [f for f in java_files if f["path"].startswith(prefix) or f["path"] == scope]
 
     if not java_files:
         return "// No Java files changed"
@@ -188,7 +235,6 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
     deleted = [f for f in java_files if f["status"] == "deleted"]
     modified = [f for f in java_files if f["status"] == "modified"]
 
-    out = []
     parts = []
     if modified:
         parts.append(f"{len(modified)} modified")
@@ -196,203 +242,105 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
         parts.append(f"{len(added)} added")
     if deleted:
         parts.append(f"{len(deleted)} deleted")
-    out.append(
-        f"// === Changed Java Files ({len(java_files)} files: {', '.join(parts)}) ==="
-    )
-    out.append("//")
+    out = [f"// === Changed Java Files ({len(java_files)} files: {', '.join(parts)}) ===", "//"]
 
-    # --- Deleted files ---
     for f in deleted:
         out.append(f"// [DELETED] {f['path']}")
-
     if deleted and (added or modified):
         out.append("//")
 
-    # --- Added files ---
     for f in added:
-        filepath = git_root / f["path"]
-        if not filepath.exists():
-            out.append(f"// [NEW] {f['path']} (file not on disk)")
+        parsed, reason = _load_parsed(git_root, f["path"])
+        if parsed is None:
+            out.append(f"// [NEW] {f['path']} ({reason})")
             out.append("//")
             continue
-
-        content = filepath.read_text(encoding="utf-8", errors="replace")
-        try:
-            parsed = parse_java(content)
-        except Exception:
-            out.append(f"// [NEW] {f['path']} (parse error)")
-            out.append("//")
-            continue
-
         out.append(f"// [NEW] {f['path']}")
-        if parsed["class_annotations"]:
-            out.append(f"//   {' '.join(parsed['class_annotations'])}")
-        out.append(f"//   {parsed['class_declaration']}")
-        fc = len(parsed["fields"])
-        mc = len(parsed["methods"])
-        out.append(f"//   {fc} fields, {mc} methods, {parsed['total_lines']} lines")
-
-        for m in parsed["methods"]:
-            kind = classify_method(m["sig"])
-            if kind in ("getter", "setter", "boilerplate"):
-                continue
-            lines = m["end"] - m["start"] + 1
-            ann_str = ""
-            if m["annotations"]:
-                ann_str = " " + " ".join(m["annotations"])
-            out.append(
-                f"//   [NEW] L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
-            )
-            calls = m.get("calls", [])
-            if calls:
-                if len(calls) <= 10:
-                    out.append(f"//     → {', '.join(calls)}")
-                else:
-                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
+        _append_header(out, parsed)
+        fields = sum(len(instance_fields(t)) for t in parsed["types"])
+        methods = [m for t in parsed["types"] for m in t["methods"]]
+        out.append(f"//   {fields} fields, {len(methods)} methods, {parsed['total_lines']} lines")
+        for m in methods:
+            if not _is_trivial(m):
+                _append_method(out, "[NEW]", m)
         out.append("//")
 
-    # --- Modified files ---
     for f in modified:
-        filepath = git_root / f["path"]
-        if not filepath.exists():
-            out.append(f"// [MODIFIED] {f['path']} (file not on disk)")
+        parsed, reason = _load_parsed(git_root, f["path"])
+        if parsed is None:
+            out.append(f"// [MODIFIED] {f['path']} ({reason})")
             out.append("//")
             continue
 
-        content = filepath.read_text(encoding="utf-8", errors="replace")
-        try:
-            parsed = parse_java(content)
-        except Exception:
-            out.append(f"// [MODIFIED] {f['path']} (parse error)")
-            out.append("//")
-            continue
-
-        changed_lines = f["changed_lines"]
-
-        # Get old method identities for NEW/DELETED detection
-        old_methods = None
+        old = None
         if base_ref:
-            old_path = f.get("old_path", f["path"])
-            old_methods = _get_old_methods(base_ref, old_path, cwd=git_root)
+            old = _get_old_structure(base_ref, f.get("old_path", f["path"]), cwd=git_root)
 
         out.append(f"// {f['path']}")
-        if parsed["class_annotations"]:
-            out.append(f"//   {' '.join(parsed['class_annotations'])}")
-        out.append(f"//   {parsed['class_declaration']}")
+        _append_header(out, parsed)
 
-        new_methods = []
-        modified_methods = []
+        changed_lines = f["changed_lines"]
+        current_methods = _method_keys(parsed)
+        old_methods = _method_keys(old) if old is not None else None
+
+        new_methods, modified_methods = [], []
         unchanged_count = 0
-
-        current_method_ids = set()
-        for m in parsed["methods"]:
-            method_id = m.get("identity", m["sig"])
-            current_method_ids.add(method_id)
-
-            kind = classify_method(m["sig"])
-            is_trivial = kind in ("getter", "setter", "boilerplate")
-
-            if old_methods is not None and method_id not in old_methods:
-                # Method exists in current but not in old -> NEW
-                if not is_trivial:
+        for key, m in current_methods.items():
+            trivial = _is_trivial(m)
+            if old_methods is not None and key not in old_methods:
+                if trivial:
+                    unchanged_count += 1
+                else:
                     new_methods.append(m)
-                else:
-                    unchanged_count += 1
             elif _changes_overlap(changed_lines, m["start"], m["end"]):
-                # Method exists in both (or can't determine), hunks overlap -> MODIFIED
-                if not is_trivial:
-                    modified_methods.append(m)
-                else:
+                if trivial:
                     unchanged_count += 1
+                else:
+                    modified_methods.append(m)
             else:
                 unchanged_count += 1
 
-        # Detect deleted methods
-        deleted_method_ids = []
+        deleted_methods = []
         if old_methods is not None:
-            deleted_method_ids = sorted(set(old_methods) - current_method_ids)
+            deleted_methods = [old_methods[k] for k in sorted(set(old_methods) - set(current_methods))]
+
+        field_changes = []
+        if old is not None:
+            old_fields = _field_keys(old)
+            new_fields = _field_keys(parsed)
+            field_changes = (
+                [f"+{new_fields[k]}" for k in new_fields if k not in old_fields]
+                + [f"-{old_fields[k]}" for k in old_fields if k not in new_fields]
+            )
+        if field_changes:
+            out.append(f"//   {'[FIELDS]':<10} {', '.join(field_changes)}")
 
         for m in new_methods:
-            lines = m["end"] - m["start"] + 1
-            ann_str = ""
-            if m["annotations"]:
-                ann_str = " " + " ".join(m["annotations"])
-            out.append(
-                f"//   [NEW]      L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
-            )
-            calls = m.get("calls", [])
-            if calls:
-                if len(calls) <= 10:
-                    out.append(f"//     → {', '.join(calls)}")
-                else:
-                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
-
+            _append_method(out, "[NEW]", m)
         for m in modified_methods:
-            lines = m["end"] - m["start"] + 1
-            ann_str = ""
-            if m["annotations"]:
-                ann_str = " " + " ".join(m["annotations"])
-            out.append(
-                f"//   [MODIFIED] L{m['start']}-L{m['end']} ({lines} lines):{ann_str} {m['sig']}"
-            )
-            calls = m.get("calls", [])
-            if calls:
-                if len(calls) <= 10:
-                    out.append(f"//     → {', '.join(calls)}")
-                else:
-                    out.append(f"//     → {', '.join(calls[:10])}, ... +{len(calls) - 10} more")
+            _append_method(out, "[MODIFIED]", m)
+        for m in deleted_methods:
+            out.append(f"//   {'[DELETED]':<10} {m['sig']}")
 
-        for method_id in deleted_method_ids:
-            out.append(f"//   [DELETED]  {old_methods[method_id]}")
-
-        if not new_methods and not modified_methods and not deleted_method_ids:
-            out.append("//   (non-method changes only)")
-
+        if not (new_methods or modified_methods or deleted_methods or field_changes):
+            out.append("//   (no field or method changes)")
         if unchanged_count:
             out.append(f"//   ({unchanged_count} other methods unchanged)")
-
         out.append("//")
 
     return "\n".join(out)
 
 
-def _parse_args(argv):
-    """Parse CLI arguments for diff mode.
-
-    Returns (ref, scope_path_str) where scope_path_str may be None.
-    """
-    ref = None
-    scope = None
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--diff" and i + 1 < len(argv):
-            ref = argv[i + 1]
-            i += 2
-        elif not argv[i].startswith("--"):
-            scope = argv[i]
-            i += 1
-        else:
-            i += 1
-    return ref, scope
-
-
-def main():
-    ref, scope_str = _parse_args(sys.argv[1:])
-
-    if not ref:
-        print(
-            "Usage: jskim --diff <ref> [directory]\n"
-            "       git diff main | jskim --diff -",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def main(args):
+    """Run diff mode for ``args.diff`` scoped to ``args.paths[0]`` if given."""
+    ref = args.diff
+    scope_str = args.paths[0] if args.paths else None
 
     git_root = _find_git_root()
     if git_root is None:
         print("Error: not in a git repository", file=sys.stderr)
         sys.exit(1)
 
-    # Read diff from stdin or run git diff
     if ref == "-":
         diff_text = sys.stdin.read()
         base_ref = None
@@ -402,17 +350,13 @@ def main():
 
     changed_files = parse_diff_output(diff_text)
 
-    # Resolve scope path relative to git root
     scope = None
     if scope_str:
         scope_path = Path(scope_str).resolve()
         try:
             scope = str(scope_path.relative_to(git_root))
         except ValueError:
-            print(
-                f"Error: {scope_str} is not under git root {git_root}",
-                file=sys.stderr,
-            )
+            print(f"Error: {scope_str} is not under git root {git_root}", file=sys.stderr)
             sys.exit(1)
 
     print(format_diff_output(changed_files, git_root, base_ref, scope))
