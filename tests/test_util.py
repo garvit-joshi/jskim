@@ -25,6 +25,11 @@ from jskim.util import (
     is_field_final,
     is_field_static,
     extract_method_calls,
+    build_call_scope,
+    get_javadoc_summary,
+    walk_types,
+    format_static_field,
+    signature_line,
     get_annotation_name_from_node,
     extract_mapping_paths,
     extract_request_method,
@@ -1093,26 +1098,27 @@ class TestExtractRecordComponents:
         root = parse_java_bytes(b"record Point(int x, int y) {}")
         decl = find_first_type_declaration(root)
         components = extract_record_components(decl)
-        assert len(components) == 2
-        assert ("int", "x") in components
-        assert ("int", "y") in components
+        assert [(c["type"], c["name"]) for c in components] == [("int", "x"), ("int", "y")]
+        assert components[0]["annotations"] == []
 
     def test_generic_record(self):
         root = parse_java_bytes(b"record Pair<A, B>(A first, B second) {}")
         decl = find_first_type_declaration(root)
         components = extract_record_components(decl)
-        assert len(components) == 2
-        assert ("A", "first") in components
-        assert ("B", "second") in components
+        assert [(c["type"], c["name"]) for c in components] == [("A", "first"), ("B", "second")]
 
     def test_record_with_generic_types(self):
         root = parse_java_bytes(b"record Response<T>(T data, List<String> tags, int code) {}")
         decl = find_first_type_declaration(root)
         components = extract_record_components(decl)
-        assert len(components) == 3
-        assert components[0] == ("T", "data")
-        assert components[1] == ("List<String>", "tags")
-        assert components[2] == ("int", "code")
+        assert [(c["type"], c["name"]) for c in components] == [
+            ("T", "data"), ("List<String>", "tags"), ("int", "code"),
+        ]
+
+    def test_component_annotations_kept(self):
+        root = parse_java_bytes(b"record R(@NotNull @Size(min = 1) @Schema(x = 1) List<E> events) {}")
+        decl = find_first_type_declaration(root)
+        assert extract_record_components(decl)[0]["annotations"] == ["@NotNull", "@Size"]
 
     def test_non_record_returns_empty(self):
         root = parse_java_bytes(b"class Foo { int x; }")
@@ -1512,7 +1518,13 @@ class TestClassifyMethod:
         ("public boolean isActive() { return true; }", "getter"),
         ("public Boolean isActive() { return true; }", "getter"),
         ("public void setName(String n) {}", "setter"),
-        ("public C(int x) {}", "constructor"),
+        ("public C(int x) {}", "wiring"),
+        ("public C(int x) { this.x = x; }", "wiring"),
+        ("C(Foo f, Bar b) { this.f = Objects.requireNonNull(f); b = b; }", "wiring"),
+        ("public C(int x) { super(x); this.x = x; }", "wiring"),
+        ("public C(int x) { this.x = x * 2; }", "constructor"),
+        ("public C(int x) { this.x = x; validate(); }", "constructor"),
+        ("public C(Foo f) { this.f = f.build(); }", "constructor"),
         ("public void process() {}", "business"),
         ("public String toString() { return null; }", "boilerplate"),
         ("public boolean equals(Object o) { return false; }", "boilerplate"),
@@ -1531,6 +1543,8 @@ class TestClassifyMethod:
 
     def test_compact_constructor(self):
         t = _first_type("record R(int x) { R { } }")
+        assert classify_method(t["methods"][0]) == "wiring"
+        t = _first_type("record R(int x) { R { if (x < 0) throw new IllegalArgumentException(); } }")
         assert classify_method(t["methods"][0]) == "constructor"
 
 
@@ -1541,3 +1555,207 @@ class TestNewConstants:
 
     def test_spring_stereotypes(self):
         assert {"@Service", "@Component", "@Repository", "@RestController", "@Configuration"} <= SPRING_STEREOTYPES
+
+
+# ---------------------------------------------------------------------------
+# Call scope: which qualified calls are followable
+# ---------------------------------------------------------------------------
+
+class TestCallScope:
+    SOURCE = """
+    package com.acme.app.trips;
+    import java.time.OffsetDateTime;
+    import java.util.stream.Collectors;
+    import com.acme.app.audit.AuditEvent;
+    import org.springframework.security.core.context.SecurityContextHolder;
+    import static com.acme.jooq.Tables.TRIP;
+    import static org.assertj.core.api.Assertions.assertThat;
+    class S {
+        Repo repo;
+        void m(Other other) {
+            Collectors.toList(); OffsetDateTime.now(); SecurityContextHolder.getContext();
+            AuditEvent.now(); TRIP.fields(); assertThat(repo); repo.save();
+            LocalRules.check(); helper(); other.run(); this.repo.find();
+        }
+        void helper() {}
+    }
+    """
+
+    def test_foreign_and_static_imports_dropped(self):
+        calls = _first_type(self.SOURCE)["methods"][0]["calls"]
+        assert calls == ["AuditEvent.now", "LocalRules.check", "helper", "repo.find", "repo.save"]
+
+    def test_static_field_and_constant_owners_dropped(self):
+        t = _first_type("""
+        class S {
+            private static final SecureRandom RANDOM = new SecureRandom();
+            private final Repo repo;
+            void m() { RANDOM.nextInt(); ID.eq(1); repo.save(); Factory.make(); }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["Factory.make", "repo.save"]
+
+    def test_wildcard_jdk_imports_still_filtered(self):
+        t = _first_type("""
+        package com.acme.app;
+        import java.util.*;
+        import java.time.*;
+        class S { void m() { Comparator.comparing(x); LocalDate.now(); Rules.check(); } }
+        """)
+        assert t["methods"][0]["calls"] == ["Rules.check"]
+
+    def test_scope_shape(self):
+        scope = build_call_scope("com.acme.app", ["java.util.List", "com.acme.app.x.Y", "com.acme.jooq.Tables.TRIP"], {"TRIP"})
+        assert scope["foreign"] == {"List"}
+        assert scope["static_members"] == {"TRIP"}
+        assert scope["fields"] == set()
+
+    def test_no_package_treats_every_import_as_foreign(self):
+        scope = build_call_scope(None, ["a.b.C"], ())
+        assert scope["foreign"] == {"C"}
+
+    def test_no_scope_keeps_everything(self):
+        root = parse_java_bytes(b"class F { void m() { Helper.build(); x.run(); } }")
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
+        assert extract_method_calls(method) == ["Helper.build", "x.run"]
+
+
+# ---------------------------------------------------------------------------
+# parse_method: signature line, noise spans, wiring
+# ---------------------------------------------------------------------------
+
+class TestMethodLines:
+    SOURCE = """
+    class C {
+        @PostMapping("/x")
+        @Operation(summary = "a",
+            description = "b")
+        @ApiResponse(responseCode = "200")
+        public Foo create(Bar bar) {
+            return null;
+        }
+
+        @Override @SuppressWarnings("unchecked") public void run() {}
+    }
+    """
+
+    def test_start_is_signature_line_and_decl_start_is_first_annotation(self):
+        m = _first_type(self.SOURCE)["methods"][0]
+        assert (m["decl_start"], m["start"], m["end"]) == (3, 7, 9)
+
+    def test_noise_spans_cover_documentation_annotations_only(self):
+        m = _first_type(self.SOURCE)["methods"][0]
+        assert [(s["start"], s["end"]) for s in m["noise_spans"]] == [(4, 5), (6, 6)]
+
+    def test_inline_noise_annotation_span(self):
+        m = _first_type(self.SOURCE)["methods"][1]
+        assert m["start"] == m["decl_start"] == 11
+        assert len(m["noise_spans"]) == 1 and m["noise_spans"][0]["start_col"] > 0
+
+    def test_signature_line_for_type(self):
+        root = parse_java_bytes(b"@Data\n@Builder\nclass C {}")
+        assert signature_line(find_first_type_declaration(root)) == 3
+
+    def test_wiring_flag(self):
+        t = _first_type("class C { C(A a) { this.a = a; } C(A a, int n) { this.a = a; this.n = n + 1; } }")
+        assert [m["wiring"] for m in t["methods"]] == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# get_javadoc_summary / walk_types / format_static_field / nested types
+# ---------------------------------------------------------------------------
+
+class TestJavadocSummary:
+    def test_first_sentence_with_inline_tags(self):
+        t = _first_type("""
+        /**
+         * Trips: plan one, {@code rewrite} its plan, or {@link #cancel}. Second sentence.
+         *
+         * <p>More detail.
+         * @see Other
+         */
+        class C {}
+        """)
+        assert t["doc"] == "Trips: plan one, rewrite its plan, or cancel."
+
+    def test_html_and_block_tags(self):
+        t = _first_type("/**\n * <strong>Bold</strong> start<br>here\n * @param x the x\n */\nrecord R(int x) {}")
+        assert t["doc"] == "Bold start here"
+
+    def test_plain_block_comment_is_not_javadoc(self):
+        assert _first_type("/* not doc */ class C {}")["doc"] is None
+        assert _first_type("class C {}")["doc"] is None
+
+    def test_long_sentence_is_capped(self):
+        t = _first_type("/** " + "word " * 60 + "*/ class C {}")
+        assert t["doc"].endswith("...") and len(t["doc"]) <= 160
+
+    def test_nested_type_doc(self):
+        t = _first_type("class C { /** The inner one. */ record R(int x) {} }")
+        assert t["inner_types"][0]["doc"] == "The inner one."
+
+
+class TestNestedTypes:
+    def test_inner_types_are_full_parse_dicts(self):
+        t = _first_type("""
+        class Outer {
+            record Claim(int count, @NotNull Integer last) { static Claim of() { return null; } }
+            enum Kind { A, B }
+            static class Config { @Bean Foo foo() { return null; } }
+        }
+        """)
+        claim, kind, config = t["inner_types"]
+        assert [f["name"] for f in claim["fields"]] == ["count", "last"]
+        assert claim["fields"][1]["annotations"] == ["@NotNull"]
+        assert claim["methods"][0]["name"] == "of"
+        assert kind["enum_constants"] == ["A", "B"]
+        assert config["methods"][0]["annotations"][0]["full"] == "@Bean"
+        assert claim["line"] == 3
+
+    def test_walk_types_labels(self):
+        parsed = parse_java_source("class A { class B { class C {} } enum D {} } class E {}")
+        assert [label for label, _ in walk_types(parsed["types"])] == ["A", "A.B", "A.B.C", "A.D", "E"]
+
+    def test_outer_field_does_not_leak_into_nested_scope(self):
+        t = _first_type("""
+        record View(Progress progress) {
+            record Progress(int n) { static Progress of(Line progress) { return new Progress(progress.count()); } }
+        }
+        """)
+        assert t["inner_types"][0]["methods"][0]["calls"] == []
+
+    def test_nested_calls_use_file_scope(self):
+        t = _first_type("""
+        package a.b;
+        import java.util.stream.Collectors;
+        class Outer { static class In { Repo repo; void m() { Collectors.toSet(); repo.save(); } } }
+        """)
+        assert t["inner_types"][0]["methods"][0]["calls"] == ["repo.save"]
+
+
+class TestFormatStaticField:
+    def test_short_string_value_shown(self):
+        t = _first_type('class P { public static final String READ = "audit.event.read"; private static final String EVENT = "x.y"; static final int MAX = 3; static final String LONG = "' + "x" * 50 + '"; }')
+        rendered = [format_static_field(f, t["constants"]) for f in t["fields"]]
+        assert rendered == ['READ = "audit.event.read"', "EVENT", "MAX", "LONG"]
+
+
+class TestAnnotationConstantResolution:
+    def test_constant_argument_resolved(self):
+        t = _first_type("""
+        class C {
+            static final String CREATE = "trip.create";
+            static final String READ = "trip.read";
+            @RequiresPermission(CREATE) void a() {}
+            @RequiresPermission({CREATE, READ}) void b() {}
+            @RequiresPermission(value = CREATE) void c() {}
+            @RequiresPermission("lit") void d() {}
+        }
+        """)
+        fulls = [m["annotations"][0]["full"] for m in t["methods"]]
+        assert fulls == [
+            '@RequiresPermission("trip.create")',
+            '@RequiresPermission("trip.create", "trip.read")',
+            "@RequiresPermission(value = CREATE)",
+            '@RequiresPermission("lit")',
+        ]

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .util import (
     parse_java_source, classify_method, instance_fields,
-    format_method_annotations, format_calls,
+    format_method_annotations, format_calls, walk_types,
 )
 
 
@@ -120,27 +120,27 @@ def _resolve_base_ref(ref, cwd=None):
 
 
 def _method_keys(parsed):
-    """Map ``Type.identity`` to the method dict for every method in a file."""
+    """Map ``Type.identity`` to the method dict for every method in a file, nested types included."""
     return {
-        f"{t['name']}.{m['identity']}": m
-        for t in parsed["types"] for m in t["methods"]
+        f"{label}.{m['identity']}": m
+        for label, t in walk_types(parsed["types"]) for m in t["methods"]
     }
 
 
 def _field_keys(parsed):
-    """Return ``{key: label}`` for every instance field in a file.
+    """Return ``{key: label}`` for every instance field in a file, nested types included.
 
-    The label is prefixed with the type name only when the file declares
-    more than one top-level type.
+    The label is prefixed with the type name for every type except the
+    file's primary type.
     """
-    multi = len(parsed["types"]) > 1
+    primary = parsed["types"][0]["name"] if parsed["types"] else None
     result = {}
-    for t in parsed["types"]:
+    for type_label, t in walk_types(parsed["types"]):
         for f in instance_fields(t):
             label = f"{f['type']} {f['name']}" if f["name"] else f["type"]
-            if multi:
-                label = f"{t['name']}.{label}"
-            result[f"{t['name']}:{label}"] = label
+            if type_label != primary:
+                label = f"{type_label}.{label}"
+            result[f"{type_label}:{label}"] = label
     return result
 
 
@@ -175,7 +175,7 @@ def run_git_diff(ref, cwd=None):
 
 
 def _is_trivial(method):
-    return classify_method(method) in ("getter", "setter", "boilerplate")
+    return classify_method(method) in ("getter", "setter", "boilerplate", "wiring")
 
 
 def _append_method(out, tag, m):
@@ -257,8 +257,8 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
             continue
         out.append(f"// [NEW] {f['path']}")
         _append_header(out, parsed)
-        fields = sum(len(instance_fields(t)) for t in parsed["types"])
-        methods = [m for t in parsed["types"] for m in t["methods"]]
+        fields = sum(len(instance_fields(t)) for _, t in walk_types(parsed["types"]))
+        methods = [m for _, t in walk_types(parsed["types"]) for m in t["methods"]]
         out.append(f"//   {fields} fields, {len(methods)} methods, {parsed['total_lines']} lines")
         for m in methods:
             if not _is_trivial(m):
@@ -292,7 +292,7 @@ def format_diff_output(changed_files, git_root, base_ref, scope=None):
                     unchanged_count += 1
                 else:
                     new_methods.append(m)
-            elif _changes_overlap(changed_lines, m["start"], m["end"]):
+            elif _changes_overlap(changed_lines, m["decl_start"], m["end"]):
                 if trivial:
                     unchanged_count += 1
                 else:

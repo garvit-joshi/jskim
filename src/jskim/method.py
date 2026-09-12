@@ -5,7 +5,8 @@ Usage: jskim <file.java> <method_name> [method2 ...]
 
 Outputs method bodies with surrounding context:
   - Class declaration and instance fields
-  - The full method source code (with preceding annotations/Javadoc)
+  - The full method source code (with its Javadoc and behaviour annotations;
+    documentation-only annotations such as OpenAPI blocks are skipped)
   - Other methods called within the same class (signatures only)
 """
 
@@ -13,25 +14,27 @@ import re
 import sys
 from pathlib import Path
 
-from .util import parse_java_source, instance_fields, format_method_annotations
+from .util import parse_java_source, instance_fields, format_method_annotations, walk_types
 
 
 def parse_methods(content, source_name=None):
-    """Parse all methods (across every top-level type) from a Java file."""
+    """Parse all methods (across every top-level and nested type) from a Java file."""
     parsed = parse_java_source(content, source_name=source_name)
     types = parsed["types"]
     primary = types[0] if types else None
 
     methods = []
-    for t in types:
+    for label, t in walk_types(types):
         for m in t["methods"]:
             methods.append({
                 "name": m["name"],
                 "sig": m["sig"],
                 "start": m["start"],
+                "decl_start": m["decl_start"],
                 "end": m["end"],
+                "noise_spans": m["noise_spans"],
                 "annotations": format_method_annotations(m),
-                "class_name": t["name"],
+                "class_name": label,
             })
 
     return {
@@ -66,14 +69,30 @@ def list_methods(parsed):
 
 
 def _walk_back_start(all_lines, start):
-    """Include preceding annotation and comment lines above a method."""
+    """Include the Javadoc / comment lines directly above a declaration."""
     while start > 1:
         prev = all_lines[start - 2].strip()
-        if prev.startswith(("@", "*", "/*", "//")):
+        if prev.startswith(("*", "/*", "//")):
             start -= 1
         else:
             break
     return start
+
+
+def _skipped_lines(all_lines, spans):
+    """Line numbers fully covered by documentation annotations.
+
+    A span is skipped only when nothing else shares its first and last
+    line, so ``@Override @SuppressWarnings("x")`` on one line stays visible.
+    """
+    skipped = set()
+    for span in spans:
+        first = all_lines[span["start"] - 1]
+        last = all_lines[span["end"] - 1]
+        if first[: span["start_col"]].strip() or last[span["end_col"]:].strip():
+            continue
+        skipped.update(range(span["start"], span["end"] + 1))
+    return skipped
 
 
 def extract_methods(parsed, method_names):
@@ -109,9 +128,11 @@ def extract_methods(parsed, method_names):
         ann_str = f"{m['annotations']} " if m["annotations"] else ""
         out.append(f"// {ann_str}{m['sig']} (L{m['start']}-L{m['end']})")
         out.append("")
-        start = _walk_back_start(all_lines, m["start"])
+        start = _walk_back_start(all_lines, m["decl_start"])
+        skipped = _skipped_lines(all_lines, m["noise_spans"])
         for i in range(start - 1, m["end"]):
-            out.append(f"{i + 1:>5} | {all_lines[i]}")
+            if i + 1 not in skipped:
+                out.append(f"{i + 1:>5} | {all_lines[i]}")
         out.append("")
 
     method_bodies = "\n".join(

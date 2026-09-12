@@ -13,18 +13,18 @@ Published as a PyPI package (`pip install jskim`). Python 3.10+ required.
 ## Build & Development Commands
 
 ```bash
-pip install -e .              # Install locally in editable mode (the .venv otherwise pins an old wheel)
+pip install -e .              # Install locally in editable mode (the .venv otherwise pins an old wheel; the Homebrew Python behind /opt/homebrew/bin/jskim needs --break-system-packages)
 python -m build               # Build distribution artifacts
-pytest                        # Run all tests
+pytest                        # Run all tests (use the interpreter that has jskim installed, e.g. .venv/bin/python -m pytest)
 pytest tests/test_diff.py     # Run specific test file
 pytest tests/test_diff.py::TestParseDiffOutput::test_modified_file  # Run single test
 ```
 
-**Dependencies:** `tree-sitter>=0.25.0`, `tree-sitter-java>=0.23.0`. Build backend: `hatchling`.
+**Dependencies:** `tree-sitter>=0.26.0`, `tree-sitter-java>=0.23.5`. Build backend: `hatchling`.
 
 ## Architecture
 
-`cli.py` owns the single argparse parser and picks the mode from the positional arguments. Every mode module exposes `main(args)` taking the parsed namespace and only formats output; all parsing lives in `util.py`.
+`cli.py` owns the single argparse parser and picks the mode from the positional arguments. Every mode module exposes `main(args)` taking the parsed namespace and only formats output; all parsing lives in `util.py`. `scripts/audit_real.py <src_dir>` measures the output on a real codebase (parse errors, unfollowable calls, hidden members) and is the regression check to run after output changes.
 
 ```
 cli.py (argparse, mode auto-detection, warns about flags the mode does not use)
@@ -44,7 +44,9 @@ util.py — the only module that imports tree_sitter:
 **Key design patterns:**
 - `util.parse_java_source` is the one parse chain. skim/method/project/diff consume its dicts and never walk the AST themselves. Adding information to the output means adding a key in `parse_type`/`parse_method`/`parse_field`, then rendering it in the modules that care.
 - Annotation rendering is centralized in `util.get_annotations_rich`: noise annotations (`NOISE_ANNOTATIONS`) are dropped, repeats deduped, arguments whitespace-normalized and capped at `ANNOTATION_ARGS_MAX`. HTTP mapping annotations render only their path, resolved through `resolve_string_expression` against the class's `static final String` constants (`extract_string_constants`).
-- `extract_method_calls(node, field_names)` keeps only calls that can be followed from a summary: same-class, `field.method`, `Class.method`, `super.method`. Calls on locals/parameters are dropped.
+- `extract_method_calls(node, call_scope)` keeps only calls that can be followed from a summary: same-class, `field.method`, `super.method`, and `Class.method` when `Class` is a project type (same package or imported from the project root, see `build_call_scope`). Calls on locals/parameters, static-imported members and JDK/library classes are dropped.
+- `parse_method` reports `start` as the signature line and `decl_start` as the first annotation line; `noise_spans` mark documentation annotations so method extraction can skip them. Constructors that only store their parameters carry `wiring: True` and are collapsed everywhere.
+- `inner_types` are full `parse_type` dicts; `walk_types()` iterates a file's types depth first with dotted labels. Every consumer renders nested members (skim), counts nested `@Bean` producers (project) or diffs nested methods and fields (diff).
 - `fields` carry `static`/`final`/`component` flags. Every consumer separates instance fields from constants via `instance_fields()`/`static_fields()`.
 - `project.py` keeps file-level dicts (`scan_java_file` → `{"filepath", "package", "package_annotations", "types": [...]}`) so `package-info.java` annotations reach the package header; `flatten_types()` gives the per-type rows used by dependency, endpoint and call-graph code. Endpoints are resolved in a post-pass (`collect_endpoints`) so constants in other classes resolve.
 - Bean dependencies come from constructor parameters; Lombok constructor annotations fall back to final fields; `@Autowired`/`@Inject` fields always count.

@@ -205,28 +205,30 @@ class TestFormatOutput:
         output = skim(load_fixture("SimpleDirection.java"), "SimpleDirection.java")
         lines = output.split("\n")
         assert lines[0] == "// SimpleDirection.java"
-        assert lines[1] == "// com.example | 0 imports"
+        assert lines[1] == "// com.example"
         assert any("total:" in l for l in lines)
 
     def test_enum_constants_in_output(self):
         output = skim(load_fixture("SimpleDirection.java"))
         assert "// constants: NORTH, SOUTH, EAST, WEST" in output
 
-    def test_lombok_in_output(self):
+    def test_lombok_annotations_stay_on_class_line(self):
         output = skim(load_fixture("StaticFieldService.java"))
-        assert "lombok:" in output
+        assert "@RequiredArgsConstructor" in output
+        assert "lombok:" not in output
 
     def test_instance_and_static_fields_split(self):
         output = skim("""
         class Foo {
-            private static final String BASE = "/x";
+            static final String BASE = "/x";
+            private static final String SECRET = "/y";
             private static final int MAX = 3;
             private final Bar bar;
             private Baz baz;
         }
         """)
         assert "// fields:\n//   Bar bar\n//   Baz baz" in output
-        assert "// static fields: BASE, MAX" in output
+        assert '// static fields: BASE = "/x", SECRET, MAX' in output
         assert "String BASE" not in output
 
     def test_methods_in_output(self):
@@ -320,11 +322,61 @@ class TestFormatOutput:
         )
         assert output == (
             "// package-info.java\n"
-            "// com.example.evidence | 0 imports\n"
+            "// com.example.evidence\n"
             '// @ApplicationModule(displayName = "Evidence")\n'
             "//\n"
             "// total: 3 lines"
         )
+
+    def test_doc_line_after_declaration(self):
+        output = skim("/** Plans trips. Details follow. */\n@Service\nclass TripService {}")
+        assert "// @Service\n// class TripService\n// doc: Plans trips.\n" in output
+
+    def test_wiring_constructor_collapsed(self):
+        output = skim("""
+        class S {
+            private final A a; private final B b;
+            S(A a, B b) { this.a = a; this.b = b; }
+            S(A a) { this.a = a; this.b = build(); }
+        }
+        """)
+        assert "// constructor: L4-L4 (2 params)" in output
+        assert "S(A a, B b)" not in output
+        assert "S(A a)" in output  # non-wiring constructor stays in methods
+
+    def test_record_component_annotations_shown(self):
+        output = skim("record B(@NotNull @Size(min = 1) @Valid List<E> events) {}")
+        assert "//   List<E> events (@NotNull @Size @Valid)" in output
+
+    def test_nested_types_show_members(self):
+        output = skim("""
+        class Outer {
+            record Claim(int count, Integer last) {}
+            enum Kind { A, B }
+            @Configuration static class Cfg {
+                static final String P = "x";
+                @Bean Foo foo(Bar bar) { return bar.make(); }
+            }
+        }
+        """)
+        assert "//   L3: record Claim\n//     fields: int count, Integer last" in output
+        assert "//   L4: enum Kind { A, B }" in output
+        assert "//   L5: @Configuration static class Cfg\n" in output
+        assert '//     static fields: P = "x"' in output
+        assert "//     methods:\n//    " in output
+        assert "L7-L7 (  1 lines): @Bean Foo foo(Bar bar)" in output
+
+    def test_method_range_starts_at_signature(self):
+        output = skim("""
+        class C {
+            @Operation(summary = "x")
+            @ApiResponse(responseCode = "200")
+            @Transactional
+            public void go() {
+            }
+        }
+        """)
+        assert "L6-L7 (  2 lines): @Transactional public void go()" in output
 
     def test_mapping_paths_resolved_from_constants(self):
         output = skim("""

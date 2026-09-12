@@ -31,36 +31,36 @@ jskim A.java B.java C.java                # multiple files
 
 Java simple source files without an explicit type wrapper are summarized as `implicit class <FileStem>`. A `package-info.java` shows its package-level annotations (Spring Modulith `@ApplicationModule`).
 
-The summary shows instance fields and static constants separately, keeps annotation arguments that change behaviour (`@RequiresPermission(Perms.X)`, `@Transactional(readOnly = true)`), drops OpenAPI/Swagger documentation annotations, and resolves mapping paths from class constants (`@PostMapping(path = ONE_TRIP + "/start")` → `@PostMapping("/trips/{tripId}/start")`).
+The summary shows the class Javadoc's first sentence, instance fields and static constants separately (non-private short string constants with their value), collapses dependency-injection constructors to one line, keeps annotation arguments that change behaviour (`@RequiresPermission("trip.create")`, `@Transactional(readOnly = true)`), drops OpenAPI/Swagger documentation annotations, renders nested types with their members, and resolves mapping paths from class constants (`@PostMapping(path = ONE_TRIP + "/start")` → `@PostMapping("/trips/{tripId}/start")`). Method line ranges start at the signature, not at the annotation block above it.
 
 ### Project map
 
-Generates a compact map of all Java files in a directory: packages (with `package-info.java` annotations), classes, annotations, field/method counts, Lombok usage, enum constants.
+Generates a compact map of all Java files in a directory: packages (relative to the common root, with `package-info.java` annotations), classes, annotations, field/method counts, Lombok usage, enum constants, records by name. Build output directories (`target/`, `build/`) are skipped.
 
 ```bash
 jskim <src_dir>
-jskim <src_dir> --deps                 # import-based dependencies
+jskim <src_dir> --deps                 # package-to-package dependencies
 jskim <src_dir> --endpoints             # REST endpoint map
 jskim <src_dir> --beans                 # Spring bean DI graph + @Bean producers + config properties
 jskim <src_dir> --callers Class.method  # upstream callers for a specific method
 jskim <src_dir> --impact Class.method   # callers + direct callees for a specific method
 jskim <src_dir> --impact Class.method --depth 2  # bounded hierarchy depth
-jskim <src_dir> --package <prefix>      # filter by package
+jskim <src_dir> --package <text>        # filter by package (substring)
 jskim <src_dir> --annotation <@Ann>     # filter by class annotation
 jskim <src_dir> --extends <ClassName>   # filter by superclass
 jskim <src_dir> --implements <Name>     # filter by implemented interface
 ```
 
 **Spring Boot flags:**
-- `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number. Paths built from constants (`@RequestMapping(BASE_PATH)`, `TRIPS + "/{id}"`, `ApiPaths.ROOT`) are resolved across the project
-- `--beans` — shows bean DI wiring (constructor parameters, or Lombok constructor + final fields, or `@Autowired`/`@Inject` fields), `@Bean` factory method producers, and `@ConfigurationProperties` with prefix + field details
+- `--endpoints` — lists all REST endpoints: HTTP method, full path (base + method), handler, line number, and the handler's guard annotations with constants resolved (`@RequiresPermission("trip.create")`). Paths built from constants (`@RequestMapping(BASE_PATH)`, `TRIPS + "/{id}"`, `ApiPaths.ROOT`) are resolved across the project
+- `--beans` — shows bean DI wiring (constructor parameters, or Lombok constructor + final fields, or `@Autowired`/`@Inject` fields), `@Bean` factory method producers (nested `@Configuration` classes included), and `@ConfigurationProperties` with prefix + field details
 - `--callers Class.method` — shows resolved upstream callers for a specific method; use a fully-qualified class name when class names collide
 - `--impact Class.method` — shows both upstream callers and downstream calls from the target method
 - `--depth N` — controls caller/impact traversal depth; defaults to 1 to keep output compact
 - `--implements` — filter classes by implemented interface name
-- `--deps` — uses fully-qualified names when simple class names would be ambiguous
+- `--deps` — one block per package listing the other project packages it imports, extends or implements, and the types involved. Same-package references are omitted, so the output is the module-boundary view
 
-Call hierarchy mode resolves same-class calls, static calls on project classes, and field calls such as `billingService.create()` when the field type points to a project class. It intentionally skips unresolved local-variable/parameter calls and ambiguous overload edges rather than guessing. Classes are shown by simple name and fully qualified only when the simple name is ambiguous.
+Call hierarchy mode resolves same-class calls, static calls on project classes, and field calls such as `billingService.create()` when the field type points to a project class. A call through an interface or superclass also counts for every project implementation, so `--callers AuditEventService.write` finds the callers of `AuditApi.write`. It intentionally skips unresolved local-variable/parameter calls and ambiguous overload edges rather than guessing. Classes are shown by simple name and fully qualified only when the simple name is ambiguous.
 
 Example:
 
@@ -105,7 +105,7 @@ jskim src/ --diff HEAD~1               # scoped to directory
 git diff main | jskim --diff -         # read diff from stdin
 ```
 
-Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`, and added/removed instance fields or record components as `[FIELDS] +Type name, -Type name`. Getters/setters/boilerplate changes are suppressed.
+Output marks methods as `[NEW]`, `[MODIFIED]`, or `[DELETED]`, and added/removed instance fields or record components as `[FIELDS] +Type name, -Type name`, nested types included. Getters/setters/boilerplate and dependency-injection constructor changes are suppressed.
 Deleted methods are shown with their previous signature when a base ref is available, so overload removals stay distinguishable.
 
 ### Extract methods
@@ -115,6 +115,8 @@ jskim <file.java> --list                          # list all methods
 jskim <file.java> <method_name>                    # extract one method
 jskim <file.java> <method1> <method2> <method3>    # extract multiple
 ```
+
+The extracted source keeps the Javadoc and behaviour annotations above the method and skips documentation-only annotations (`@Operation`, `@ApiResponse`, `@Schema`).
 
 ## Method calls (`→`)
 
@@ -128,7 +130,7 @@ Each method in the skim output shows its direct method invocations:
 //                → billingService.findById
 ```
 
-Every `→` entry can be followed: an unqualified name is a method in the same class, `field.method` resolves through the `fields:` section (`billingService` → `BillingService`, so skim `BillingService.java` next), and `Class.method` is a static call. Calls on local variables and parameters, chained/fluent calls, logging, and collection plumbing are excluded because they cannot be followed from a summary.
+Every `→` entry can be followed: an unqualified name is a method in the same class, `field.method` resolves through the `fields:` section (`billingService` → `BillingService`, so skim `BillingService.java` next), and `Class.method` is a static call on a project class. Calls on local variables and parameters, JDK/Spring/library classes (`Collectors.groupingBy`, `OffsetDateTime.now`), static-imported members, ALL_CAPS constants, chained/fluent calls, logging, and collection plumbing are excluded because they cannot be followed from a summary.
 
 ## Usage in Skill-enabled Agents
 

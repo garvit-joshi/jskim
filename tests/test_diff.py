@@ -495,3 +495,33 @@ class TestDiffFieldChanges:
             "class Foo {}\nclass Bar { int x; int y; }\n",
         )
         assert "[FIELDS]   +Bar.int y" in output
+
+
+class TestDiffTrivialAndNested:
+    def _format_repo_diff(self, tmp_path, old_source, new_source):
+        return TestDiffOverloads._format_repo_diff(self, tmp_path, old_source, new_source)
+
+    def test_wiring_constructor_change_is_not_listed(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    private final A a;\n    Foo(A a) { this.a = a; }\n}\n",
+            "class Foo {\n    private final A a;\n    private final B b;\n    Foo(A a, B b) { this.a = a; this.b = b; }\n}\n",
+        )
+        assert "[FIELDS]   +B b" in output
+        assert "Foo(A a, B b)" not in output
+
+    def test_annotation_only_change_marks_method_modified(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    @Transactional\n    void go() {\n    }\n}\n",
+            "class Foo {\n    @Transactional(readOnly = true)\n    void go() {\n    }\n}\n",
+        )
+        assert "[MODIFIED] L3-L4 (2 lines): @Transactional(readOnly = true) void go()" in output
+
+    def test_nested_record_component_change(self, tmp_path):
+        output = self._format_repo_diff(
+            tmp_path,
+            "class Foo {\n    record Claim(int a) {}\n}\n",
+            "class Foo {\n    record Claim(int a, int b) {}\n}\n",
+        )
+        assert "[FIELDS]   +Foo.Claim.int b" in output

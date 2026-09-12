@@ -6,11 +6,12 @@ from jskim.project import (
     scan_java_file,
     flatten_types,
     collect_endpoints,
-    find_dependencies,
+    find_package_dependencies,
     format_output,
     format_callers_output,
     format_impact_output,
     filter_files,
+    find_java_files,
     _join_paths,
 )
 from tests.conftest import fixture_path, FIXTURES_DIR
@@ -246,66 +247,41 @@ class TestCollectEndpoints:
 
 
 # ---------------------------------------------------------------------------
-# find_dependencies
+# find_package_dependencies
 # ---------------------------------------------------------------------------
 
-class TestFindDependencies:
-    def test_no_deps(self):
-        assert find_dependencies([synthetic_type("Foo"), synthetic_type("Bar")]) == {}
+class TestFindPackageDependencies:
+    def test_no_cross_package_deps(self):
+        assert find_package_dependencies([synthetic_type("Foo", imports=["com.example.Bar"]), synthetic_type("Bar")]) == {}
 
-    def test_import_based_dep(self):
-        deps = find_dependencies([synthetic_type("Foo", imports=["com.example.Bar"]), synthetic_type("Bar")])
-        assert deps == {"Foo": ["Bar"]}
-
-    def test_extends_dep(self):
-        deps = find_dependencies([synthetic_type("Foo", extends="Bar"), synthetic_type("Bar")])
-        assert deps["Foo"] == ["Bar"]
-
-    def test_implements_dep(self):
-        deps = find_dependencies([synthetic_type("Foo", implements=["Baz"]), synthetic_type("Baz")])
-        assert deps["Foo"] == ["Baz"]
-
-    def test_wildcard_import(self):
-        deps = find_dependencies([
-            synthetic_type("Foo", package="com.example.a", imports=["com.example.b.*"]),
-            synthetic_type("Bar", package="com.example.b"),
+    def test_import_extends_implements_and_wildcard(self):
+        deps = find_package_dependencies([
+            synthetic_type("Svc", package="com.example.trips", imports=["com.example.audit.AuditApi", "com.example.shared.*"],
+                           extends="BaseSvc", implements=["TripsApi"]),
+            synthetic_type("AuditApi", package="com.example.audit"),
+            synthetic_type("Ids", package="com.example.shared"),
+            synthetic_type("BaseSvc", package="com.example.core"),
+            synthetic_type("TripsApi", package="com.example.trips"),
         ])
-        assert deps["Foo"] == ["Bar"]
+        assert deps == {"com.example.trips": {
+            "com.example.audit": ["AuditApi"],
+            "com.example.core": ["BaseSvc"],
+            "com.example.shared": ["Ids"],
+        }}
 
-    def test_self_reference_excluded(self):
-        assert find_dependencies([synthetic_type("Foo", imports=["com.example.Foo"])]) == {}
-
-    def test_duplicate_simple_names_use_qualified_dependency_names(self):
-        deps = find_dependencies([
-            synthetic_type("UseA", package="com.example.use", imports=["com.example.a.Config"]),
-            synthetic_type("UseB", package="com.example.use", imports=["com.example.b.Config"]),
-            synthetic_type("Config", package="com.example.a"),
-            synthetic_type("Config", package="com.example.b"),
+    def test_static_import_counts_for_owning_type(self):
+        deps = find_package_dependencies([
+            synthetic_type("Repo", package="com.example.a", imports=["com.example.jooq.Tables.TRIP"]),
+            synthetic_type("Tables", package="com.example.jooq"),
         ])
-        assert deps["UseA"] == ["com.example.a.Config"]
-        assert deps["UseB"] == ["com.example.b.Config"]
-
-    def test_duplicate_simple_names_use_qualified_source_keys(self):
-        deps = find_dependencies([
-            synthetic_type("Foo", package="com.example.a", imports=["com.example.shared.Bar"]),
-            synthetic_type("Foo", package="com.example.b", imports=["com.example.shared.Bar"]),
-            synthetic_type("Bar", package="com.example.shared"),
-        ])
-        assert deps["com.example.a.Foo"] == ["Bar"]
-        assert deps["com.example.b.Foo"] == ["Bar"]
-
-    def test_same_package_extends_beats_ambiguous_simple_name(self):
-        deps = find_dependencies([
-            synthetic_type("Foo", package="com.example.a", extends="BaseConfig"),
-            synthetic_type("BaseConfig", package="com.example.a"),
-            synthetic_type("BaseConfig", package="com.example.b"),
-        ])
-        assert deps["Foo"] == ["com.example.a.BaseConfig"]
+        assert deps == {"com.example.a": {"com.example.jooq": ["Tables"]}}
 
     def test_real_fixtures(self):
         types = flatten_types(files_of(fixture_path("StaticFieldService.java"), fixture_path("AppConfiguration.java")))
-        assert isinstance(find_dependencies(types), dict)
+        assert isinstance(find_package_dependencies(types), dict)
 
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # filter_files
@@ -358,30 +334,75 @@ class TestFormatOutput:
         assert "Project Map: 1 files" in output
         assert "enum SimpleDirection { NORTH, SOUTH, EAST, WEST }" in output
 
-    def test_packages_grouped(self):
+    def test_packages_grouped_relative_to_root(self):
         output = format_output(files_of(fixture_path("SimpleDirection.java"), fixture_path("StaticFieldService.java")))
+        assert "| packages under com.example" in output
         assert "// com.example (1 files," in output
-        assert "// com.example.services (1 files," in output
+        assert "// services (1 files," in output
+
+    def test_single_package_keeps_full_name(self):
+        output = format_output(files_of(fixture_path("SimpleDirection.java")))
+        assert "packages under" not in output
+        assert "// com.example (1 files," in output
 
     def test_field_method_line_counts(self):
         output = format_output(files_of(fixture_path("StaticFieldService.java")))
         assert "class StaticFieldService @Service [4F | 2M | 44L | " in output
         assert "lombok:Slf4j,RequiredArgsConstructor" in output
 
-    def test_show_deps(self):
-        output = format_output(files_of(fixture_path("SealedAndMultiClass.java")), show_deps=True)
-        assert "=== Dependencies ===" in output
-        assert "Circle → SealedAndMultiClass" in output
-
-    def test_show_deps_disambiguates_duplicate_names(self):
+    def test_show_deps_is_package_level(self):
         files = [
-            synthetic_file(synthetic_type("UseA", package="com.example.use", imports=["com.example.a.Config"]),
+            synthetic_file(synthetic_type("UseA", package="com.example.use", imports=["com.example.a.Config", "com.example.a.Other"]),
                            package="com.example.use"),
-            synthetic_file(synthetic_type("Config", package="com.example.a"), package="com.example.a"),
-            synthetic_file(synthetic_type("Config", package="com.example.b"), package="com.example.b"),
+            synthetic_file(synthetic_type("Config", package="com.example.a"), synthetic_type("Other", package="com.example.a"),
+                           package="com.example.a"),
         ]
         output = format_output(files, show_deps=True)
-        assert "UseA → com.example.a.Config" in output
+        assert "// === Package Dependencies ===\n//   use →\n//     a: Config, Other\n" in output
+
+    def test_records_collapsed_to_names(self, tmp_path):
+        (tmp_path / "A.java").write_text("package d; record A(int x) {}", encoding="utf-8")
+        (tmp_path / "B.java").write_text("package d; record B(int x) { static B of() { return null; } }", encoding="utf-8")
+        (tmp_path / "C.java").write_text("package d; @Service record C(int x) {}", encoding="utf-8")
+        (tmp_path / "S.java").write_text("package d; class S {}", encoding="utf-8")
+        output = format_output(files_of(*sorted(tmp_path.glob("*.java"))))
+        assert "//   record C @Service [1F | 1L]\n//   class S [1L]\n//   records: A, B\n" in output
+        assert "record A" not in output
+
+    def test_endpoint_guards_resolved_across_classes(self, tmp_path):
+        (tmp_path / "Perms.java").write_text(
+            'package d; public final class Perms { public static final String READ = "trip.read"; }', encoding="utf-8")
+        (tmp_path / "C.java").write_text("""
+            package d;
+            @RestController @RequestMapping("/api")
+            class C {
+                @GetMapping("/trips") @ResponseStatus(HttpStatus.OK) @RequiresPermission(Perms.READ)
+                @Operation(summary = "x") List<T> list() { return null; }
+            }
+            """, encoding="utf-8")
+        output = format_output(files_of(*sorted(tmp_path.glob("*.java"))), show_endpoints=True)
+        assert 'GET  /api/trips  C.list()  L6  @ResponseStatus(HttpStatus.OK) @RequiresPermission("trip.read")' in output
+
+    def test_endpoint_guards_resolve_through_unfiltered_project(self, tmp_path):
+        (tmp_path / "Perms.java").write_text(
+            'package d.perms; public final class Perms { public static final String READ = "trip.read"; }', encoding="utf-8")
+        (tmp_path / "C.java").write_text(
+            'package d.web; @RestController class C { @GetMapping("/t") @RequiresPermission(Perms.READ) void list() {} }',
+            encoding="utf-8")
+        all_files = files_of(*sorted(tmp_path.glob("*.java")))
+        filtered = filter_files(all_files, pkg_filter="d.web")
+        assert '@RequiresPermission("trip.read")' in format_output(filtered, show_endpoints=True, all_file_infos=all_files)
+        assert "@RequiresPermission(Perms.READ)" in format_output(filtered, show_endpoints=True)
+
+    def test_nested_bean_producers(self, tmp_path):
+        (tmp_path / "Cfg.java").write_text("""
+            package d;
+            @Configuration class Cfg {
+                @Configuration static class Inner { @Bean S3Client client() { return null; } }
+            }
+            """, encoding="utf-8")
+        output = format_output(files_of(tmp_path / "Cfg.java"), show_beans=True)
+        assert "Cfg @Configuration → S3Client" in output
 
     def test_show_beans(self):
         output = format_output(files_of(fixture_path("AppConfiguration.java")), show_beans=True)
@@ -509,6 +530,19 @@ class TestCallHierarchyOutput:
         assert "target: demo.a.Config.build()" in output
         assert "← User.go()" in output
 
+    def test_callers_follow_interface_to_implementation(self, tmp_path):
+        (tmp_path / "AuditApi.java").write_text(
+            "package demo; public interface AuditApi { void write(String e); }", encoding="utf-8")
+        (tmp_path / "AuditService.java").write_text(
+            "package demo; class AuditService implements AuditApi { public void write(String e) {} }", encoding="utf-8")
+        (tmp_path / "TripService.java").write_text(
+            "package demo; class TripService { AuditApi audit; void start() { audit.write(\"x\"); } }", encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        assert "← TripService.start()" in format_callers_output(types, "AuditService.write")
+        assert "← TripService.start()" in format_callers_output(types, "AuditApi.write")
+        impact = format_impact_output(types, "TripService.start")
+        assert "→ AuditApi.write(String)" in impact and "→ AuditService.write(String)" in impact
+
     def test_impact_shows_callers_and_callees(self, tmp_path):
         output = format_impact_output(self._write_project(tmp_path), "BillingService.processBilling", depth=1)
         assert "Impact: BillingService.processBilling" in output
@@ -528,3 +562,23 @@ class TestFullProjectScan:
         output = format_output(files, show_deps=True, show_endpoints=True, show_beans=True)
         assert output.startswith("//")
         assert "Project Map: 34 files, 2003 lines" in output
+
+
+# ---------------------------------------------------------------------------
+# find_java_files / filter_files
+# ---------------------------------------------------------------------------
+
+class TestScanAndFilter:
+    def test_build_output_dirs_skipped(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "target" / "gen").mkdir(parents=True)
+        (tmp_path / "src" / "A.java").write_text("class A {}", encoding="utf-8")
+        (tmp_path / "target" / "gen" / "B.java").write_text("class B {}", encoding="utf-8")
+        assert [f.name for f in find_java_files(tmp_path)] == ["A.java"]
+
+    def test_package_filter_is_substring(self):
+        files = [
+            synthetic_file(synthetic_type("A", package="com.example.logistics.internal"), package="com.example.logistics.internal"),
+            synthetic_file(synthetic_type("B", package="com.example.audit"), package="com.example.audit"),
+        ]
+        assert [f["package"] for f in filter_files(files, pkg_filter="logistics.internal")] == ["com.example.logistics.internal"]

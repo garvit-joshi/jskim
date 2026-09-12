@@ -9,7 +9,7 @@ from pathlib import Path
 from .util import (
     parse_java_source, classify_method, instance_fields, static_fields,
     format_method_annotations, format_calls, format_enum_constants,
-    LOMBOK_ANNOTATIONS, ENUM_CONSTANTS_SKIM_MAX,
+    format_static_field, ENUM_CONSTANTS_SKIM_MAX,
 )
 
 
@@ -29,15 +29,24 @@ def _format_annotation_list(annotations):
     return " ".join(a["full"] for a in annotations)
 
 
-def _format_methods(out, methods, grep=None, annotation=None):
+def _format_field(f):
+    """Render one field as ``Type name (@Ann @Ann)``."""
+    ann = f" ({' '.join(f['annotations'])})" if f["annotations"] else ""
+    name = f" {f['name']}" if f["name"] else ""
+    return f"{f['type']}{name}{ann}"
+
+
+def _format_methods(out, methods, indent, grep=None, annotation=None):
     """Append the collapsed/expanded method listing for one type."""
-    getters, setters, boilerplate, named = [], [], [], []
+    wiring, getters, setters, boilerplate, named = [], [], [], [], []
     filtering = grep or annotation
     for m in methods:
         if filtering and not _match_method(m, grep, annotation):
             continue
         kind = classify_method(m)
-        if kind == "getter":
+        if kind == "wiring":
+            wiring.append(m)
+        elif kind == "getter":
             getters.append(m["name"])
         elif kind == "setter":
             setters.append(m["name"])
@@ -46,22 +55,46 @@ def _format_methods(out, methods, grep=None, annotation=None):
         else:
             named.append(m)
 
+    if wiring:
+        spans = ", ".join(f"L{m['start']}-L{m['end']} ({len(m['params'])} params)" for m in wiring)
+        out.append(f"//{indent} constructor: {spans}")
     if getters:
-        out.append(f"// getters: {', '.join(getters)}")
+        out.append(f"//{indent} getters: {', '.join(getters)}")
     if setters:
-        out.append(f"// setters: {', '.join(setters)}")
+        out.append(f"//{indent} setters: {', '.join(setters)}")
     if boilerplate:
-        out.append(f"// boilerplate: {', '.join(boilerplate)}")
+        out.append(f"//{indent} boilerplate: {', '.join(boilerplate)}")
     if named:
-        out.append("// methods:")
+        out.append(f"//{indent} methods:")
         for m in named:
             lines = m["end"] - m["start"] + 1
             loc = f"L{m['start']}-L{m['end']}"
             ann_str = format_method_annotations(m)
             ann_str = f" {ann_str}" if ann_str else ""
-            out.append(f"//   {loc:>12} ({lines:>3} lines):{ann_str} {m['sig']}")
+            out.append(f"//{indent}   {loc:>12} ({lines:>3} lines):{ann_str} {m['sig']}")
             if m["calls"]:
-                out.append(f"//                → {format_calls(m['calls'])}")
+                out.append(f"//{indent}                → {format_calls(m['calls'])}")
+
+
+def _format_inner_type(out, t, indent, grep=None, annotation=None):
+    """Append one nested type as a header line plus a compact body."""
+    ann = _format_annotation_list(t["annotations"])
+    ann_str = f" {ann}" if ann else ""
+    decl = t["declaration"]
+    if t["enum_constants"]:
+        decl += f" {{ {format_enum_constants(t['enum_constants'], ENUM_CONSTANTS_SKIM_MAX)} }}"
+    out.append(f"//{indent} L{t['line']}:{ann_str} {decl}")
+    body_indent = indent + "  "
+    fields = instance_fields(t)
+    if fields:
+        out.append(f"//{body_indent} fields: {', '.join(_format_field(f) for f in fields)}")
+    statics = static_fields(t)
+    if statics:
+        out.append(f"//{body_indent} static fields: {', '.join(format_static_field(f, t['constants']) for f in statics)}")
+    if t["methods"]:
+        _format_methods(out, t["methods"], body_indent, grep, annotation)
+    for inner in t["inner_types"]:
+        _format_inner_type(out, inner, body_indent, grep, annotation)
 
 
 def _format_type(out, t, grep=None, annotation=None):
@@ -75,14 +108,12 @@ def _format_type(out, t, grep=None, annotation=None):
         out.append("//")
         out.append("// fields:")
         for f in fields:
-            ann = f" ({' '.join(f['annotations'])})" if f["annotations"] else ""
-            name = f" {f['name']}" if f["name"] else ""
-            out.append(f"//   {f['type']}{name}{ann}")
+            out.append(f"//   {_format_field(f)}")
 
     statics = static_fields(t)
     if statics:
         out.append("//")
-        out.append(f"// static fields: {', '.join(f['name'] for f in statics)}")
+        out.append(f"// static fields: {', '.join(format_static_field(f, t['constants']) for f in statics)}")
 
     if t["static_initializers"]:
         out.append("//")
@@ -92,22 +123,19 @@ def _format_type(out, t, grep=None, annotation=None):
 
     if t["methods"]:
         out.append("//")
-        _format_methods(out, t["methods"], grep, annotation)
+        _format_methods(out, t["methods"], "", grep, annotation)
 
     if t["inner_types"]:
         out.append("//")
         out.append("// inner types:")
         for inner in t["inner_types"]:
-            ann = _format_annotation_list(inner["annotations"])
-            ann_str = f" {ann}" if ann else ""
-            out.append(f"//   L{inner['line']}:{ann_str} {inner['declaration']}")
+            _format_inner_type(out, inner, "  ", grep, annotation)
 
 
 def format_output(parsed, filepath, grep=None, annotation=None):
     """Format a parse_java_source result into a compact summary."""
     out = [f"// {filepath}"]
-    pkg = parsed["package"] or "(default)"
-    out.append(f"// {pkg} | {len(parsed['imports'])} imports")
+    out.append(f"// {parsed['package'] or '(default)'}")
     if parsed["package_annotations"]:
         out.append(f"// {_format_annotation_list(parsed['package_annotations'])}")
 
@@ -118,15 +146,11 @@ def format_output(parsed, filepath, grep=None, annotation=None):
         return "\n".join(out)
 
     primary = types[0]
-    lombok_notes = [
-        f"{a}: {LOMBOK_ANNOTATIONS[a]}"
-        for a in primary["annotation_names"] if a in LOMBOK_ANNOTATIONS
-    ]
-    if lombok_notes:
-        out.append(f"// lombok: {' | '.join(lombok_notes)}")
     if primary["annotations"]:
         out.append(f"// {_format_annotation_list(primary['annotations'])}")
     out.append(f"// {primary['declaration']}")
+    if primary["doc"]:
+        out.append(f"// doc: {primary['doc']}")
 
     _format_type(out, primary, grep, annotation)
 

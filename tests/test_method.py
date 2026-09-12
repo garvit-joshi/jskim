@@ -253,6 +253,32 @@ class TestExtractMethods:
         # The Javadoc above isSingleEscortTrip should be captured
         assert "single escort trip" in output.lower()
 
+    def test_documentation_annotations_skipped_in_source(self):
+        content = (
+            "class C {\n"
+            "    /** Creates it. */\n"
+            "    @PostMapping(\"/x\")\n"
+            "    @Operation(summary = \"a\",\n"
+            "        description = \"b\")\n"
+            "    @ApiResponse(responseCode = \"200\")\n"
+            "    @Override @SuppressWarnings(\"x\") public Foo create(Bar bar) {\n"
+            "        return null;\n"
+            "    }\n"
+            "}\n"
+        )
+        output = extract_methods(parse_methods(content), ["create"])
+        assert "Creates it." in output
+        assert "@PostMapping" in output
+        assert "@Operation" not in output and "description" not in output and "@ApiResponse" not in output
+        assert '@Override @SuppressWarnings("x") public Foo create' in output  # shares a line, kept
+        assert "(L7-L9)" in output
+
+    def test_nested_type_methods_are_extractable(self):
+        content = "class Outer {\n    record In(int x) {\n        static In of() { return null; }\n    }\n}\n"
+        parsed = parse_methods(content)
+        assert [m["class_name"] for m in parsed["methods"]] == ["Outer.In"]
+        assert "static In of()" in extract_methods(parsed, ["of"])
+
     def test_implicit_class_extract(self):
         content = load_fixture("ImplicitClass.java")
         parsed = parse_methods(content, source_name="ImplicitClass.java")

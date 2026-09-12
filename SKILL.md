@@ -26,7 +26,7 @@ Do not attempt to run jskim commands until it is confirmed installed. Fall back 
 `jskim` auto-detects whether you're pointing at a file or directory, and whether you're asking for a summary or method extraction. A flag that does not apply to the detected mode is reported on stderr (`Warning: --grep not used in project mode, ignored`), never silently dropped.
 
 ### Single file summary
-Summarizes a Java file — collapses imports, boilerplate (getters/setters/equals/hashCode), and shows method signatures with line ranges, annotations with their arguments, and traceable method calls.
+Summarizes a Java file — drops imports, collapses boilerplate (wiring constructors, getters/setters/equals/hashCode), and shows the class Javadoc's first sentence, method signatures with line ranges, annotations with their arguments, nested types with their members, and traceable method calls.
 
 ```bash
 jskim <file.java>
@@ -44,29 +44,29 @@ Java simple source files without an explicit type wrapper are summarized as `imp
 - Filters can be combined: `--grep create --annotation @PostMapping`
 
 ### Project map
-Generates a compact map of all Java files in a directory — packages (with package-level annotations), classes, annotations, field/method counts, Lombok usage, enum constants.
+Generates a compact map of all Java files in a directory — packages (with package-level annotations), classes, annotations, field/method counts, Lombok usage, enum constants; records are listed by name only. Build output (`target/`, `build/`, `out/`) is skipped, so pointing at a repo root is safe.
 
 ```bash
 jskim <src_dir>
-jskim <src_dir> --deps                          # import-based dependencies
+jskim <src_dir> --deps                          # package-to-package dependencies
 jskim <src_dir> --endpoints                     # REST endpoint map with resolved paths
 jskim <src_dir> --beans                         # Spring bean DI graph + @Bean producers + config properties
 jskim <src_dir> --callers Class.method          # upstream callers for a specific method
 jskim <src_dir> --impact Class.method           # callers + direct callees for a specific method
 jskim <src_dir> --impact Class.method --depth 2 # bounded caller/callee hierarchy depth
-jskim <src_dir> --package <prefix>               # filter by package
+jskim <src_dir> --package <text>                 # filter by package (substring)
 jskim <src_dir> --annotation <@Ann>              # filter by class annotation
 jskim <src_dir> --extends <ClassName>            # filter by superclass
 jskim <src_dir> --implements <Interface>        # filter by implemented interface
 ```
 
 **Filters** (essential for large projects with hundreds of files):
-- `--package com.stw.server.tripsheet` — only show classes in that package (prefix match)
+- `--package logistics.internal` — only show classes whose package contains that text
 - `--annotation @RestController` — only show classes with that annotation
 - `--extends BaseService` — only show classes extending that superclass
 - `--implements EventPublisher` — only show classes implementing that interface
-- `--deps` — show which classes depend on which (uses imports, runs in seconds even on 2000+ files)
-- `--endpoints` — list all REST endpoints: HTTP method, full path, handler method, line number. Paths built from constants (`@RequestMapping(BASE_PATH)`, `path = TRIPS + "/{id}"`, `ApiPaths.ROOT`) are resolved across the whole project.
+- `--deps` — show which packages depend on which other packages and through which types (the Spring Modulith boundary view; same-package references are not listed)
+- `--endpoints` — list all REST endpoints: HTTP method, full path, handler method, line number, and the handler's remaining annotations (`@RequiresPermission("trip.create")`, `@ResponseStatus(...)`). Paths and annotation constants (`@RequestMapping(BASE_PATH)`, `path = TRIPS + "/{id}"`, `ApiPaths.ROOT`, `Perms.TRIP_CREATE`) are resolved across the whole project.
 - `--beans` — show Spring bean DI graph (constructor parameters, Lombok constructor + final fields, or `@Autowired`/`@Inject` fields), `@Bean` factory method producers, and `@ConfigurationProperties` with instance field details
 - `--callers BillingService.create` — show resolved upstream callers for a class-qualified method target
 - `--impact BillingService.create` — show callers plus resolved downstream calls from the target method
@@ -77,6 +77,7 @@ jskim <src_dir> --implements <Interface>        # filter by implemented interfac
 - Always use a class-qualified target (`Class.method` or `com.example.Class.method`). Bare method names like `create` are intentionally rejected because they are too ambiguous in Java projects.
 - If simple class names collide, rerun with the fully-qualified class name shown in the candidates list.
 - Edges are resolved from same-class calls, static calls on project classes, and field calls where the field type is a project class, such as `billingService.create()`.
+- A call through an interface or superclass also counts as a call to every project implementation: `audit.write()` on an `AuditApi` field is a caller of both `AuditApi.write` and `AuditEventService.write`, so querying the concrete service works in Modulith codebases where every cross-module call goes through an `*Api` interface.
 - Calls on local variables, parameters, or overloaded targets are skipped when they cannot be resolved safely. Treat missing edges as "not proven" rather than "not called."
 
 ### Diff mode
@@ -96,12 +97,13 @@ git diff main | jskim --diff -         # read diff from stdin
 - `[DELETED]` — file or method that was removed (previous signature shown when the base ref is available)
 - `[FIELDS]` — instance fields or record components added (`+`) or removed (`-`); this is how a DTO/record contract change shows up
 - `→` calls shown for new/modified methods (same format as file summary)
-- Getters, setters, boilerplate and static constant changes are suppressed
+- Getters, setters, boilerplate, wiring constructors and static constant changes are suppressed; a new constructor dependency shows up as a `[FIELDS]` entry instead
+- Methods and fields of nested types are compared too, labelled `Outer.Inner.name`
 - Unchanged methods are counted but not listed
 - `(no field or method changes)` means only comments, imports, constants or bodies of trivial methods changed
 
 ### Method extraction
-Extracts method source code with context (instance fields, called methods, annotations, Javadoc).
+Extracts method source code with context (instance fields, called methods, behaviour annotations, Javadoc). Documentation annotations (`@Operation`, `@ApiResponse`, `@Schema`, ...) are skipped when printing the source, so a 3-line handler under 40 lines of OpenAPI stays 3 lines. Methods of nested types are extractable by name too.
 
 ```bash
 jskim <file.java> --list                         # list all methods
@@ -120,40 +122,46 @@ jskim <file.java> <method1> <method2> <method3>   # extract multiple
 
 ```
 // path/to/BillingController.java
-// com.example.billing | 12 imports
+// com.example.billing
 // @RestController @RequestMapping("/api/v1/billing")
 // class BillingController extends BaseController
+// doc: The billing routes: create a bill, read one, and settle it.
 //
 // fields:
 //   BillingService billingService
 //   BillingValidator validator (@Autowired)
 //   AuditLogger auditLogger
 //
-// static fields: BASE_PATH, LOG, MAX_PAGE_SIZE
+// static fields: BASE_PATH = "/api/v1/billing", LOG, MAX_PAGE_SIZE
 //
+// constructor: L18-L21 (2 params)          <- only stores its parameters; the fields above are the dependency list
 // getters: getName, getStatus              <- collapsed, names only
 // setters: setName, setStatus              <- collapsed, names only
 // boilerplate: toString, hashCode, equals  <- collapsed, names only
 // methods:
-//     L18-L21 (  4 lines): BillingController(BillingService svc, BillingValidator v)
-//     L45-L62 ( 18 lines): @PostMapping("/bills") @RequiresPermission(Perms.BILL_CREATE) @ResponseStatus(HttpStatus.CREATED) Bill createBill(@Valid @RequestBody BillDTO dto)
+//     L60-L62 (  3 lines): @PostMapping("/bills") @RequiresPermission(Perms.BILL_CREATE) @ResponseStatus(HttpStatus.CREATED) Bill createBill(@Valid @RequestBody BillDTO dto)
 //                → auditLogger.log, billingService.create, notifyStakeholders, validator.validate
 //     L64-L80 ( 17 lines): @GetMapping("/bills/{id}") Bill getBill(@PathVariable Long id)
 //                → billingService.findById
 //
 // inner types:
-//   L90: public static enum Status
+//   L90: public enum Status { DRAFT, PAID }
+//   L95: record Claim implements Comparable<Claim>
+//     fields: int count, @NotNull Integer last
+//   L99: @Configuration static class S3Config
+//     methods:
+//              L101-L105 (  5 lines): @Bean S3Client client(BillingProperties props)
 //
 // other classes in file:
-//   L100: class BillingHelper [2F, 3M]     <- 2F = 2 instance fields, 3M = 3 methods
+//   L120: class BillingHelper [2F, 3M]     <- 2F = 2 instance fields, 3M = 3 methods
 //
-// total: 120 lines
+// total: 130 lines
 ```
 
 For Java simple source files:
 ```
 // SomeScript.java
-// (default) | 0 imports
+// (default)
 // implicit class SomeScript
 //
 // methods:
@@ -175,15 +183,17 @@ For enums:
 For `package-info.java`:
 ```
 // src/main/java/com/example/evidence/package-info.java
-// com.example.evidence | 1 imports
+// com.example.evidence
 // @ApplicationModule(displayName = "Evidence")
 //
 // total: 65 lines
 ```
 
-- `L45-L62` = line range in the file (use with `Read` offset/limit)
-- `( 18 lines)` = method body length
-- `fields:` = instance fields only. `static fields:` lists constants by name so they do not bury the injected dependencies. A record's components appear under `fields:`.
+- `L60-L62` = line range from the signature line to the closing brace (use with `Read` offset/limit). Annotations above the signature are not counted, so `( 3 lines)` is the real size of the method even when 40 lines of `@ApiResponse` sit above it. `jskim File.java method` prints the annotations and Javadoc too.
+- `doc:` = first sentence of the type's Javadoc, when there is one. This is where the design intent lives; read it before the methods.
+- `fields:` = instance fields only, with their non-documentation annotations (`@NotNull @Size` on a record component are validation rules). `static fields:` lists constants by name, with the value inline for short non-private string constants (`EVENT_READ = "audit.event.read"`) so permission keys and paths other classes reference are readable without opening the file; private constants stay names only. A record's components appear under `fields:`.
+- `constructor:` = constructors that only store their parameters into fields (dependency-injection wiring). Their parameter list is the `fields:` list, so the signature is not repeated. A constructor that does anything else stays under `methods:`.
+- `inner types:` show their own members indented: record components as a one-line `fields:`, enum constants inline, methods in the usual format. A nested `@Configuration` with `@Bean` methods, a nested `record Claim(...)` and a nested `enum Mode` are all readable without opening the file.
 - Annotations keep their arguments for everything that changes behaviour: `@RequiresPermission(Perms.X)`, `@ResponseStatus(HttpStatus.CREATED)`, `@Transactional(readOnly = true)`, `@Scheduled(cron = "...")`. Long argument lists are truncated with `...)`. Repeated annotations are shown once.
 - Mapping annotations show only the path, resolved from same-class constants: `@PostMapping(path = ONE_TRIP + "/start", consumes = ...)` renders as `@PostMapping("/trips/{tripId}/start")`. `@RequestMapping(method = GET, ...)` renders as `@RequestMapping(GET "/path")`. A constant defined in another class stays as its source text, e.g. `@RequestMapping(ApiPaths.BASE)`; `--endpoints` resolves those across the project.
 - Documentation-only annotations are dropped everywhere: OpenAPI/Swagger (`@Operation`, `@ApiResponse`, `@Parameter`, `@Schema`, `@Tag`), `@SuppressWarnings`, `@Generated`.
@@ -199,32 +209,32 @@ The `→` line lists only calls you can follow from the summary:
 
 - **Same-class calls (no dot):** `notifyStakeholders` → a method in this class. Use `jskim File.java notifyStakeholders` to read it.
 - **Field calls (`field.method`):** `billingService.create` → look up `billingService` in `fields:` to get the type (`BillingService`), then skim that class.
-- **Static calls (`Class.method`):** `AuditEvent.now`, `Ids.newId` → a static method on that class.
+- **Static calls (`Class.method`):** `AuditEvent.now`, `Ids.newId` → a static method on a project class (same package, or imported from the project's root package).
 - **`super.method`** → the parent class.
 
-Calls on local variables and parameters (`dto.getName()`, `row.status()`) are **not shown**: their type is not visible in the summary, so they cannot be followed. Boilerplate is also filtered: collection ops (`put`, `get`, `add`, `stream`, `collect`), utility checks (`Objects.equals`, `StringUtils.isBlank`), logging (`log.info`), type conversions (`toString`, `valueOf`), and chained/fluent calls. Calls are capped at 10 per method; overflow shown as `... +N more`. Abstract methods and methods with no traceable calls have no `→` line.
+Not shown, because they cannot be followed from the summary: calls on local variables and parameters (`dto.getName()`, `row.status()`), calls on JDK/Spring/library classes (`Collectors.groupingBy`, `OffsetDateTime.now`, `DSL.noCondition`, `SecurityContextHolder.getContext`), calls on or to static-imported members (`TRIP.fields()`, `assertThat(...)`), calls on static fields and ALL_CAPS constants (`RANDOM.nextInt`, `ID.eq`), collection ops (`put`, `get`, `stream`, `collect`), logging (`log.info`), type conversions (`toString`, `valueOf`), and chained/fluent calls. Calls are capped at 10 per method; overflow shown as `... +N more`. Abstract methods and methods with no traceable calls have no `→` line.
 
 ### Project map output format
 
 ```
-// Project Map: 42 files, 8500 lines
+// Project Map: 42 files, 8500 lines | packages under com.example
 //
-// com.example.billing (5 files, 600 lines) @ApplicationModule(displayName = "Billing")
+// billing (8 files, 900 lines) @ApplicationModule(displayName = "Billing")
 //   class BillingService @Service [3F | 8M | 120L | lombok:Data]
 //   class BillingRepository @Repository [5M | 45L]
 //   class BillDTO @Data [7F | 30L | lombok:Data,Builder]
 //   enum BillStatus { DRAFT, PENDING, APPROVED, REJECTED } [15L]
 //   interface BillingPort [3M | 20L]
+//   records: BillView, CreateBillRequest, SettleBillRequest
 ```
 
 With `--endpoints`:
 ```
 // === REST Endpoints ===
-//   GET     /api/v1/billing         BillingController.list()      L45
-//   POST    /api/v1/billing         BillingController.create()    L62
-//   GET     /api/v1/billing/{id}    BillingController.get()       L70
-//   PUT     /api/v1/billing/{id}    BillingController.update()    L80
-//   DELETE  /api/v1/billing/{id}    BillingController.delete()    L90
+//   GET     /api/v1/billing         BillingController.list()    L45  @RequiresPermission("billing.read")
+//   POST    /api/v1/billing         BillingController.create()  L62  @ResponseStatus(HttpStatus.CREATED) @RequiresPermission("billing.create")
+//   GET     /api/v1/billing/{id}    BillingController.get()     L70  @RequiresPermission("billing.read")
+//   DELETE  /api/v1/billing/{id}    BillingController.delete()  L90  @PreAuthorize("hasRole('ADMIN')")
 ```
 
 With `--beans`:
@@ -242,8 +252,11 @@ With `--beans`:
 
 With `--deps`:
 ```
-// === Dependencies ===
-//   BillingService → BillingRepository, BillDTO, BillingPort
+// === Package Dependencies ===
+//   billing.internal →
+//     audit: AuditApi, AuditEvent
+//     billing: BillingPort, BillingPermissions
+//     shared.problem: Problem
 ```
 
 With `--callers BillingService.create --depth 2`:
@@ -269,14 +282,16 @@ With `--impact BillingService.create`:
 //   → BillingService.validate(BillDTO)  src/.../BillingService.java:L80
 ```
 
+- Package names are shown relative to the common root package named in the header (`billing.internal` under `com.example`); the root package itself keeps its full name
 - Package header carries the annotations from that package's `package-info.java` (Spring Modulith module boundaries)
+- `records:` = the package's records by name (DTOs, requests, views, rows). Skim the file when you need the components; the controller/service signatures already name the ones that matter
 - `NF` = N instance fields (statics excluded), `NM` = N methods, `NL` = N lines in file
 - `lombok:Data,Builder` = Lombok annotations present on the class
 - `inner:Foo,Bar` = inner classes/enums inside this class
 - Enum constants shown inline: `enum Status { ACTIVE, INACTIVE }`
-- Dependencies (`--deps`) = import-based class references; when simple class names are ambiguous, fully-qualified names are shown
-- Endpoints (`--endpoints`) = all `@GetMapping`/`@PostMapping`/etc. with full paths, constants resolved project-wide; an unresolvable expression stays visible as source text (`/api/Unknown.PATH`)
-- Beans (`--beans`) = DI wiring, `@Bean` factory method producers, and `@ConfigurationProperties`
+- Dependencies (`--deps`) = which packages import, extend or implement types from which other packages, and which types cross the boundary. Same-package references are omitted. Use it to check Modulith boundaries: an `internal` package appearing as a target of another module is a violation
+- Endpoints (`--endpoints`) = all `@GetMapping`/`@PostMapping`/etc. with full paths, constants resolved project-wide; an unresolvable expression stays visible as source text (`/api/Unknown.PATH`). The trailing annotations are the route's guards and status: read the security model of the whole API from this one table
+- Beans (`--beans`) = DI wiring, `@Bean` factory method producers (nested `@Configuration` classes included), and `@ConfigurationProperties`
 - Callers/impact (`--callers`, `--impact`) = resolved method call edges only; classes show as simple names, fully qualified only when the simple name is ambiguous in the project; the file path is always shown
 
 ### Method extraction output format
@@ -305,7 +320,7 @@ With `--impact BillingService.create`:
 //   L64-L80: public void processBill(Long id)
 ```
 
-- Shows full method source with line numbers, including the annotations and Javadoc directly above it
+- Shows full method source with line numbers, including the Javadoc and behaviour annotations directly above it; documentation-only annotations (`@Operation`, `@ApiResponse`, `@Schema`, `@SuppressWarnings`) are skipped, which is why line numbers can jump
 - `fields:` lists instance fields for context (constants omitted)
 - `called methods in same class` shows other methods referenced in the extracted method bodies
 - `// not found: methodX` appears if a requested method name wasn't found
@@ -379,6 +394,8 @@ Fallback for unresolved/ambiguous cases (calls through local variables, paramete
 | See Spring bean DI wiring + producers | `jskim src/ --beans` |
 | Find all classes extending BaseService | `jskim src/ --extends BaseService` |
 | Find all implementations of an interface | `jskim src/ --implements EventPublisher` |
+| Check module boundaries (what imports what across packages) | `jskim src/ --deps` |
+| See which permission guards each route | `jskim src/ --endpoints` |
 | Understand a class structure | `jskim File.java` |
 | Trace call flow downstream | Skim the class → follow `→` field calls → skim the dependency class |
 | Find callers (upstream) | `jskim src/ --callers Class.method` |
@@ -420,7 +437,7 @@ Fallback for unresolved/ambiguous cases (calls through local variables, paramete
 - Run `jskim` before reading a Java file directly when you don't already know where to look (no line numbers from search, no prior context). Skip jskim if you already have the line range you need.
 - Use the line ranges from skim output to read only the relevant slice of the file — never read the whole file when you only need one method
 - When exploring a new Java project, start with `jskim <src_dir>` to understand the structure
-- For large projects (500+ files), use `--package` to scope project map output
+- For large projects (500+ files), use `--package` to scope project map output (substring match: `--package logistics.internal`)
 - For caller/impact checks, use class-qualified targets and keep `--depth` at 1 until you know you need more context
 - For large classes (300+ lines, many methods), use `--grep` or `--annotation` to filter output
 - For editing: read the exact lines you need first, then edit normally — skim is for understanding, not for editing

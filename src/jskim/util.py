@@ -5,6 +5,7 @@ This module owns the parser and every AST traversal. Feature modules
 ``parse_java_source`` and only format them.
 """
 
+import re
 from pathlib import Path
 
 import tree_sitter_java as tsjava
@@ -58,6 +59,13 @@ TYPE_KEYWORDS = {
 }
 
 BOILERPLATE_METHOD_NAMES = {"toString", "hashCode", "equals", "compareTo", "clone"}
+
+# Calls allowed on the right-hand side of a wiring constructor assignment
+# (``this.x = Objects.requireNonNull(x)``, ``this.items = List.copyOf(items)``).
+WIRING_CALL_METHODS = {"requireNonNull", "requireNonNullElse", "copyOf"}
+
+# Directory names skipped when scanning a source tree (build output, VCS).
+SKIP_DIRS = {"target", "build", "out", ".git", ".gradle", ".idea", "node_modules"}
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +133,21 @@ ANNOTATION_ARGS_MAX = 80
 # Method call noise constants
 # ---------------------------------------------------------------------------
 
-# Object names whose calls are always noise (logging, utilities, primitives).
+# Object names whose calls are always noise: loggers, java.lang classes (never
+# imported, so the import-based scope cannot classify them) and the JDK
+# classes most often reached through wildcard imports (``java.util.*``).
 NOISE_CALL_OBJECTS = {
     "log", "logger", "LOG", "LOGGER",
     "Objects", "StringUtils", "CollectionUtils", "MapUtils", "ArrayUtils",
-    "Optional", "Collections", "Arrays", "Math",
+    "Optional", "Collections", "Arrays", "Math", "System", "Thread",
     "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte", "Short",
-    "Character", "BigDecimal", "BigInteger",
+    "Character", "BigDecimal", "BigInteger", "StringBuilder", "Class", "Enum",
+    "Runtime", "Record", "Void", "Number", "ScopedValue", "StackWalker",
+    "Comparator", "Collectors", "Stream", "IntStream", "List", "Map", "Set",
+    "UUID", "EnumSet", "Instant", "Duration", "LocalDate", "LocalDateTime",
+    "LocalTime", "OffsetDateTime", "ZonedDateTime", "ZoneId", "ChronoUnit",
+    "Files", "Paths", "Path", "Pattern", "Base64", "URI", "URL",
+    "Executors", "CompletableFuture", "TimeUnit",
 }
 
 # Method names that are noise when called on any object (collection ops,
@@ -234,13 +250,39 @@ def _annotation_argument_list(ann_node):
     return None
 
 
-def _format_annotation(ann_node, constants=None):
+def _resolved_annotation_values(args, constants):
+    """Resolve a positional annotation argument list to string values, or None.
+
+    Handles ``@Ann(CONST)``, ``@Ann(Other.CONST)`` and ``@Ann({A, B})`` when
+    every element is a compile-time string; anything else returns None so
+    the caller falls back to the source text.
+    """
+    if not constants:
+        return None
+    values = []
+    for child in args.named_children:
+        if child.type == "element_value_pair":
+            return None
+        elements = child.named_children if child.type == "element_value_array_initializer" else [child]
+        for element in elements:
+            if element.type == "string_literal":
+                return None  # already readable as source text
+            value = resolve_string_expression(element, constants)
+            if value is None:
+                return None
+            values.append(value)
+    return values or None
+
+
+def format_annotation(ann_node, constants=None):
     """Render one annotation for a summary, or None if it is noise.
 
     Returns a dict ``{"name", "params", "full", "node"}``. HTTP mapping
     annotations show only their (resolved) path and, for @RequestMapping,
-    the HTTP method. Every other annotation shows its whitespace-normalized
-    arguments, truncated to ANNOTATION_ARGS_MAX characters.
+    the HTTP method. Every other annotation shows its arguments: constant
+    references that resolve through ``constants`` render as their string
+    value (``@RequiresPermission("trip.create")``); otherwise the source
+    text is whitespace-normalized and truncated to ANNOTATION_ARGS_MAX.
     """
     name = get_annotation_name_from_node(ann_node)
     if not name or name in NOISE_ANNOTATIONS:
@@ -261,7 +303,11 @@ def _format_annotation(ann_node, constants=None):
     else:
         args = _annotation_argument_list(ann_node)
         if args is not None:
-            text = _normalize_ws(args.text.decode()).replace("( ", "(").replace(" )", ")")
+            resolved = _resolved_annotation_values(args, constants)
+            if resolved is not None:
+                text = "(" + ", ".join(f'"{v}"' for v in resolved) + ")"
+            else:
+                text = _normalize_ws(args.text.decode()).replace("( ", "(").replace(" )", ")")
             if len(text) > ANNOTATION_ARGS_MAX:
                 text = text[: ANNOTATION_ARGS_MAX - 4] + "...)"
             params = text
@@ -284,7 +330,7 @@ def get_annotations_rich(parent_node, constants=None):
     result = []
     seen = set()
     for child in _iter_annotation_nodes(parent_node):
-        rendered = _format_annotation(child, constants)
+        rendered = format_annotation(child, constants)
         if rendered is None or rendered["full"] in seen:
             continue
         seen.add(rendered["full"])
@@ -659,12 +705,13 @@ def is_field_static(field_node):
 def parse_field(field_node):
     """Parse a field_declaration into one dict per declared variable.
 
-    Each dict: ``{"type", "name", "annotations", "static", "final", "line"}``
+    Each dict: ``{"type", "name", "annotations", "static", "final", "private", "line"}``
     where ``annotations`` is a list of ``@Name`` strings.
     """
     anns = get_annotations(get_modifiers_node(field_node))
     static = is_field_static(field_node)
     final = is_field_final(field_node)
+    private = _has_modifier(field_node, "private")
     line = field_node.start_point[0] + 1
     return [
         {
@@ -673,6 +720,7 @@ def parse_field(field_node):
             "annotations": anns,
             "static": static,
             "final": final,
+            "private": private,
             "line": line,
         }
         for ftype, fname in extract_field_info(field_node)
@@ -680,21 +728,18 @@ def parse_field(field_node):
 
 
 def extract_record_components(decl_node):
-    """Extract record component types and names from a record declaration.
+    """Extract the components of a record declaration.
 
-    Returns a list of (type_str, name_str) tuples, one per component.
-    E.g., 'record Point(int x, int y)' -> [('int', 'x'), ('int', 'y')]
-    Returns an empty list for non-record declarations or if no parameters found.
+    Returns one ``{"type", "name", "annotations"}`` dict per component (the
+    ``parse_parameters`` shape), e.g. ``record Point(int x, @NotNull int y)``
+    -> ``[{"type": "int", "name": "x", "annotations": []}, {..., "annotations": ["@NotNull"]}]``.
+    Returns an empty list for non-record declarations.
     """
     if decl_node.type != "record_declaration":
         return []
     for child in decl_node.children:
         if child.type == "formal_parameters":
-            return [
-                (param["type"], param["name"])
-                for param in parse_parameters(child)
-                if param["type"] and param["name"]
-            ]
+            return [p for p in parse_parameters(child) if p["type"] and p["name"]]
     return []
 
 
@@ -823,32 +868,106 @@ def _method_kind(node):
     return "method"
 
 
-def parse_method(node, field_names=None, constants=None):
+def signature_line(node):
+    """Line of a declaration's signature (return type or name), not its annotations."""
+    for field in ("type", "name"):
+        child = node.child_by_field_name(field)
+        if child is not None:
+            return child.start_point[0] + 1
+    return node.start_point[0] + 1
+
+
+def _noise_annotation_spans(modifiers_node):
+    """Source spans of NOISE_ANNOTATIONS on a declaration, for extraction to skip.
+
+    Each span is ``{"start", "end", "start_col", "end_col"}`` with 1-based
+    lines and 0-based columns.
+    """
+    spans = []
+    for ann in _iter_annotation_nodes(modifiers_node):
+        if get_annotation_name_from_node(ann) in NOISE_ANNOTATIONS:
+            spans.append({
+                "start": ann.start_point[0] + 1, "start_col": ann.start_point[1],
+                "end": ann.end_point[0] + 1, "end_col": ann.end_point[1],
+            })
+    return spans
+
+
+def _is_wiring_constructor(node):
+    """True when a constructor body only stores its parameters into fields.
+
+    Allowed statements: ``this.x = x``, ``x = x``, ``this.x = Objects.requireNonNull(x)``
+    (see WIRING_CALL_METHODS), ``super(...)``/``this(...)`` and comments. An
+    empty body also counts (utility-class private constructors).
+    """
+    if node.type not in CONSTRUCTOR_NODES:
+        return False
+    body = node.child_by_field_name("body")
+    if body is None:
+        return False
+    for stmt in body.named_children:
+        if stmt.type in ("explicit_constructor_invocation", "line_comment", "block_comment"):
+            continue
+        if stmt.type != "expression_statement" or not stmt.named_children:
+            return False
+        expr = stmt.named_children[0]
+        if expr.type != "assignment_expression":
+            return False
+        left = expr.child_by_field_name("left")
+        right = expr.child_by_field_name("right")
+        if left is None or right is None:
+            return False
+        if left.type == "field_access":
+            obj = left.child_by_field_name("object")
+            if obj is None or obj.type != "this":
+                return False
+        elif left.type != "identifier":
+            return False
+        if right.type == "method_invocation":
+            name = right.child_by_field_name("name")
+            if name is None or name.text.decode() not in WIRING_CALL_METHODS:
+                return False
+        elif right.type != "identifier":
+            return False
+    return True
+
+
+def parse_method(node, call_scope=None, constants=None):
     """Parse a method-like node into a plain dict.
 
     Keys: ``name``, ``kind`` (method/constructor/annotation_element),
-    ``identity``, ``sig``, ``start``, ``end``, ``annotations`` (rich dicts),
-    ``return_type``, ``params`` (parsed parameter dicts), ``calls``.
+    ``identity``, ``sig``, ``start`` (signature line), ``decl_start`` (first
+    annotation line), ``end``, ``annotations`` (rich dicts), ``noise_spans``
+    (documentation annotations to skip when printing source), ``wiring``
+    (constructor that only assigns fields), ``return_type``, ``params``
+    (parsed parameter dicts), ``calls``.
     """
-    params = parse_parameters(_get_formal_parameters(node))
+    mods = get_modifiers_node(node)
     return {
         "name": get_method_name(node),
         "kind": _method_kind(node),
         "identity": build_method_identity(node),
         "sig": build_method_signature(node),
-        "start": node.start_point[0] + 1,
+        "start": signature_line(node),
+        "decl_start": node.start_point[0] + 1,
         "end": node.end_point[0] + 1,
-        "annotations": get_annotations_rich(get_modifiers_node(node), constants),
+        "annotations": get_annotations_rich(mods, constants),
+        "noise_spans": _noise_annotation_spans(mods),
+        "wiring": _is_wiring_constructor(node),
         "return_type": _get_return_type(node),
-        "params": params,
-        "calls": extract_method_calls(node, field_names),
+        "params": parse_parameters(_get_formal_parameters(node)),
+        "calls": extract_method_calls(node, call_scope),
     }
 
 
 def classify_method(method):
-    """Classify a parsed method dict as getter/setter/boilerplate/constructor/business."""
+    """Classify a parsed method dict.
+
+    Returns ``wiring`` (constructor that only stores its parameters),
+    ``constructor``, ``getter``, ``setter``, ``boilerplate`` or ``business``.
+    """
     if method["kind"] == "constructor":
-        return "constructor"
+        return "wiring" if method.get("wiring") else "constructor"
     name = method["name"]
     if name in BOILERPLATE_METHOD_NAMES:
         return "boilerplate"
@@ -887,14 +1006,52 @@ def _is_noise_call(call_str):
     return obj in NOISE_CALL_OBJECTS or method in NOISE_CALL_METHODS
 
 
-def _is_traceable_owner(owner, field_names):
-    """Return True if a call owner can be followed: a field, a class, or super."""
-    if field_names is None:
+_CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]+")
+
+
+def build_call_scope(package, imports, static_members, field_names=()):
+    """Build the scope that decides which method calls are followable.
+
+    ``foreign`` holds simple names imported from outside the project root
+    (the first two segments of ``package``): JDK, Spring, libraries.
+    ``static_members`` holds names brought in by ``import static``; calls on
+    them (``TRIP.fields()``) or to them (``assertThat(...)``) lead outside
+    the class. ``fields`` are the class's own instance field names; static
+    fields are not followable because the summary lists them by name only.
+    """
+    root = ".".join(package.split(".")[:2]) if package else None
+    foreign = set()
+    for path in imports:
+        if path.endswith(".*"):
+            continue
+        simple = path.rsplit(".", 1)[-1]
+        if simple in static_members:
+            continue
+        if root is None or not path.startswith(root + "."):
+            foreign.add(simple)
+    return {
+        "foreign": foreign,
+        "static_members": set(static_members),
+        "fields": set(field_names),
+    }
+
+
+def _is_traceable_call(call, scope):
+    """Return True if a call can be followed from a summary within ``scope``."""
+    if scope is None:
         return True
-    return owner == "super" or owner in field_names or (owner[:1].isupper())
+    if "." not in call:
+        return call not in scope["static_members"]
+    owner = call.rsplit(".", 1)[0]
+    if owner == "super" or owner in scope["fields"]:
+        return True
+    if owner in scope["static_members"] or owner in scope["foreign"]:
+        return False
+    # CamelCase owners are classes (static calls); ALL_CAPS owners are constants.
+    return owner[:1].isupper() and not _CONSTANT_NAME_RE.fullmatch(owner)
 
 
-def extract_method_calls(method_node, field_names=None):
+def extract_method_calls(method_node, call_scope=None):
     """Extract method calls from a method/constructor body.
 
     Returns a deduplicated sorted list of call strings like:
@@ -902,11 +1059,12 @@ def extract_method_calls(method_node, field_names=None):
 
     Keeps unqualified calls (same class), calls on ``super``, calls on a
     simple object identifier and ``this.field.method()`` (as
-    ``field.method``). Chained/fluent calls are skipped. When
-    ``field_names`` is given, qualified calls are kept only when the owner
-    is a field of the class or starts with an uppercase letter (a class,
-    for static calls); calls on locals and parameters are dropped because
-    their type cannot be followed from the summary.
+    ``field.method``). Chained/fluent calls are skipped. With a
+    ``call_scope`` (see ``build_call_scope``), qualified calls are kept only
+    when the owner is a field or a project class (same package or imported
+    from the project root); calls on locals, parameters, static-imported
+    members and JDK/library classes are dropped because they cannot be
+    followed from the summary.
 
     Boilerplate noise is filtered via NOISE_CALL_OBJECTS / NOISE_CALL_METHODS.
     """
@@ -915,14 +1073,10 @@ def extract_method_calls(method_node, field_names=None):
         return []
     calls = set()
     _collect_method_calls(body, calls)
-    result = []
-    for call in sorted(calls):
-        if _is_noise_call(call):
-            continue
-        if "." in call and not _is_traceable_owner(call.rsplit(".", 1)[0], field_names):
-            continue
-        result.append(call)
-    return result
+    return [
+        call for call in sorted(calls)
+        if not _is_noise_call(call) and _is_traceable_call(call, call_scope)
+    ]
 
 
 def _collect_method_calls(node, calls):
@@ -954,23 +1108,31 @@ def _collect_method_calls(node, calls):
 # Structured parsing: file -> types -> members
 # ---------------------------------------------------------------------------
 
-def extract_import_path(import_node):
-    """Extract the import path string from an import_declaration node.
+def _parse_import(import_node):
+    """Return ``(path, is_static)`` for an import_declaration node.
 
-    Returns the path with 'static ' prefix stripped and wildcard expanded.
-    E.g., 'import static java.util.Collections.emptyList;' -> 'java.util.Collections.emptyList'
-          'import java.util.*;' -> 'java.util.*'
+    The path has the ``static`` keyword stripped and wildcards expanded:
+    ``import static java.util.Collections.emptyList;`` -> ``("java.util.Collections.emptyList", True)``,
+    ``import java.util.*;`` -> ``("java.util.*", False)``.
     """
     has_asterisk = False
+    is_static = False
     path = None
     for child in import_node.children:
         if child.type in ("scoped_identifier", "identifier"):
             path = child.text.decode()
-        if child.type == "asterisk":
+        elif child.type == "asterisk":
             has_asterisk = True
+        elif child.type == "static":
+            is_static = True
     if path and has_asterisk:
-        return path + ".*"
-    return path
+        path += ".*"
+    return path, is_static
+
+
+def extract_import_path(import_node):
+    """Extract the import path string from an import_declaration node."""
+    return _parse_import(import_node)[0]
 
 
 def parse_file_structure(source_bytes):
@@ -979,7 +1141,8 @@ def parse_file_structure(source_bytes):
     Returns a dict with:
       - "package": package name string or None
       - "package_annotations": rich annotation dicts on the package declaration
-      - "imports": list of import path strings
+      - "imports": list of import path strings (static imports included)
+      - "static_members": simple names brought in by non-wildcard static imports
       - "type_nodes": list of top-level type declaration AST nodes
       - "program_members": implicit-class members when the file has loose
         top-level declarations (methods, fields, nested types, etc.)
@@ -988,6 +1151,7 @@ def parse_file_structure(source_bytes):
     package = None
     package_annotations = []
     imports = []
+    static_members = set()
     type_nodes = []
     program_members = []
     non_structure_nodes = []
@@ -1000,9 +1164,11 @@ def parse_file_structure(source_bytes):
                     package = sub.text.decode()
                     break
         elif child.type == "import_declaration":
-            path = extract_import_path(child)
+            path, is_static = _parse_import(child)
             if path:
                 imports.append(path)
+                if is_static and not path.endswith(".*"):
+                    static_members.add(path.rsplit(".", 1)[-1])
         elif child.type not in PROGRAM_STRUCTURE_NODES:
             non_structure_nodes.append(child)
 
@@ -1018,43 +1184,76 @@ def parse_file_structure(source_bytes):
         "package": package,
         "package_annotations": package_annotations,
         "imports": imports,
+        "static_members": static_members,
         "type_nodes": type_nodes,
         "program_members": program_members,
     }
 
 
-def parse_type_members(members, extra_field_names=(), constants=None):
+_INLINE_TAG_RE = re.compile(r"\{@\w+\s*#?([^}]*)\}")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
+
+
+def get_javadoc_summary(node):
+    """First sentence of the Javadoc directly above a declaration, or None.
+
+    Inline tags are unwrapped (``{@code x}`` -> ``x``), HTML tags dropped,
+    block tags (``@param`` ...) ignored, and the result is capped at
+    DOC_SUMMARY_MAX characters.
+    """
+    prev = node.prev_named_sibling
+    if prev is None or prev.type != "block_comment":
+        return None
+    text = prev.text.decode()
+    if not text.startswith("/**"):
+        return None
+    lines = []
+    for raw in text[3:].removesuffix("*/").splitlines():
+        line = raw.strip().lstrip("*").strip()
+        if line.startswith("@"):
+            break
+        lines.append(line)
+    text = _INLINE_TAG_RE.sub(r"\1", " ".join(lines))
+    text = _normalize_ws(_HTML_TAG_RE.sub(" ", text))
+    if not text:
+        return None
+    sentence = _SENTENCE_END_RE.split(text, 1)[0]
+    if len(sentence) > DOC_SUMMARY_MAX:
+        sentence = sentence[: DOC_SUMMARY_MAX - 3].rstrip() + "..."
+    return sentence
+
+
+def parse_type_members(members, call_scope=None, constants=None, component_names=()):
     """Parse fields, methods, nested types and static initializers from members.
 
     Returns ``{"fields", "methods", "inner_types", "static_initializers"}``.
-    ``extra_field_names`` (record components) are treated as fields when
-    filtering method calls.
+    Methods see ``call_scope`` (the file scope from ``build_call_scope``)
+    plus the type's own instance fields and ``component_names`` (record
+    components); nested types get the bare file scope again, so an outer
+    field never masks a nested type's parameter. Nested types are full
+    ``parse_type`` dicts.
     """
     fields = []
     for member in members:
         if member.type == "field_declaration":
             fields.extend(parse_field(member))
-    field_names = set(extra_field_names) | {f["name"] for f in fields}
+    scope = dict(call_scope or build_call_scope(None, (), ()))
+    scope["fields"] = scope["fields"] | set(component_names) | {f["name"] for f in fields if not f["static"]}
 
     methods = []
     inner_types = []
     static_initializers = []
     for member in members:
         if member.type in METHOD_NODES:
-            methods.append(parse_method(member, field_names, constants))
+            methods.append(parse_method(member, scope, constants))
         elif member.type == "static_initializer":
             static_initializers.append({
                 "start": member.start_point[0] + 1,
                 "end": member.end_point[0] + 1,
             })
         elif member.type in INNER_TYPE_NODES:
-            inner_types.append({
-                "line": member.start_point[0] + 1,
-                "kind": get_type_keyword(member),
-                "name": get_declaration_name(member),
-                "declaration": build_class_declaration_text(member),
-                "annotations": get_annotations_rich(get_modifiers_node(member), constants),
-            })
+            inner_types.append(parse_type(member, call_scope))
 
     return {
         "fields": fields,
@@ -1071,6 +1270,7 @@ def _empty_type(kind, name, declaration, line):
         "name": name,
         "declaration": declaration,
         "line": line,
+        "doc": None,
         "annotations": [],
         "annotation_names": [],
         "modifiers": [],
@@ -1086,13 +1286,15 @@ def _empty_type(kind, name, declaration, line):
     }
 
 
-def parse_type(decl_node):
+def parse_type(decl_node, call_scope=None):
     """Parse a top-level or nested type declaration into a plain dict.
 
     Record components appear first in ``fields`` with ``"component": True``.
     ``annotations`` are rich dicts (noise dropped); ``annotation_names`` is
     the unfiltered list of ``@Name`` strings for detection logic.
     ``constants`` maps ``static final String`` names to resolved values.
+    ``doc`` is the first sentence of the type's Javadoc. ``inner_types``
+    are full ``parse_type`` dicts. ``line`` is the line of the type name.
     """
     mods = get_modifiers_node(decl_node)
     body = get_class_body(decl_node)
@@ -1103,8 +1305,9 @@ def parse_type(decl_node):
         get_type_keyword(decl_node),
         get_declaration_name(decl_node),
         build_class_declaration_text(decl_node),
-        decl_node.start_point[0] + 1,
+        signature_line(decl_node),
     )
+    info["doc"] = get_javadoc_summary(decl_node)
     info["annotations"] = get_annotations_rich(mods, constants)
     info["annotation_names"] = get_annotations(mods)
     info["modifiers"] = _get_modifier_keywords(mods) if mods else []
@@ -1116,13 +1319,13 @@ def parse_type(decl_node):
 
     record_fields = [
         {
-            "type": ftype, "name": fname, "annotations": [],
-            "static": False, "final": True, "component": True,
-            "line": decl_node.start_point[0] + 1,
+            "type": c["type"], "name": c["name"], "annotations": c["annotations"],
+            "static": False, "final": True, "private": False, "component": True,
+            "line": info["line"],
         }
-        for ftype, fname in extract_record_components(decl_node)
+        for c in extract_record_components(decl_node)
     ]
-    parsed = parse_type_members(members, (f["name"] for f in record_fields), constants)
+    parsed = parse_type_members(members, call_scope, constants, [f["name"] for f in record_fields])
     info["fields"] = record_fields + parsed["fields"]
     info["methods"] = parsed["methods"]
     info["inner_types"] = parsed["inner_types"]
@@ -1133,7 +1336,7 @@ def parse_type(decl_node):
     return info
 
 
-def parse_implicit_type(program_members, source_name=None):
+def parse_implicit_type(program_members, source_name=None, call_scope=None):
     """Parse the synthetic implicit class of a Java simple source file."""
     stem = Path(str(source_name)).stem if source_name else None
     constants = extract_string_constants(program_members)
@@ -1144,7 +1347,7 @@ def parse_implicit_type(program_members, source_name=None):
         1,
     )
     info["constants"] = constants
-    parsed = parse_type_members(program_members, (), constants)
+    parsed = parse_type_members(program_members, call_scope, constants)
     info.update(parsed)
     return info
 
@@ -1163,11 +1366,12 @@ def parse_java_source(content, source_name=None):
         source_bytes = content.encode("utf-8")
         text = content
     structure = parse_file_structure(source_bytes)
+    scope = build_call_scope(structure["package"], structure["imports"], structure["static_members"])
 
     if structure["program_members"]:
-        types = [parse_implicit_type(structure["program_members"], source_name)]
+        types = [parse_implicit_type(structure["program_members"], source_name, scope)]
     else:
-        types = [parse_type(node) for node in structure["type_nodes"]]
+        types = [parse_type(node, scope) for node in structure["type_nodes"]]
 
     return {
         "package": structure["package"],
@@ -1178,6 +1382,17 @@ def parse_java_source(content, source_name=None):
     }
 
 
+def walk_types(types, prefix=""):
+    """Yield ``(label, type)`` for every type and nested type, depth first.
+
+    Labels are dotted: ``Outer``, ``Outer.Inner``, ``Outer.Inner.Deeper``.
+    """
+    for t in types:
+        label = f"{prefix}{t['name']}"
+        yield label, t
+        yield from walk_types(t["inner_types"], f"{label}.")
+
+
 def instance_fields(type_info):
     """Return the non-static fields of a parsed type."""
     return [f for f in type_info["fields"] if not f["static"]]
@@ -1186,6 +1401,18 @@ def instance_fields(type_info):
 def static_fields(type_info):
     """Return the static fields of a parsed type."""
     return [f for f in type_info["fields"] if f["static"]]
+
+
+def format_static_field(field, constants):
+    """Render a static field as ``NAME``, or ``NAME = "value"`` for short non-private string constants.
+
+    Non-private constants are contract (permission keys, paths, event names
+    other classes reference); private ones are implementation detail.
+    """
+    value = constants.get(field["name"])
+    if value is not None and not field["private"] and len(value) <= STATIC_VALUE_MAX:
+        return f'{field["name"]} = "{value}"'
+    return field["name"]
 
 
 def format_method_annotations(method):
@@ -1202,6 +1429,14 @@ CALLS_DISPLAY_MAX = 10
 # Enum constants shown inline in a file summary / project map row.
 ENUM_CONSTANTS_SKIM_MAX = 10
 ENUM_CONSTANTS_MAP_MAX = 6
+# Non-private static string constants at most this long show their value inline.
+STATIC_VALUE_MAX = 40
+# Javadoc first sentence cap.
+DOC_SUMMARY_MAX = 160
+# Type kinds collapsed to a names-only line per package in the project map.
+MAP_COLLAPSED_KINDS = ("record",)
+# Wrap width for those names-only lines.
+MAP_LINE_WIDTH = 140
 
 
 def format_calls(calls):

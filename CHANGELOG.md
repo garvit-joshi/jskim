@@ -2,6 +2,32 @@
 
 All notable changes to jskim are documented here.
 
+## [0.4.0] - 2026-09-12
+
+Output format changed again; no backward compatibility is kept. Every change comes from an audit of the tool against the same 470-file Spring Boot 4 / Java 25 backend, measured with the new `scripts/audit_real.py`.
+
+### Fixes
+- **`--callers`/`--impact` did not cross interfaces** — `--callers AuditEventService.write` found nothing while every caller went through the `AuditApi` interface. A call resolved to an interface or superclass method now also produces an edge to every project implementation
+- **Method line ranges started at the annotation block** — a 3-line handler under 40 lines of `@ApiResponse` was reported as `L93-L138 (46 lines)`. `start` is now the signature line; diff overlap still considers the annotations
+- **Method extraction printed the OpenAPI blocks** the summary had already dropped — documentation annotations are skipped in the printed source (52 lines became 15 on the reference handler)
+- **Nested types were opaque** — nested records, enums and `@Configuration` classes showed one declaration line. They are now full parse results: skim renders their members, `--beans` counts nested `@Bean` producers, diff compares nested methods and fields, method extraction finds nested methods
+- **Record component annotations were dropped** — `@NotNull @Size @Valid List<E> events` now shows its annotations
+- **`→` leaked unfollowable static calls** (18% of qualified entries on the reference backend: `Collectors.groupingBy`, `OffsetDateTime.now`, `DSL.noCondition`, `TRIP.fields`, `RANDOM.nextInt`). `Class.method` is kept only when `Class` is a project type (same package or imported from the project root); static-imported members, static fields and ALL_CAPS constants are dropped
+
+### Output
+- `constructor: L160-L190 (14 params)` replaces the full signature of constructors that only store their parameters (119 of them on the reference backend, 9.3k characters that duplicated `fields:`)
+- `doc:` line with the first sentence of the type's Javadoc; the `| N imports` count and the `lombok:` explanation line are gone
+- `static fields:` shows the value of short non-private string constants: `EVENT_READ = "audit.event.read"`; private constants stay names only
+- Annotation arguments that are constants resolve to their string when the constant is visible: `@RequiresPermission("trip.create")`; `--endpoints` resolves them project-wide and appends the handler's remaining annotations as a guard column
+- Project map: package names relative to the common root package (`logistics.internal` under `com.saveasbiochar.ethos`); records collapsed to one `records:` line per package (525 lines became 376 on the reference backend)
+- `--deps` is package-to-package (`billing.internal → audit: AuditApi, AuditEvent`) instead of 180 per-class import lists
+- `--package` is a substring match; `target/`, `build/`, `out/` and VCS directories are skipped when scanning
+- Diff mode suppresses wiring-constructor changes (the new dependency appears under `[FIELDS]`)
+
+### Internals
+- `parse_method` carries `decl_start`, `noise_spans` and `wiring`; `inner_types` are `parse_type` dicts; `walk_types()` iterates nested types with dotted labels; `build_call_scope()` decides followability from the file's package and imports
+- `scripts/audit_real.py <src_dir>` prints parse errors, call-owner statistics, hidden nested members and map size for a real codebase
+
 ## [0.3.0] - 2026-09-12
 
 Output format changed throughout; no backward compatibility is kept. Every change was driven by running the tool against a 470-file Spring Boot 4 / Java 25 backend and reading the result as the consumer.

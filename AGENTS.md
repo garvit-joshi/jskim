@@ -1,0 +1,1 @@
+> **At session start, read `CLAUDE.md` in full — it is the canonical project guidance for this repository. Update `CLAUDE.md` whenever a change introduces a new pattern, module, architectural decision, or external integration.**
