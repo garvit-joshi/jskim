@@ -550,6 +550,18 @@ class TestCallHierarchyOutput:
         assert "→ BillingService.validate()" in output
         assert "→ BillingRepository.save()" in output
 
+    def test_callers_and_impact_follow_method_references(self, tmp_path):
+        (tmp_path / "Repo.java").write_text(
+            "package demo; public class Repo { public void save(String x) {} }", encoding="utf-8")
+        (tmp_path / "Service.java").write_text(
+            "package demo; import java.util.List; class Service { Repo repo; void process(List<String> items) { items.forEach(repo::save); items.forEach(this::log); } void log(String s) {} }", encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        callers = format_callers_output(types, "Repo.save")
+        assert "← Service.process" in callers
+        impact = format_impact_output(types, "Service.process")
+        assert "→ Repo.save(String)" in impact
+        assert "→ Service.log(String)" in impact
+
 
 # ---------------------------------------------------------------------------
 # Full project scan

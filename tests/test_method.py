@@ -219,6 +219,21 @@ class TestExtractMethods:
         # extractData calls mapRow, isValidCabId, isValidString
         assert "called methods" in output.lower()
 
+    def test_called_methods_via_method_reference_shown(self):
+        content = """
+        package com.example;
+        public class Worker {
+            public void process(List<String> items) {
+                items.forEach(this::handleItem);
+            }
+            private void handleItem(String item) {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "handleItem" in output
+
     def test_fields_shown(self):
         content = load_fixture("StaticFieldService.java")
         parsed = parse_methods(content)

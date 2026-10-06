@@ -36,6 +36,7 @@ from jskim.util import (
     extract_first_annotation_string,
     INNER_TYPE_NODES,
     METHOD_NODES,
+    CALL_NODES,
     LOMBOK_SET,
     MODIFIER_KEYWORDS,
     HTTP_MAPPING_ANNOTATIONS,
@@ -1067,6 +1068,9 @@ class TestConstants:
         }
         assert METHOD_NODES == expected
 
+    def test_call_nodes_complete(self):
+        assert CALL_NODES == {"method_invocation", "method_reference"}
+
     def test_lombok_set_has_common_annotations(self):
         assert "@Data" in LOMBOK_SET
         assert "@Value" in LOMBOK_SET
@@ -1618,6 +1622,34 @@ class TestCallScope:
         root = parse_java_bytes(b"class F { void m() { Helper.build(); x.run(); } }")
         method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
         assert extract_method_calls(method) == ["Helper.build", "x.run"]
+
+    def test_method_references_extracted(self):
+        t = _first_type("""
+        package com.acme.app;
+        import java.util.Objects;
+        import com.acme.app.service.BillingService;
+        class S {
+            Repo repo;
+            void process(List<Item> items) {
+                items.forEach(this::validate);
+                items.forEach(super::audit);
+                items.forEach(repo::save);
+                items.forEach(this.repo::flush);
+                items.forEach(BillingService::charge);
+                items.forEach(Objects::requireNonNull);
+                items.forEach(String::valueOf);
+            }
+            void validate(Item item) {}
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert calls == [
+            "BillingService.charge",
+            "repo.flush",
+            "repo.save",
+            "super.audit",
+            "validate",
+        ]
 
 
 # ---------------------------------------------------------------------------
