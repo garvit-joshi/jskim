@@ -278,6 +278,21 @@ class TestFormatOutput:
         output = skim(load_fixture("ScheduleServiceProxy.java"))
         assert "→" in output
 
+    def test_method_reference_tracing_in_output(self):
+        source = """
+        package com.example;
+        public class Processor {
+            private final Handler handler;
+            public void run(List<String> list) {
+                list.forEach(this::validate);
+                list.forEach(handler::process);
+            }
+            private void validate(String s) {}
+        }
+        """
+        output = skim(source)
+        assert "→ handler.process, validate" in output
+
     def test_many_enum_constants_truncated(self):
         output = skim(load_fixture("Role.java"))
         assert "...+" in output

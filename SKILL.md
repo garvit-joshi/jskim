@@ -76,7 +76,7 @@ jskim <src_dir> --implements <Interface>        # filter by implemented interfac
 **Call hierarchy rules:**
 - Always use a class-qualified target (`Class.method` or `com.example.Class.method`). Bare method names like `create` are intentionally rejected because they are too ambiguous in Java projects.
 - If simple class names collide, rerun with the fully-qualified class name shown in the candidates list.
-- Edges are resolved from same-class calls, static calls on project classes, and field calls where the field type is a project class, such as `billingService.create()`.
+- Edges are resolved from same-class calls, static calls on project classes, and field calls where the field type is a project class, such as `billingService.create()`. Method references (`this::validate`, `billingService::create`, `OrderMapper::toDto`) are resolved identically to invocations.
 - A call through an interface or superclass also counts as a call to every project implementation: `audit.write()` on an `AuditApi` field is a caller of both `AuditApi.write` and `AuditEventService.write`, so querying the concrete service works in Modulith codebases where every cross-module call goes through an `*Api` interface.
 - Calls on local variables, parameters, or overloaded targets are skipped when they cannot be resolved safely. Treat missing edges as "not proven" rather than "not called."
 

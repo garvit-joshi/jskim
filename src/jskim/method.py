@@ -142,7 +142,10 @@ def extract_methods(parsed, method_names):
     called = [
         om for om in parsed["methods"]
         if om["name"] not in matched_names
-        and re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies)
+        and (
+            re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies)
+            or re.search(rf"::\s*{re.escape(om['name'])}\b", method_bodies)
+        )
     ]
     if called:
         out.append("// --- called methods in same class ---")
