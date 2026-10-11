@@ -1016,7 +1016,7 @@ def _is_noise_call(call_str):
 _CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]+")
 
 
-def _strip_type_details(type_name):
+def strip_type_details(type_name):
     """Strip generics and array suffixes from a type reference."""
     if not type_name:
         return None
@@ -1024,6 +1024,9 @@ def _strip_type_details(type_name):
     while cleaned.endswith("[]"):
         cleaned = cleaned[:-2].strip()
     return cleaned
+
+
+_strip_type_details = strip_type_details
 
 
 def build_call_scope(package, imports, static_members, field_names=(), super_types=()):
@@ -1063,12 +1066,14 @@ def _is_traceable_call(call, scope):
     if "." not in call:
         return call not in scope["static_members"]
     owner = call.rsplit(".", 1)[0]
+    parts = owner.split(".")
+    root = parts[0]
+    if root in scope["foreign"] or owner in scope["foreign"]:
+        return False
+    if root in scope["static_members"] or owner in scope["static_members"]:
+        return False
     if owner == "super" or owner in scope["fields"] or owner in scope.get("super_types", ()):
         return True
-    if owner in scope["static_members"] or owner in scope["foreign"]:
-        return False
-    # CamelCase owners are classes (static calls); ALL_CAPS owners are constants.
-    parts = owner.split(".")
     if any(_CONSTANT_NAME_RE.fullmatch(p) for p in parts):
         return False
     return all(p[:1].isupper() for p in parts)
@@ -1411,7 +1416,7 @@ def parse_type(decl_node, call_scope=None):
     info["constants"] = constants
 
     super_types = {
-        _strip_type_details(t).rsplit(".", 1)[-1]
+        strip_type_details(t).rsplit(".", 1)[-1]
         for t in ([info["extends"]] + info["implements"])
         if t
     }

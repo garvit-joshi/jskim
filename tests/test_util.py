@@ -27,6 +27,7 @@ from jskim.util import (
     extract_method_calls,
     extract_raw_method_calls,
     resolve_target_class,
+    strip_type_details,
     build_call_scope,
     get_javadoc_summary,
     walk_types,
@@ -1751,6 +1752,19 @@ class TestCallScope:
         assert "Singleton.INSTANCE.run" not in calls
         assert "Outer.Inner.process" in calls
 
+    def test_call_scope_filters_nested_owners_rooted_in_foreign_types(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme.app", ["java.util.Map"], ())
+        assert not _is_traceable_call("Map.Entry.getKey", scope)
+        assert not _is_traceable_call("Map.Entry.run", scope)
+        assert _is_traceable_call("Outer.Inner.run", scope)
+
+    def test_call_scope_filters_foreign_super_types(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme.app", ["com.vendor.VendorBase"], (), super_types={"VendorBase"})
+        assert not _is_traceable_call("VendorBase.work", scope)
+        assert not _is_traceable_call("VendorBase.run", scope)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1956,3 +1970,14 @@ class TestResolveTargetClass:
         assert resolve_target_class("opt", "Outer.Inner", known) is None
         assert resolve_target_class("", "Outer.Inner", known) is None
         assert resolve_target_class(None, "Outer.Inner", known) is None
+
+
+class TestStripTypeDetails:
+    def test_strip_generics_and_arrays(self):
+        assert strip_type_details("List<String>") == "List"
+        assert strip_type_details("Map<String, List<Integer>>") == "Map"
+        assert strip_type_details("String[]") == "String"
+        assert strip_type_details("int[][]") == "int"
+        assert strip_type_details("Foo<Bar>[]") == "Foo"
+        assert strip_type_details(None) is None
+        assert strip_type_details("") is None

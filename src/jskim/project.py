@@ -23,7 +23,7 @@ from pathlib import Path
 from .util import (
     parse_java_source, instance_fields, format_enum_constants, format_annotation,
     extract_mapping_paths, extract_request_method, extract_first_annotation_string,
-    walk_types, _strip_type_details, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
+    walk_types, strip_type_details, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
     SPRING_STEREOTYPES, CONTROLLER_ANNOTATIONS, INJECTION_ANNOTATIONS,
     KEY_CLASS_ANNOTATIONS, ENUM_CONSTANTS_MAP_MAX, MAP_COLLAPSED_KINDS, MAP_LINE_WIDTH, SKIP_DIRS,
 )
@@ -76,7 +76,7 @@ def _bean_dependencies(t, is_bean):
 def _bean_producers(t):
     """Return types produced by @Bean methods in a type and its nested types."""
     return [
-        _strip_type_details(m["return_type"])
+        strip_type_details(m["return_type"])
         for _, nested in walk_types([t])
         for m in nested["methods"]
         if m["return_type"] and any(a["name"] == "@Bean" for a in m["annotations"])
@@ -241,7 +241,7 @@ def _build_dependency_indexes(type_infos):
 def _resolve_type_reference(type_name, info, indexes):
     """Resolve a type reference to a fully-qualified project type name."""
     fq_names, package_to_fqns, simple_to_fqns, explicit_imports, wildcard_imports = indexes
-    stripped = _strip_type_details(type_name)
+    stripped = strip_type_details(type_name)
     if not stripped:
         return None
 
