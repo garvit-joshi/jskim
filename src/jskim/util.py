@@ -42,6 +42,8 @@ ANNOTATION_NODES = {"marker_annotation", "annotation"}
 
 BODY_NODES = {"block", "constructor_body"}
 
+CALL_NODES = {"method_invocation", "method_reference"}
+
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
 
 MODIFIER_KEYWORDS = {
@@ -1058,8 +1060,9 @@ def extract_method_calls(method_node, call_scope=None):
       ["orderRepo.save", "paymentService.charge", "validate"]
 
     Keeps unqualified calls (same class), calls on ``super``, calls on a
-    simple object identifier and ``this.field.method()`` (as
-    ``field.method``). Chained/fluent calls are skipped. With a
+    simple object identifier, ``this.field.method()`` (as ``field.method``)
+    and method references (``this::validate``, ``repo::save``,
+    ``Service::process``). Chained/fluent calls are skipped. With a
     ``call_scope`` (see ``build_call_scope``), qualified calls are kept only
     when the owner is a field or a project class (same package or imported
     from the project root); calls on locals, parameters, static-imported
@@ -1079,26 +1082,80 @@ def extract_method_calls(method_node, call_scope=None):
     ]
 
 
+def _normalize_call_target(target):
+    """Extract a normalized target string from an AST receiver/target node."""
+    if target is None or target.type == "this":
+        return ""
+    while target.type == "parenthesized_expression" and len(target.children) >= 3:
+        target = target.children[1]
+    if target.type == "this":
+        return ""
+    if target.type == "super":
+        return "super"
+    if target.type == "generic_type":
+        target = target.children[0] if target.children else None
+        if target is None:
+            return None
+    if target.type in ("identifier", "type_identifier"):
+        return target.text.decode()
+    if target.type == "scoped_type_identifier":
+        text = target.text.decode()
+        if text.endswith(".super"):
+            return "super"
+        parts = text.split(".")
+        for i, p in enumerate(parts):
+            if p and p[0].isupper():
+                return ".".join(parts[i:])
+        return parts[-1]
+    if target.type == "field_access":
+        inner_obj = target.child_by_field_name("object")
+        field = target.child_by_field_name("field")
+        if not field:
+            return None
+        if inner_obj and inner_obj.type == "this":
+            return field.text.decode()
+        field_text = field.text.decode()
+        if field_text == "this" and inner_obj:
+            text = inner_obj.text.decode()
+            parts = text.split(".")
+            for i, p in enumerate(parts):
+                if p and p[0].isupper():
+                    return ".".join(parts[i:])
+            return text
+        if field_text and field_text[0].isupper():
+            text = target.text.decode()
+            parts = text.split(".")
+            for i, p in enumerate(parts):
+                if p and p[0].isupper():
+                    return ".".join(parts[i:])
+            return field_text
+    return None
+
+
+def _record_call(target, method_name, calls):
+    """Record a call target into ``calls`` from an object/target node and method name."""
+    if not method_name:
+        return
+    norm = _normalize_call_target(target)
+    if norm == "":
+        calls.add(method_name)
+    elif norm:
+        calls.add(f"{norm}.{method_name}")
+
+
 def _collect_method_calls(node, calls):
-    """Recursively collect method invocation strings from an AST subtree."""
-    if node.type == "method_invocation":
-        obj = node.child_by_field_name("object")
-        name = node.child_by_field_name("name")
-        if name:
-            method_name = name.text.decode()
-            if obj is None or obj.type == "this":
-                calls.add(method_name)
-            elif obj.type == "identifier":
-                calls.add(f"{obj.text.decode()}.{method_name}")
-            elif obj.type == "super":
-                calls.add(f"super.{method_name}")
-            elif obj.type == "field_access":
-                # Handle this.field.method() → field.method
-                inner_obj = obj.child_by_field_name("object")
-                field = obj.child_by_field_name("field")
-                if inner_obj and inner_obj.type == "this" and field:
-                    calls.add(f"{field.text.decode()}.{method_name}")
-            # else: chained call (object is method_invocation etc.), skip
+    """Recursively collect method invocation and reference strings from an AST subtree."""
+    if node.type in CALL_NODES:
+        if node.type == "method_invocation":
+            name = node.child_by_field_name("name")
+            if name:
+                _record_call(node.child_by_field_name("object"), name.text.decode(), calls)
+        elif node.type == "method_reference":
+            if len(node.children) >= 3:
+                target = node.children[0]
+                last = node.children[-1]
+                if last.type == "identifier":
+                    _record_call(target, last.text.decode(), calls)
 
     for child in node.children:
         _collect_method_calls(child, calls)

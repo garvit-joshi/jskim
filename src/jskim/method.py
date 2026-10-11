@@ -10,7 +10,6 @@ Outputs method bodies with surrounding context:
   - Other methods called within the same class (signatures only)
 """
 
-import re
 import sys
 from pathlib import Path
 
@@ -35,6 +34,7 @@ def parse_methods(content, source_name=None):
                 "noise_spans": m["noise_spans"],
                 "annotations": format_method_annotations(m),
                 "class_name": label,
+                "calls": m.get("calls", []),
             })
 
     return {
@@ -135,14 +135,12 @@ def extract_methods(parsed, method_names):
                 out.append(f"{i + 1:>5} | {all_lines[i]}")
         out.append("")
 
-    method_bodies = "\n".join(
-        all_lines[i] for m in matches for i in range(m["start"] - 1, m["end"])
-    )
     matched_names = {m["name"] for m in matches}
+    match_calls = {c for m in matches for c in m.get("calls", [])}
     called = [
         om for om in parsed["methods"]
         if om["name"] not in matched_names
-        and re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies)
+        and (om["name"] in match_calls or f"{om.get('class_name', '')}.{om['name']}" in match_calls)
     ]
     if called:
         out.append("// --- called methods in same class ---")
