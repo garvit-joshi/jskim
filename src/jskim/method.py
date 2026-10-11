@@ -19,6 +19,7 @@ from .util import (
     format_method_annotations,
     walk_types,
     resolve_target_class,
+    get_type_and_supertypes,
 )
 
 
@@ -30,7 +31,9 @@ def parse_methods(content, source_name=None):
 
     classes = [label for label, _ in walk_types(types)]
     methods = []
+    type_map = {}
     for label, t in walk_types(types):
+        type_map[label] = t
         for m in t["methods"]:
             methods.append({
                 "name": m["name"],
@@ -50,6 +53,7 @@ def parse_methods(content, source_name=None):
         "class_name": primary["name"] if primary else None,
         "class_declaration": primary["declaration"] if primary else None,
         "classes": classes,
+        "type_map": type_map,
         "fields": [
             f"{f['type']} {f['name']}" if f["name"] else f["type"]
             for f in (instance_fields(primary) if primary else [])
@@ -149,6 +153,7 @@ def extract_methods(parsed, method_names):
         parsed.get("classes")
         or [om.get("class_name") for om in parsed["methods"] if om.get("class_name")]
     )
+    type_map = parsed.get("type_map") or {}
     called_ids = set()
     for m in matches:
         m_cls = m.get("class_name", "")
@@ -159,22 +164,35 @@ def extract_methods(parsed, method_names):
 
         for c in m.get("raw_calls", m.get("calls", [])):
             if "." not in c:
+                matched_unqualified = False
                 for enc_cls in enclosing_classes:
-                    matching = [
-                        x for x in parsed["methods"]
-                        if x["name"] == c and x.get("class_name", "") == enc_cls
-                    ]
-                    if matching:
-                        for x in matching:
-                            called_ids.add(id(x))
+                    search_classes = get_type_and_supertypes(enc_cls, type_map, known_classes)
+                    for target_cls in search_classes:
+                        matching = [
+                            x for x in parsed["methods"]
+                            if x["name"] == c and x.get("class_name", "") == target_cls
+                        ]
+                        if matching:
+                            for x in matching:
+                                called_ids.add(id(x))
+                            matched_unqualified = True
+                            break
+                    if matched_unqualified:
                         break
             else:
                 target, called_name = c.rsplit(".", 1)
                 resolved_cls = resolve_target_class(target, m_cls, known_classes)
                 if resolved_cls is not None:
-                    for x in parsed["methods"]:
-                        if x["name"] == called_name and x.get("class_name", "") == resolved_cls:
-                            called_ids.add(id(x))
+                    search_classes = get_type_and_supertypes(resolved_cls, type_map, known_classes)
+                    for target_cls in search_classes:
+                        matching = [
+                            x for x in parsed["methods"]
+                            if x["name"] == called_name and x.get("class_name", "") == target_cls
+                        ]
+                        if matching:
+                            for x in matching:
+                                called_ids.add(id(x))
+                            break
 
     called = [
         om for om in parsed["methods"]

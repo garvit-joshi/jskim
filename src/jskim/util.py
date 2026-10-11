@@ -64,6 +64,13 @@ FOR_NODES = {"for_statement"}
 WHILE_NODES = {"while_statement"}
 TRY_RESOURCE_NODES = {"try_with_resources_statement"}
 IF_NODES = {"if_statement", "ternary_expression"}
+IF_STATEMENT_NODES = {"if_statement"}
+ABRUPT_COMPLETION_NODES = {
+    "return_statement",
+    "throw_statement",
+    "break_statement",
+    "continue_statement",
+}
 SWITCH_RULE_NODES = {"switch_rule"}
 SWITCH_GROUP_NODES = {"switch_block_statement_group"}
 SWITCH_LABEL_NODES = {"switch_label"}
@@ -74,6 +81,22 @@ LOGICAL_AND_OPERATORS = {"&&"}
 LOGICAL_OR_OPERATORS = {"||"}
 LOGICAL_NOT_OPERATORS = {"!"}
 STRING_CONCAT_OPERATORS = {"+"}
+
+IMPLICIT_PLATFORM_TYPES = {
+    "Object", "Class", "String", "CharSequence", "StringBuffer", "StringBuilder",
+    "Throwable", "Exception", "RuntimeException", "Error",
+    "IllegalArgumentException", "IllegalStateException", "NullPointerException",
+    "IndexOutOfBoundsException", "ArrayIndexOutOfBoundsException",
+    "UnsupportedOperationException", "SecurityException", "ClassCastException",
+    "ClassNotFoundException", "NoSuchMethodException", "NoSuchFieldException",
+    "InterruptedException", "ReflectiveOperationException", "AssertionError",
+    "OutOfMemoryError", "StackOverflowError",
+    "System", "Runtime", "Thread", "ThreadLocal", "ThreadGroup",
+    "Runnable", "Callable", "Iterable", "AutoCloseable", "Cloneable", "Comparable",
+    "Process", "ProcessBuilder", "ClassLoader", "Package", "Module", "Record", "Enum",
+    "Number", "Boolean", "Byte", "Short", "Character", "Integer", "Long", "Float", "Double",
+    "Void", "Math", "StrictMath", "StackTraceElement",
+}
 
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
 
@@ -1083,16 +1106,20 @@ def build_call_scope(package, imports, static_members, field_names=(), super_typ
     """
     root = ".".join(package.split(".")[:2]) if package else None
     foreign = set()
+    project_types = set()
     for path in imports:
         if path.endswith(".*"):
             continue
         simple = path.rsplit(".", 1)[-1]
         if simple in static_members:
             continue
-        if root is None or not path.startswith(root + "."):
+        if root is not None and path.startswith(root + "."):
+            project_types.add(simple)
+        elif root is None or not path.startswith(root + "."):
             foreign.add(simple)
     return {
         "foreign": foreign,
+        "project_types": project_types,
         "static_members": set(static_members),
         "fields": set(field_names),
         "super_types": set(super_types),
@@ -1109,6 +1136,8 @@ def _is_traceable_call(call, scope):
     parts = owner.split(".")
     root = parts[0]
     if root in scope["foreign"] or owner in scope["foreign"]:
+        return False
+    if (root in IMPLICIT_PLATFORM_TYPES or owner in IMPLICIT_PLATFORM_TYPES) and root not in scope.get("project_types", ()):
         return False
     if root in scope["static_members"] or owner in scope["static_members"]:
         return False
@@ -1224,11 +1253,31 @@ def _get_pattern_variables_flow(expr):
         rt, rf = _get_pattern_variables_flow(right)
         op_text = op.text.decode() if op else ""
         if op and (op.type in LOGICAL_AND_OPERATORS or op_text in LOGICAL_AND_OPERATORS):
-            return (lt | rt), (lf | rf)
+            return (lt | rt), (lf & rf)
         if op and (op.type in LOGICAL_OR_OPERATORS or op_text in LOGICAL_OR_OPERATORS):
             return (lt & rt), (lf | rf)
 
     return set(), set()
+
+
+def _statement_completes_abruptly(node):
+    """Return True if node definitely completes abruptly (return/throw/break/continue)."""
+    if node is None:
+        return False
+    if node.type in ABRUPT_COMPLETION_NODES:
+        return True
+    if node.type in BODY_NODES:
+        for child in node.named_children:
+            if _statement_completes_abruptly(child):
+                return True
+        return False
+    if node.type in IF_STATEMENT_NODES:
+        consequence = node.child_by_field_name("consequence")
+        alternative = node.child_by_field_name("alternative")
+        if consequence and alternative:
+            return _statement_completes_abruptly(consequence) and _statement_completes_abruptly(alternative)
+        return False
+    return False
 
 
 def _is_call_receiver_shadowed(call_node, receiver, method_node):
@@ -1245,8 +1294,20 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
         elif curr.type in ENHANCED_FOR_NODES:
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
-                if _declares_variable(curr, receiver):
-                    return True
+                name = curr.child_by_field_name("name")
+                if name:
+                    if name.type in IDENTIFIER_NODES and name.text.decode() == receiver:
+                        return True
+                    if _declares_variable(name, receiver):
+                        return True
+                for child in curr.named_children:
+                    if (
+                        child != body
+                        and child != curr.child_by_field_name("value")
+                        and child.type in PATTERN_VARIABLE_NODES
+                        and _declares_variable(child, receiver)
+                    ):
+                        return True
         elif curr.type in CATCH_NODES:
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
@@ -1255,9 +1316,20 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                         return True
         elif curr.type in FOR_NODES:
             init = curr.child_by_field_name("init")
-            if init and not _is_descendant(init, call_node):
-                if _declares_variable(init, receiver):
-                    return True
+            if init:
+                if not _is_descendant(init, call_node):
+                    if _declares_variable(init, receiver):
+                        return True
+                else:
+                    for child in init.named_children:
+                        if child.type in LOCAL_DECLARATION_NODES and child.start_byte <= call_node.start_byte:
+                            if _declares_variable(child, receiver):
+                                return True
+                        elif child.type in LOCAL_VAR_DECLARATION_NODES:
+                            for decl in child.named_children:
+                                if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
+                                    if _declares_variable(decl, receiver):
+                                        return True
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
                 cond = curr.child_by_field_name("condition")
@@ -1319,6 +1391,16 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                         if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
                             if _declares_variable(decl, receiver):
                                 return True
+                elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
+                    cond = child.child_by_field_name("condition")
+                    consequence = child.child_by_field_name("consequence")
+                    alternative = child.child_by_field_name("alternative")
+                    if cond:
+                        wt, wf = _get_pattern_variables_flow(cond)
+                        if consequence and _statement_completes_abruptly(consequence) and receiver in wf:
+                            return True
+                        if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
+                            return True
         elif curr.type in BODY_NODES:
             for child in curr.named_children:
                 if child.type in LOCAL_VAR_DECLARATION_NODES:
@@ -1326,6 +1408,16 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                         if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
                             if _declares_variable(decl, receiver):
                                 return True
+                elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
+                    cond = child.child_by_field_name("condition")
+                    consequence = child.child_by_field_name("consequence")
+                    alternative = child.child_by_field_name("alternative")
+                    if cond:
+                        wt, wf = _get_pattern_variables_flow(cond)
+                        if consequence and _statement_completes_abruptly(consequence) and receiver in wf:
+                            return True
+                        if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
+                            return True
         curr = curr.parent
 
     params = _get_formal_parameters(method_node)
@@ -1816,6 +1908,43 @@ def resolve_target_class(target, caller_class, known_classes=None):
         return target
 
     return None
+
+
+def get_type_and_supertypes(cls_name, type_map, known_classes=None):
+    """Return [cls_name, *supertypes] in resolution order for cls_name.
+
+    Resolves superclass and interface names using ``type_map`` (keyed by type label)
+    and ``resolve_target_class`` against ``known_classes``.
+    """
+    if not cls_name:
+        return []
+    result = []
+    visited = set()
+    queue = [cls_name]
+    classes = set(known_classes or ())
+    if type_map:
+        classes.update(type_map.keys())
+
+    while queue:
+        curr = queue.pop(0)
+        if not curr or curr in visited:
+            continue
+        visited.add(curr)
+        result.append(curr)
+        t = type_map.get(curr) if type_map else None
+        if t:
+            ext = t.get("extends")
+            if ext:
+                clean_ext = strip_type_details(ext)
+                resolved = resolve_target_class(clean_ext, curr, classes) or clean_ext
+                if resolved and resolved not in visited:
+                    queue.append(resolved)
+            for imp in t.get("implements", []):
+                clean_imp = strip_type_details(imp)
+                resolved = resolve_target_class(clean_imp, curr, classes) or clean_imp
+                if resolved and resolved not in visited:
+                    queue.append(resolved)
+    return result
 
 
 def instance_fields(type_info):

@@ -284,6 +284,26 @@ class TestExtractMethods:
         assert "L9-L9" in output
         assert "L3-L3" not in output
 
+    def test_called_methods_inherited_takes_precedence_over_enclosing(self):
+        content = """
+        class Base {
+            void validate() {}
+        }
+        class Outer {
+            void validate() {}
+            class Inner extends Base {
+                void test() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["test"])
+        assert "called methods in same class" in output
+        assert "L3-L3" in output
+        assert "L6-L6" not in output
+
     def test_called_methods_qualified_same_class_helpers_preserved(self):
         content = """
         class S {
