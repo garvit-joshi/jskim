@@ -61,10 +61,14 @@ INSTANCEOF_NODES = {"instanceof_expression"}
 CATCH_NODES = {"catch_clause"}
 ENHANCED_FOR_NODES = {"enhanced_for_statement"}
 FOR_NODES = {"for_statement"}
+WHILE_NODES = {"while_statement"}
 TRY_RESOURCE_NODES = {"try_with_resources_statement"}
-IF_NODES = {"if_statement"}
+IF_NODES = {"if_statement", "ternary_expression"}
 SWITCH_RULE_NODES = {"switch_rule"}
 LOCAL_VAR_DECLARATION_NODES = {"local_variable_declaration"}
+BINARY_EXPRESSION_NODES = {"binary_expression"}
+LOGICAL_AND_OPERATORS = {"&&"}
+STRING_CONCAT_OPERATORS = {"+"}
 
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
 
@@ -400,13 +404,13 @@ def resolve_string_expression(node, constants=None):
         if qualified in constants:
             return constants[qualified]
         return constants.get(field.text.decode())
-    if node.type == "parenthesized_expression":
+    if node.type in PARENTHESIZED_EXPRESSION_NODES:
         for child in node.named_children:
             return resolve_string_expression(child, constants)
         return None
-    if node.type == "binary_expression":
+    if node.type in BINARY_EXPRESSION_NODES:
         op = node.child_by_field_name("operator")
-        if op is None or op.type != "+":
+        if op is None or (op.type not in STRING_CONCAT_OPERATORS and op.text.decode() not in STRING_CONCAT_OPERATORS):
             return None
         left = resolve_string_expression(node.child_by_field_name("left"), constants)
         right = resolve_string_expression(node.child_by_field_name("right"), constants)
@@ -1197,17 +1201,41 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
             if init and not _is_descendant(init, call_node):
                 if _declares_variable(init, receiver):
                     return True
-        elif curr.type in TRY_RESOURCE_NODES:
-            resources = curr.child_by_field_name("resources")
-            if resources and not _is_descendant(resources, call_node):
-                if _declares_variable(resources, receiver):
+            body = curr.child_by_field_name("body")
+            if body and _is_descendant(body, call_node):
+                cond = curr.child_by_field_name("condition")
+                if cond and _declares_variable(cond, receiver):
                     return True
+        elif curr.type in WHILE_NODES:
+            body = curr.child_by_field_name("body")
+            if body and _is_descendant(body, call_node):
+                cond = curr.child_by_field_name("condition")
+                if cond and _declares_variable(cond, receiver):
+                    return True
+        elif curr.type in TRY_RESOURCE_NODES:
+            body = curr.child_by_field_name("body")
+            resources = curr.child_by_field_name("resources")
+            if body and _is_descendant(body, call_node):
+                if resources and _declares_variable(resources, receiver):
+                    return True
+            elif resources and _is_descendant(resources, call_node):
+                for child in resources.named_children:
+                    if child.start_byte < call_node.start_byte and _declares_variable(child, receiver):
+                        return True
         elif curr.type in IF_NODES:
             consequence = curr.child_by_field_name("consequence")
             if consequence and _is_descendant(consequence, call_node):
                 cond = curr.child_by_field_name("condition")
                 if cond and _declares_variable(cond, receiver):
                     return True
+        elif curr.type in BINARY_EXPRESSION_NODES:
+            op = curr.child_by_field_name("operator")
+            if op and (op.type in LOGICAL_AND_OPERATORS or op.text.decode() in LOGICAL_AND_OPERATORS):
+                right = curr.child_by_field_name("right")
+                if right and _is_descendant(right, call_node):
+                    left = curr.child_by_field_name("left")
+                    if left and _declares_variable(left, receiver):
+                        return True
         elif curr.type in SWITCH_RULE_NODES:
             if curr.named_children:
                 label = curr.named_children[0]

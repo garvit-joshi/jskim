@@ -668,6 +668,49 @@ class TestCallHierarchyOutput:
         impact = format_impact_output(types, "Service.run", depth=1)
         assert "→ Repo.save" in impact
 
+    def test_callers_and_impact_respect_try_with_resources_and_pattern_condition_scope(self, tmp_path):
+        service = """
+        package demo;
+        public class Service {
+            private Repo repo;
+            public void testTry() {
+                try (Other repo = open()) {
+                    repo.save();
+                } catch (Exception e) {
+                    repo.save();
+                }
+            }
+            public void testPattern(Object obj) {
+                if (obj instanceof Other repo && repo.save()) {
+                    repo.save();
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public boolean save() { return true; }
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public boolean save() { return true; }
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.testTry" in output
+        assert "Service.testPattern" not in output
+        impact_try = format_impact_output(types, "Service.testTry", depth=1)
+        assert "→ Repo.save" in impact_try
+        impact_pattern = format_impact_output(types, "Service.testPattern", depth=1)
+        assert "→ Repo.save" not in impact_pattern
+
 
 # ---------------------------------------------------------------------------
 # Full project scan

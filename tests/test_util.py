@@ -1898,6 +1898,50 @@ class TestCallScope:
         calls = extract_method_calls(method, scope)
         assert calls == ["repo.save"]
 
+    def test_try_with_resources_shadowing_limited_to_try_body_and_ordered_resources(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run() {
+                try (Other r1 = repo.init(); Other repo = open(); Other r2 = repo.next()) {
+                    repo.save();
+                } catch (Exception e) {
+                    repo.sync();
+                } finally {
+                    repo.flush();
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["open", "repo.flush", "repo.init", "repo.sync"]
+
+    def test_pattern_variable_shadowing_in_conditional_and_expressions(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                if (obj instanceof Other repo && repo.isReady()) {
+                    repo.save();
+                }
+                if (repo.check() && obj instanceof Other repo) {
+                    repo.save();
+                }
+                while (obj instanceof Other repo && repo.isReady()) {
+                    repo.save();
+                }
+                boolean ok = (obj instanceof Other repo && repo.isReady()) ? repo.save() : false;
+                this.repo.save();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.check", "repo.save"]
+
 
 
 # ---------------------------------------------------------------------------
