@@ -248,6 +248,23 @@ class TestExtractMethods:
         output = extract_methods(parsed, ["process"])
         assert "called methods in same class" not in output
 
+    def test_called_methods_nested_class_simple_name(self):
+        content = """
+        class Outer {
+            static class Inner {
+                void process() {
+                    Inner.validate();
+                    Runnable r = Inner::validate;
+                }
+                static void validate() {}
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+
     def test_fields_shown(self):
         content = load_fixture("StaticFieldService.java")
         parsed = parse_methods(content)

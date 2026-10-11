@@ -1661,6 +1661,7 @@ class TestCallScope:
                 items.forEach(com.acme.service.BillingService<String>::charge);
                 items.forEach(Outer.Inner::process);
                 items.forEach(Outer.super::audit);
+                items.forEach(super::audit);
                 items.forEach(Outer.this::validate);
                 items.forEach((this)::validate);
                 items.forEach(this::<String>validate);
@@ -1675,9 +1676,30 @@ class TestCallScope:
         assert calls == [
             "BillingService.charge",
             "Outer.Inner.process",
+            "Outer.audit",
             "Outer.validate",
             "super.audit",
             "validate",
+        ]
+
+    def test_method_references_qualified_super_interfaces(self):
+        t = _first_type("""
+        package com.acme.app;
+        import com.acme.app.api.AuditApi;
+        class Service implements AuditApi, I {
+            void run() {
+                items.forEach(AuditApi.super::audit);
+                items.forEach(AuditApi<String>.super::audit);
+                items.forEach(I.super::audit);
+                items.forEach(super::audit);
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert calls == [
+            "AuditApi.audit",
+            "I.audit",
+            "super.audit",
         ]
 
 

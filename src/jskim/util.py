@@ -1008,7 +1008,7 @@ def _is_noise_call(call_str):
     return obj in NOISE_CALL_OBJECTS or method in NOISE_CALL_METHODS
 
 
-_CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]+")
+_CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]{2,}")
 
 
 def build_call_scope(package, imports, static_members, field_names=()):
@@ -1092,6 +1092,8 @@ def _normalize_call_target(target):
         return ""
     if target.type == "super":
         return "super"
+    if target.type == "scoped_type_identifier" and target.text.decode().endswith(".super") and target.children:
+        target = target.children[0]
     if target.type == "generic_type":
         target = target.children[0] if target.children else None
         if target is None:
@@ -1101,7 +1103,7 @@ def _normalize_call_target(target):
     if target.type == "scoped_type_identifier":
         text = target.text.decode()
         if text.endswith(".super"):
-            return "super"
+            text = text[:-6]
         parts = text.split(".")
         for i, p in enumerate(parts):
             if p and p[0].isupper():

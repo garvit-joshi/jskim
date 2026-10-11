@@ -577,6 +577,29 @@ class TestCallHierarchyOutput:
         impact = format_impact_output(types, "Service.process", depth=1)
         assert "→ Repo.save" in impact
 
+    def test_callers_and_impact_follow_qualified_super_method_references(self, tmp_path):
+        service = """
+        package demo;
+        public class Service implements AuditApi {
+            public void process() {
+                Runnable r = AuditApi.super::audit;
+            }
+        }
+        """
+        api = """
+        package demo;
+        public interface AuditApi {
+            default void audit() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "AuditApi.java").write_text(api, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "AuditApi.audit", depth=1)
+        assert "← Service.process" in output
+        impact = format_impact_output(types, "Service.process", depth=1)
+        assert "→ AuditApi.audit" in impact
+
 
 # ---------------------------------------------------------------------------
 # Full project scan
