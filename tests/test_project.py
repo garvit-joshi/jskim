@@ -633,6 +633,41 @@ class TestCallHierarchyOutput:
         impact = format_impact_output(types, "Service.run", depth=1)
         assert "→ Repo.save" not in impact
 
+    def test_callers_and_impact_preserve_calls_outside_nested_shadowing(self, tmp_path):
+        service = """
+        package demo;
+        import java.util.List;
+        public class Service {
+            private Repo repo;
+            public void run(List<Other> items) {
+                repo.save();
+                for (Other repo : items) {
+                    repo.save();
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public void save() {}
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public void save() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.run" in output
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Repo.save" in impact
+
 
 # ---------------------------------------------------------------------------
 # Full project scan

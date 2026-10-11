@@ -43,6 +43,28 @@ ANNOTATION_NODES = {"marker_annotation", "annotation"}
 BODY_NODES = {"block", "constructor_body"}
 
 CALL_NODES = {"method_invocation", "method_reference"}
+METHOD_INVOCATION_NODES = {"method_invocation"}
+METHOD_REFERENCE_NODES = {"method_reference"}
+
+IDENTIFIER_NODES = {"identifier"}
+TYPE_IDENTIFIER_NODES = {"identifier", "type_identifier"}
+SCOPED_TYPE_IDENTIFIER_NODES = {"scoped_type_identifier"}
+GENERIC_TYPE_NODES = {"generic_type"}
+THIS_NODES = {"this"}
+SUPER_NODES = {"super"}
+FIELD_ACCESS_NODES = {"field_access"}
+PARENTHESIZED_EXPRESSION_NODES = {"parenthesized_expression"}
+
+LAMBDA_NODES = {"lambda_expression"}
+LAMBDA_PARAM_CONTAINER_NODES = {"inferred_parameters", "formal_parameters"}
+INSTANCEOF_NODES = {"instanceof_expression"}
+CATCH_NODES = {"catch_clause"}
+ENHANCED_FOR_NODES = {"enhanced_for_statement"}
+FOR_NODES = {"for_statement"}
+TRY_RESOURCE_NODES = {"try_with_resources_statement"}
+IF_NODES = {"if_statement"}
+SWITCH_RULE_NODES = {"switch_rule"}
+LOCAL_VAR_DECLARATION_NODES = {"local_variable_declaration"}
 
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
 
@@ -957,7 +979,7 @@ def parse_method(node, call_scope=None, constants=None):
     """
     mods = get_modifiers_node(node)
     raw_calls = extract_raw_method_calls(node)
-    effective_scope = _method_call_scope(node, call_scope)
+    calls = extract_method_calls(node, call_scope)
     return {
         "name": get_method_name(node),
         "kind": _method_kind(node),
@@ -971,10 +993,7 @@ def parse_method(node, call_scope=None, constants=None):
         "wiring": _is_wiring_constructor(node),
         "return_type": _get_return_type(node),
         "params": parse_parameters(_get_formal_parameters(node)),
-        "calls": [
-            call for call in raw_calls
-            if not _is_noise_call(call) and _is_traceable_call(call, effective_scope)
-        ],
+        "calls": calls,
         "raw_calls": raw_calls,
     }
 
@@ -1091,108 +1110,143 @@ def _is_traceable_call(call, scope):
     return all(p[:1].isupper() for p in parts)
 
 
-def _collect_local_names(node, names):
-    """Recursively collect local variable and parameter names declared in a method/constructor."""
-    if node.type in TYPE_BODY_NODES:
-        return
+def _is_explicit_this(target):
+    """Return True if target is explicitly qualified with 'this.'."""
+    if target is None:
+        return False
+    while target.type in PARENTHESIZED_EXPRESSION_NODES and len(target.children) >= 3:
+        target = target.children[1]
+    if target.type in FIELD_ACCESS_NODES:
+        inner_obj = target.child_by_field_name("object")
+        while (
+            inner_obj is not None
+            and inner_obj.type in PARENTHESIZED_EXPRESSION_NODES
+            and len(inner_obj.children) >= 3
+        ):
+            inner_obj = inner_obj.children[1]
+        return inner_obj is not None and inner_obj.type in THIS_NODES
+    return False
+
+
+def _is_descendant(parent, node):
+    """Return True if node is equal to parent or is a descendant of parent."""
+    curr = node
+    while curr is not None:
+        if curr == parent:
+            return True
+        curr = curr.parent
+    return False
+
+
+def _declares_variable(node, name):
+    """Return True if node or any of its subnodes declares a variable named name."""
+    if node is None:
+        return False
     if node.type in LOCAL_DECLARATION_NODES:
-        name = node.child_by_field_name("name")
-        if name and name.type == "identifier":
-            names.add(name.text.decode())
+        n = node.child_by_field_name("name")
+        if n and n.type in IDENTIFIER_NODES and n.text.decode() == name:
+            return True
     elif node.type in PATTERN_VARIABLE_NODES:
         for child in node.named_children:
-            if child.type == "identifier":
-                names.add(child.text.decode())
-    elif node.type == "inferred_parameters":
+            if child.type in IDENTIFIER_NODES and child.text.decode() == name:
+                return True
+    elif node.type in LAMBDA_PARAM_CONTAINER_NODES:
         for child in node.named_children:
-            if child.type == "identifier":
-                names.add(child.text.decode())
-    elif node.type == "lambda_expression":
-        param = node.child_by_field_name("parameters")
-        if param and param.type == "identifier":
-            names.add(param.text.decode())
-    elif node.type == "instanceof_expression":
-        if len(node.named_children) >= 3 and node.named_children[-1].type == "identifier":
-            names.add(node.named_children[-1].text.decode())
+            if child.type in IDENTIFIER_NODES and child.text.decode() == name:
+                return True
+            if _declares_variable(child, name):
+                return True
+    elif node.type in INSTANCEOF_NODES:
+        n = node.child_by_field_name("name")
+        if n and n.type in IDENTIFIER_NODES and n.text.decode() == name:
+            return True
+        for child in node.named_children:
+            if child.type in PATTERN_VARIABLE_NODES and _declares_variable(child, name):
+                return True
 
     for child in node.named_children:
-        _collect_local_names(child, names)
+        if _declares_variable(child, name):
+            return True
+    return False
 
 
-def _method_call_scope(method_node, call_scope):
-    """Return an effective call scope with shadowed fields removed."""
-    if call_scope is None or not call_scope.get("fields"):
-        return call_scope
-    local_names = set()
-    _collect_local_names(method_node, local_names)
-    shadowed = local_names & call_scope["fields"]
-    if not shadowed:
-        return call_scope
-    scope = dict(call_scope)
-    scope["fields"] = scope["fields"] - shadowed
-    return scope
+def _is_call_receiver_shadowed(call_node, receiver, method_node):
+    """Return True if receiver is shadowed at call_node by an enclosing scope declaration."""
+    curr = call_node.parent
+    while curr is not None and curr != method_node:
+        if curr.type in LAMBDA_NODES:
+            params = curr.child_by_field_name("parameters")
+            if params:
+                if params.type in IDENTIFIER_NODES and params.text.decode() == receiver:
+                    return True
+                if _declares_variable(params, receiver):
+                    return True
+        elif curr.type in ENHANCED_FOR_NODES:
+            body = curr.child_by_field_name("body")
+            if body and _is_descendant(body, call_node):
+                if _declares_variable(curr, receiver):
+                    return True
+        elif curr.type in CATCH_NODES:
+            body = curr.child_by_field_name("body")
+            if body and _is_descendant(body, call_node):
+                for child in curr.named_children:
+                    if child.type in LOCAL_DECLARATION_NODES and _declares_variable(child, receiver):
+                        return True
+        elif curr.type in FOR_NODES:
+            init = curr.child_by_field_name("init")
+            if init and not _is_descendant(init, call_node):
+                if _declares_variable(init, receiver):
+                    return True
+        elif curr.type in TRY_RESOURCE_NODES:
+            resources = curr.child_by_field_name("resources")
+            if resources and not _is_descendant(resources, call_node):
+                if _declares_variable(resources, receiver):
+                    return True
+        elif curr.type in IF_NODES:
+            consequence = curr.child_by_field_name("consequence")
+            if consequence and _is_descendant(consequence, call_node):
+                cond = curr.child_by_field_name("condition")
+                if cond and _declares_variable(cond, receiver):
+                    return True
+        elif curr.type in SWITCH_RULE_NODES:
+            if curr.named_children:
+                label = curr.named_children[0]
+                if label and not _is_descendant(label, call_node) and _declares_variable(label, receiver):
+                    return True
+        elif curr.type in BODY_NODES:
+            for child in curr.named_children:
+                if child.type in LOCAL_VAR_DECLARATION_NODES:
+                    if child.start_byte <= call_node.start_byte:
+                        if _declares_variable(child, receiver):
+                            return True
+        curr = curr.parent
 
+    params = _get_formal_parameters(method_node)
+    if params and _declares_variable(params, receiver):
+        return True
 
-def extract_raw_method_calls(method_node):
-    """Extract raw normalized method calls from a method/constructor body.
-
-    Returns a deduplicated sorted list of normalized call strings before noise
-    or scope filtering.
-    """
-    body = method_node.child_by_field_name("body")
-    if body is None:
-        return []
-    calls = set()
-    _collect_method_calls(body, calls)
-    return sorted(calls)
-
-
-def extract_method_calls(method_node, call_scope=None):
-    """Extract method calls from a method/constructor body.
-
-    Returns a deduplicated sorted list of call strings like:
-      ["orderRepo.save", "paymentService.charge", "validate"]
-
-    Keeps unqualified calls (same class), calls on ``super``, calls on a
-    simple object identifier, ``this.field.method()`` (as ``field.method``)
-    and method references (``this::validate``, ``repo::save``,
-    ``Service::process``). Chained/fluent calls are skipped. With a
-    ``call_scope`` (see ``build_call_scope``), qualified calls are kept only
-    when the owner is a field or a project class (same package or imported
-    from the project root); calls on locals, parameters, static-imported
-    members and JDK/library classes are dropped because they cannot be
-    followed from the summary. Method-local declarations shadow instance
-    fields of the same name, dropping calls on shadowed receivers.
-
-    Boilerplate noise is filtered via NOISE_CALL_OBJECTS / NOISE_CALL_METHODS.
-    """
-    effective_scope = _method_call_scope(method_node, call_scope)
-    raw = extract_raw_method_calls(method_node)
-    return [
-        call for call in raw
-        if not _is_noise_call(call) and _is_traceable_call(call, effective_scope)
-    ]
+    return False
 
 
 def _normalize_call_target(target):
     """Extract a normalized target string from an AST receiver/target node."""
-    if target is None or target.type == "this":
+    if target is None or target.type in THIS_NODES:
         return ""
-    while target.type == "parenthesized_expression" and len(target.children) >= 3:
+    while target.type in PARENTHESIZED_EXPRESSION_NODES and len(target.children) >= 3:
         target = target.children[1]
-    if target.type == "this":
+    if target.type in THIS_NODES:
         return ""
-    if target.type == "super":
+    if target.type in SUPER_NODES:
         return "super"
-    if target.type == "scoped_type_identifier" and target.text.decode().endswith(".super") and target.children:
+    if target.type in SCOPED_TYPE_IDENTIFIER_NODES and target.text.decode().endswith(".super") and target.children:
         target = target.children[0]
-    if target.type == "generic_type":
+    if target.type in GENERIC_TYPE_NODES:
         target = target.children[0] if target.children else None
         if target is None:
             return None
-    if target.type in ("identifier", "type_identifier"):
+    if target.type in TYPE_IDENTIFIER_NODES:
         return target.text.decode()
-    if target.type == "scoped_type_identifier":
+    if target.type in SCOPED_TYPE_IDENTIFIER_NODES:
         text = target.text.decode()
         if text.endswith(".super"):
             text = text[:-6]
@@ -1201,15 +1255,15 @@ def _normalize_call_target(target):
             if p and p[0].isupper():
                 return ".".join(parts[i:])
         return parts[-1]
-    if target.type == "field_access":
+    if target.type in FIELD_ACCESS_NODES:
         inner_obj = target.child_by_field_name("object")
         field = target.child_by_field_name("field")
         if not field:
             return None
-        if inner_obj and inner_obj.type == "this":
+        if inner_obj and inner_obj.type in THIS_NODES:
             return field.text.decode()
         field_text = field.text.decode()
-        if field_text == "this" and inner_obj:
+        if field_text in THIS_NODES and inner_obj:
             text = inner_obj.text.decode()
             parts = text.split(".")
             for i, p in enumerate(parts):
@@ -1227,7 +1281,7 @@ def _normalize_call_target(target):
 
 
 def _record_call(target, method_name, calls):
-    """Record a call target into ``calls`` from an object/target node and method name."""
+    """Record a raw call into ``calls`` from an object/target node and method name."""
     if not method_name:
         return
     norm = _normalize_call_target(target)
@@ -1237,22 +1291,94 @@ def _record_call(target, method_name, calls):
         calls.add(f"{norm}.{method_name}")
 
 
-def _collect_method_calls(node, calls):
+def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, method_node=None):
+    """Record a call into ``calls`` if it is followable and not shadowed at call_node."""
+    if not method_name:
+        return
+    norm = _normalize_call_target(target)
+    if norm is None:
+        return
+    call_str = method_name if norm == "" else f"{norm}.{method_name}"
+    if _is_noise_call(call_str):
+        return
+    if call_scope is not None:
+        if not _is_traceable_call(call_str, call_scope):
+            return
+        if norm in call_scope.get("fields", ()):
+            if not _is_explicit_this(target) and method_node is not None:
+                if _is_call_receiver_shadowed(call_node, norm, method_node):
+                    return
+    calls.add(call_str)
+
+
+def _collect_method_calls(node, calls, call_scope=None, method_node=None, raw=False):
     """Recursively collect method invocation and reference strings from an AST subtree."""
     if node.type in CALL_NODES:
-        if node.type == "method_invocation":
+        if node.type in METHOD_INVOCATION_NODES:
             name = node.child_by_field_name("name")
             if name:
-                _record_call(node.child_by_field_name("object"), name.text.decode(), calls)
-        elif node.type == "method_reference":
+                obj = node.child_by_field_name("object")
+                method_name = name.text.decode()
+                if raw:
+                    _record_call(obj, method_name, calls)
+                else:
+                    _record_scoped_call(node, obj, method_name, calls, call_scope, method_node)
+        elif node.type in METHOD_REFERENCE_NODES:
             if len(node.children) >= 3:
                 target = node.children[0]
                 last = node.children[-1]
-                if last.type == "identifier":
-                    _record_call(target, last.text.decode(), calls)
+                if last.type in IDENTIFIER_NODES:
+                    method_name = last.text.decode()
+                    if raw:
+                        _record_call(target, method_name, calls)
+                    else:
+                        _record_scoped_call(node, target, method_name, calls, call_scope, method_node)
 
     for child in node.children:
-        _collect_method_calls(child, calls)
+        _collect_method_calls(child, calls, call_scope=call_scope, method_node=method_node, raw=raw)
+
+
+def extract_raw_method_calls(method_node):
+    """Extract raw normalized method calls from a method/constructor body.
+
+    Returns a deduplicated sorted list of normalized call strings before noise
+    or scope filtering.
+    """
+    body = method_node.child_by_field_name("body")
+    if body is None:
+        return []
+    calls = set()
+    _collect_method_calls(body, calls, raw=True)
+    return sorted(calls)
+
+
+def extract_method_calls(method_node, call_scope=None):
+    """Extract method calls from a method/constructor body.
+
+    Returns a deduplicated sorted list of call strings like:
+      ["orderRepo.save", "paymentService.charge", "validate"]
+
+    Keeps unqualified calls (same class), calls on ``super``, calls on a
+    simple object identifier, ``this.field.method()`` (as ``field.method``)
+    and method references (``this::validate``, ``repo::save``,
+    ``Service::process``). Chained/fluent calls are skipped. With a
+    ``call_scope`` (see ``build_call_scope``), qualified calls are kept only
+    when the owner is a field or a project class (same package or imported
+    from the project root); calls on locals, parameters, static-imported
+    members and JDK/library classes are dropped because they cannot be
+    followed from the summary. Declarations in enclosing scopes (parameters,
+    local variables, loop/catch/pattern variables) shadow instance fields
+    at each call site, dropping calls on shadowed receivers unless explicitly
+    qualified with ``this.``.
+
+    Boilerplate noise is filtered via NOISE_CALL_OBJECTS / NOISE_CALL_METHODS.
+    """
+    body = method_node.child_by_field_name("body")
+    if body is None:
+        return []
+    calls = set()
+    _collect_method_calls(body, calls, call_scope=call_scope, method_node=method_node, raw=False)
+    return sorted(calls)
 
 
 # ---------------------------------------------------------------------------

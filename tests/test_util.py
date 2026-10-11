@@ -1843,6 +1843,61 @@ class TestCallScope:
         calls = extract_method_calls(method, scope)
         assert calls == ["audit.log"]
 
+    def test_nested_scope_shadowing_preserves_outer_calls(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(List<Item> items, Object obj) {
+                repo.save();
+                items.forEach(repo -> repo.save());
+                repo.flush();
+                for (Item repo : items) {
+                    repo.save();
+                }
+                repo.refresh();
+                try {
+                    repo.save();
+                } catch (Exception repo) {
+                    repo.save();
+                }
+                repo.sync();
+                if (obj instanceof Item repo) {
+                    repo.save();
+                }
+                repo.commit();
+                {
+                    Item repo = null;
+                    repo.save();
+                }
+                repo.close();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == [
+            "repo.close", "repo.commit",
+            "repo.flush", "repo.refresh", "repo.save", "repo.sync",
+        ]
+
+    def test_explicit_this_call_preserved_when_shadowed(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Other repo) {
+                repo.save();
+                this.repo.save();
+                Runnable r1 = repo::save;
+                Runnable r2 = this.repo::save;
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.save"]
+
 
 
 # ---------------------------------------------------------------------------
