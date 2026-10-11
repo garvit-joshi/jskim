@@ -1942,6 +1942,68 @@ class TestCallScope:
         calls = extract_method_calls(method, scope)
         assert calls == ["repo.check", "repo.save"]
 
+    def test_negated_and_flow_scoped_pattern_variables(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    repo.save();
+                } else {
+                    repo.flush();
+                }
+                if (obj instanceof Other repo) {
+                    repo.save();
+                } else {
+                    repo.sync();
+                }
+                if (!(obj instanceof Other repo) || repo.isReady()) {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.save", "repo.sync"]
+
+    def test_local_declarator_ordering(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run() {
+                Repo first = repo.open(), repo = first;
+                repo.save();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.open"]
+
+    def test_colon_switch_pattern_scoping(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                switch (obj) {
+                    case Other repo when repo.isReady():
+                        repo.save();
+                        break;
+                    default:
+                        repo.sync();
+                        break;
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.sync"]
+
 
 
 # ---------------------------------------------------------------------------

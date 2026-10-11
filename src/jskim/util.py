@@ -65,9 +65,14 @@ WHILE_NODES = {"while_statement"}
 TRY_RESOURCE_NODES = {"try_with_resources_statement"}
 IF_NODES = {"if_statement", "ternary_expression"}
 SWITCH_RULE_NODES = {"switch_rule"}
+SWITCH_GROUP_NODES = {"switch_block_statement_group"}
+SWITCH_LABEL_NODES = {"switch_label"}
 LOCAL_VAR_DECLARATION_NODES = {"local_variable_declaration"}
 BINARY_EXPRESSION_NODES = {"binary_expression"}
+UNARY_EXPRESSION_NODES = {"unary_expression"}
 LOGICAL_AND_OPERATORS = {"&&"}
+LOGICAL_OR_OPERATORS = {"||"}
+LOGICAL_NOT_OPERATORS = {"!"}
 STRING_CONCAT_OPERATORS = {"+"}
 
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
@@ -1174,6 +1179,58 @@ def _declares_variable(node, name):
     return False
 
 
+def _collect_pattern_variable_names(node, names):
+    """Collect declared pattern variable names under node into names set."""
+    if node is None:
+        return
+    if node.type in PATTERN_VARIABLE_NODES:
+        for c in node.named_children:
+            if c.type in IDENTIFIER_NODES:
+                names.add(c.text.decode())
+    for c in node.named_children:
+        _collect_pattern_variable_names(c, names)
+
+
+def _get_pattern_variables_flow(expr):
+    """Return (when_true, when_false) sets of pattern variable names for expr."""
+    if expr is None:
+        return set(), set()
+    while expr.type in PARENTHESIZED_EXPRESSION_NODES and len(expr.children) >= 3:
+        expr = expr.children[1]
+
+    if expr.type in INSTANCEOF_NODES:
+        names = set()
+        n = expr.child_by_field_name("name")
+        if n and n.type in IDENTIFIER_NODES:
+            names.add(n.text.decode())
+        for child in expr.named_children:
+            if child.type in PATTERN_VARIABLE_NODES:
+                _collect_pattern_variable_names(child, names)
+        return names, set()
+
+    if expr.type in UNARY_EXPRESSION_NODES:
+        op = expr.child_by_field_name("operator")
+        op_text = op.text.decode() if op else ""
+        if op and (op.type in LOGICAL_NOT_OPERATORS or op_text in LOGICAL_NOT_OPERATORS):
+            operand = expr.child_by_field_name("operand")
+            t, f = _get_pattern_variables_flow(operand)
+            return f, t
+
+    if expr.type in BINARY_EXPRESSION_NODES:
+        op = expr.child_by_field_name("operator")
+        left = expr.child_by_field_name("left")
+        right = expr.child_by_field_name("right")
+        lt, lf = _get_pattern_variables_flow(left)
+        rt, rf = _get_pattern_variables_flow(right)
+        op_text = op.text.decode() if op else ""
+        if op and (op.type in LOGICAL_AND_OPERATORS or op_text in LOGICAL_AND_OPERATORS):
+            return (lt | rt), (lf | rf)
+        if op and (op.type in LOGICAL_OR_OPERATORS or op_text in LOGICAL_OR_OPERATORS):
+            return (lt & rt), (lf | rf)
+
+    return set(), set()
+
+
 def _is_call_receiver_shadowed(call_node, receiver, method_node):
     """Return True if receiver is shadowed at call_node by an enclosing scope declaration."""
     curr = call_node.parent
@@ -1204,14 +1261,18 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
                 cond = curr.child_by_field_name("condition")
-                if cond and _declares_variable(cond, receiver):
-                    return True
+                if cond:
+                    wt, _ = _get_pattern_variables_flow(cond)
+                    if receiver in wt:
+                        return True
         elif curr.type in WHILE_NODES:
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
                 cond = curr.child_by_field_name("condition")
-                if cond and _declares_variable(cond, receiver):
-                    return True
+                if cond:
+                    wt, _ = _get_pattern_variables_flow(cond)
+                    if receiver in wt:
+                        return True
         elif curr.type in TRY_RESOURCE_NODES:
             body = curr.child_by_field_name("body")
             resources = curr.child_by_field_name("resources")
@@ -1223,30 +1284,48 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                     if child.start_byte < call_node.start_byte and _declares_variable(child, receiver):
                         return True
         elif curr.type in IF_NODES:
-            consequence = curr.child_by_field_name("consequence")
-            if consequence and _is_descendant(consequence, call_node):
-                cond = curr.child_by_field_name("condition")
-                if cond and _declares_variable(cond, receiver):
+            cond = curr.child_by_field_name("condition")
+            if cond:
+                wt, wf = _get_pattern_variables_flow(cond)
+                cons = curr.child_by_field_name("consequence")
+                if cons and _is_descendant(cons, call_node) and receiver in wt:
+                    return True
+                alt = curr.child_by_field_name("alternative")
+                if alt and _is_descendant(alt, call_node) and receiver in wf:
                     return True
         elif curr.type in BINARY_EXPRESSION_NODES:
             op = curr.child_by_field_name("operator")
-            if op and (op.type in LOGICAL_AND_OPERATORS or op.text.decode() in LOGICAL_AND_OPERATORS):
-                right = curr.child_by_field_name("right")
-                if right and _is_descendant(right, call_node):
-                    left = curr.child_by_field_name("left")
-                    if left and _declares_variable(left, receiver):
+            op_text = op.text.decode() if op else ""
+            right = curr.child_by_field_name("right")
+            if right and _is_descendant(right, call_node):
+                left = curr.child_by_field_name("left")
+                if left:
+                    wt, wf = _get_pattern_variables_flow(left)
+                    if (op.type in LOGICAL_AND_OPERATORS or op_text in LOGICAL_AND_OPERATORS) and receiver in wt:
                         return True
-        elif curr.type in SWITCH_RULE_NODES:
-            if curr.named_children:
-                label = curr.named_children[0]
-                if label and not _is_descendant(label, call_node) and _declares_variable(label, receiver):
+                    if (op.type in LOGICAL_OR_OPERATORS or op_text in LOGICAL_OR_OPERATORS) and receiver in wf:
+                        return True
+        elif curr.type in SWITCH_LABEL_NODES:
+            for child in curr.named_children:
+                if child.start_byte < call_node.start_byte and _declares_variable(child, receiver):
                     return True
+        elif curr.type in SWITCH_GROUP_NODES or curr.type in SWITCH_RULE_NODES:
+            for child in curr.named_children:
+                if child.type in SWITCH_LABEL_NODES:
+                    if child.start_byte < call_node.start_byte and _declares_variable(child, receiver):
+                        return True
+                elif child.type in LOCAL_VAR_DECLARATION_NODES:
+                    for decl in child.named_children:
+                        if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
+                            if _declares_variable(decl, receiver):
+                                return True
         elif curr.type in BODY_NODES:
             for child in curr.named_children:
                 if child.type in LOCAL_VAR_DECLARATION_NODES:
-                    if child.start_byte <= call_node.start_byte:
-                        if _declares_variable(child, receiver):
-                            return True
+                    for decl in child.named_children:
+                        if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
+                            if _declares_variable(decl, receiver):
+                                return True
         curr = curr.parent
 
     params = _get_formal_parameters(method_node)

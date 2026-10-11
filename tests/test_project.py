@@ -711,6 +711,69 @@ class TestCallHierarchyOutput:
         impact_pattern = format_impact_output(types, "Service.testPattern", depth=1)
         assert "→ Repo.save" not in impact_pattern
 
+    def test_callers_and_impact_respect_negated_patterns_declarator_order_and_colon_switch(self, tmp_path):
+        service = """
+        package demo;
+        public class Service {
+            private Repo repo;
+            public void testNegated(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    repo.save();
+                } else {
+                    repo.flush();
+                }
+            }
+            public void testDeclaratorOrder() {
+                Repo first = repo.open(), repo = first;
+                repo.save();
+            }
+            public void testColonSwitch(Object obj) {
+                switch (obj) {
+                    case Other repo:
+                        repo.save();
+                        break;
+                    default:
+                        repo.sync();
+                        break;
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public void save() {}
+            public Repo open() { return this; }
+            public void flush() {}
+            public void sync() {}
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public void save() {}
+            public void flush() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+
+        callers_save = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.testNegated" in callers_save
+        assert "Service.testDeclaratorOrder" not in callers_save
+        assert "Service.testColonSwitch" not in callers_save
+
+        callers_open = format_callers_output(types, "Repo.open", depth=1)
+        assert "← Service.testDeclaratorOrder" in callers_open
+
+        callers_flush = format_callers_output(types, "Repo.flush", depth=1)
+        assert "Service.testNegated" not in callers_flush
+
+        callers_sync = format_callers_output(types, "Repo.sync", depth=1)
+        assert "← Service.testColonSwitch" in callers_sync
+
 
 # ---------------------------------------------------------------------------
 # Full project scan
