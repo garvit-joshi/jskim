@@ -942,9 +942,10 @@ def parse_method(node, call_scope=None, constants=None):
     annotation line), ``end``, ``annotations`` (rich dicts), ``noise_spans``
     (documentation annotations to skip when printing source), ``wiring``
     (constructor that only assigns fields), ``return_type``, ``params``
-    (parsed parameter dicts), ``calls``.
+    (parsed parameter dicts), ``calls``, ``raw_calls``.
     """
     mods = get_modifiers_node(node)
+    raw_calls = extract_raw_method_calls(node)
     return {
         "name": get_method_name(node),
         "kind": _method_kind(node),
@@ -958,7 +959,11 @@ def parse_method(node, call_scope=None, constants=None):
         "wiring": _is_wiring_constructor(node),
         "return_type": _get_return_type(node),
         "params": parse_parameters(_get_formal_parameters(node)),
-        "calls": extract_method_calls(node, call_scope),
+        "calls": [
+            call for call in raw_calls
+            if not _is_noise_call(call) and _is_traceable_call(call, call_scope)
+        ],
+        "raw_calls": raw_calls,
     }
 
 
@@ -1066,6 +1071,20 @@ def _is_traceable_call(call, scope):
     return owner[:1].isupper() and not _CONSTANT_NAME_RE.fullmatch(owner)
 
 
+def extract_raw_method_calls(method_node):
+    """Extract raw normalized method calls from a method/constructor body.
+
+    Returns a deduplicated sorted list of normalized call strings before noise
+    or scope filtering.
+    """
+    body = method_node.child_by_field_name("body")
+    if body is None:
+        return []
+    calls = set()
+    _collect_method_calls(body, calls)
+    return sorted(calls)
+
+
 def extract_method_calls(method_node, call_scope=None):
     """Extract method calls from a method/constructor body.
 
@@ -1084,13 +1103,9 @@ def extract_method_calls(method_node, call_scope=None):
 
     Boilerplate noise is filtered via NOISE_CALL_OBJECTS / NOISE_CALL_METHODS.
     """
-    body = method_node.child_by_field_name("body")
-    if body is None:
-        return []
-    calls = set()
-    _collect_method_calls(body, calls)
+    raw = extract_raw_method_calls(method_node)
     return [
-        call for call in sorted(calls)
+        call for call in raw
         if not _is_noise_call(call) and _is_traceable_call(call, call_scope)
     ]
 
@@ -1474,6 +1489,36 @@ def walk_types(types, prefix=""):
         label = f"{prefix}{t['name']}"
         yield label, t
         yield from walk_types(t["inner_types"], f"{label}.")
+
+
+def resolve_target_class(target, caller_class, known_classes=None):
+    """Resolve a call target name to a class in ``known_classes`` relative to ``caller_class``.
+
+    Walks the enclosing class hierarchy of ``caller_class`` from innermost to
+    outermost, checking whether ``target`` matches the enclosing class itself
+    or an immediate member type of that enclosing class. Falls back to matching
+    a known class directly (e.g. top-level class or fully-qualified class label).
+    """
+    if not target:
+        return None
+
+    classes = set(known_classes) if known_classes else set()
+
+    if caller_class:
+        parts = caller_class.split(".")
+        scopes = [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+        for s in scopes:
+            s_simple = s.rsplit(".", 1)[-1]
+            if target == s or target == s_simple or s.endswith("." + target):
+                return s
+            candidate = f"{s}.{target}"
+            if candidate in classes:
+                return candidate
+
+    if target in classes:
+        return target
+
+    return None
 
 
 def instance_fields(type_info):

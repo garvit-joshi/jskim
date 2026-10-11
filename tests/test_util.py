@@ -25,6 +25,8 @@ from jskim.util import (
     is_field_final,
     is_field_static,
     extract_method_calls,
+    extract_raw_method_calls,
+    resolve_target_class,
     build_call_scope,
     get_javadoc_summary,
     walk_types,
@@ -937,6 +939,25 @@ class TestExtractMethodCalls:
         calls = extract_method_calls(method)
         assert calls == ["notifyStakeholders", "order.getExtras", "orderRepo.save", "validator.validate"]
 
+    def test_extract_raw_method_calls_preserves_noise_and_qualified_helpers(self):
+        source = b"""
+        class S {
+            void process(Optional<String> opt) {
+                S.get();
+                S.of();
+                opt.get();
+                Stream.of("x");
+                this.validate();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        raw = extract_raw_method_calls(method)
+        assert raw == ["S.get", "S.of", "Stream.of", "opt.get", "validate"]
+        # extract_method_calls filters noise methods on objects
+        filtered = extract_method_calls(method)
+        assert filtered == ["validate"]
+
 
 # ---------------------------------------------------------------------------
 # Spring annotation helpers
@@ -1751,6 +1772,23 @@ class TestMethodLines:
         t = _first_type("class C { C(A a) { this.a = a; } C(A a, int n) { this.a = a; this.n = n + 1; } }")
         assert [m["wiring"] for m in t["methods"]] == [True, False]
 
+    def test_raw_calls_and_filtered_calls_recorded(self):
+        t = _first_type("""
+        class C {
+            void run() {
+                C.get();
+                validate();
+            }
+            static void get() {}
+            void validate() {}
+        }
+        """)
+        m = t["methods"][0]
+        assert "raw_calls" in m
+        assert m["raw_calls"] == ["C.get", "validate"]
+        # In filtered calls, C.get is dropped as noise, while validate is kept
+        assert m["calls"] == ["validate"]
+
 
 # ---------------------------------------------------------------------------
 # get_javadoc_summary / walk_types / format_static_field / nested types
@@ -1850,3 +1888,50 @@ class TestAnnotationConstantResolution:
             "@RequiresPermission(value = CREATE)",
             '@RequiresPermission("lit")',
         ]
+
+
+class TestResolveTargetClass:
+    def test_top_level_self(self):
+        assert resolve_target_class("S", "S", {"S"}) == "S"
+
+    def test_nested_self(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("Inner", "Outer.Inner", known) == "Outer.Inner"
+        assert resolve_target_class("Outer.Inner", "Outer.Inner", known) == "Outer.Inner"
+
+    def test_nested_ancestor(self):
+        known = {"Outer", "Outer.A", "Outer.A.Inner"}
+        assert resolve_target_class("Outer", "Outer.A.Inner", known) == "Outer"
+        assert resolve_target_class("A", "Outer.A.Inner", known) == "Outer.A"
+        assert resolve_target_class("Outer.A", "Outer.A.Inner", known) == "Outer.A"
+
+    def test_nested_child_from_enclosing(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("Inner", "Outer", known) == "Outer.Inner"
+
+    def test_nested_sibling(self):
+        known = {"Outer", "Outer.Sibling1", "Outer.Sibling2"}
+        assert resolve_target_class("Sibling2", "Outer.Sibling1", known) == "Outer.Sibling2"
+
+    def test_sibling_nested_classes_with_same_simple_name(self):
+        known = {"Outer", "Outer.A", "Outer.A.Inner", "Outer.B", "Outer.B.Inner"}
+        # From within A.Inner, "Inner" refers to A.Inner, not B.Inner
+        assert resolve_target_class("Inner", "Outer.A.Inner", known) == "Outer.A.Inner"
+        # From within B.Inner, "Inner" refers to B.Inner, not A.Inner
+        assert resolve_target_class("Inner", "Outer.B.Inner", known) == "Outer.B.Inner"
+        # From within A, "Inner" refers to A.Inner
+        assert resolve_target_class("Inner", "Outer.A", known) == "Outer.A.Inner"
+        # From within B, "Inner" refers to B.Inner
+        assert resolve_target_class("Inner", "Outer.B", known) == "Outer.B.Inner"
+        # From Outer, simple "Inner" is ambiguous and does not match
+        assert resolve_target_class("Inner", "Outer", known) is None
+        # From Outer, qualified relative paths resolve correctly
+        assert resolve_target_class("A.Inner", "Outer", known) == "Outer.A.Inner"
+        assert resolve_target_class("B.Inner", "Outer", known) == "Outer.B.Inner"
+
+    def test_unknown_receiver_resolves_to_none(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("repo", "Outer.Inner", known) is None
+        assert resolve_target_class("opt", "Outer.Inner", known) is None
+        assert resolve_target_class("", "Outer.Inner", known) is None
+        assert resolve_target_class(None, "Outer.Inner", known) is None

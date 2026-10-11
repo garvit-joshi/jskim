@@ -13,7 +13,13 @@ Outputs method bodies with surrounding context:
 import sys
 from pathlib import Path
 
-from .util import parse_java_source, instance_fields, format_method_annotations, walk_types
+from .util import (
+    parse_java_source,
+    instance_fields,
+    format_method_annotations,
+    walk_types,
+    resolve_target_class,
+)
 
 
 def parse_methods(content, source_name=None):
@@ -22,6 +28,7 @@ def parse_methods(content, source_name=None):
     types = parsed["types"]
     primary = types[0] if types else None
 
+    classes = [label for label, _ in walk_types(types)]
     methods = []
     for label, t in walk_types(types):
         for m in t["methods"]:
@@ -35,12 +42,14 @@ def parse_methods(content, source_name=None):
                 "annotations": format_method_annotations(m),
                 "class_name": label,
                 "calls": m.get("calls", []),
+                "raw_calls": m.get("raw_calls", []),
             })
 
     return {
         "package": parsed["package"],
         "class_name": primary["name"] if primary else None,
         "class_declaration": primary["declaration"] if primary else None,
+        "classes": classes,
         "fields": [
             f"{f['type']} {f['name']}" if f["name"] else f["type"]
             for f in (instance_fields(primary) if primary else [])
@@ -136,26 +145,31 @@ def extract_methods(parsed, method_names):
         out.append("")
 
     matched_names = {m["name"] for m in matches}
+    known_classes = set(
+        parsed.get("classes")
+        or [om.get("class_name") for om in parsed["methods"] if om.get("class_name")]
+    )
     called = []
     for om in parsed["methods"]:
         if om["name"] in matched_names:
             continue
         om_cls = om.get("class_name", "")
-        om_simple = om_cls.rsplit(".", 1)[-1] if om_cls else ""
         name = om["name"]
         is_called = False
         for m in matches:
             m_cls = m.get("class_name", "")
-            for c in m.get("calls", []):
+            for c in m.get("raw_calls", m.get("calls", [])):
                 if "." not in c:
                     if c == name and om_cls == m_cls:
                         is_called = True
                         break
                 else:
                     target, called_name = c.rsplit(".", 1)
-                    if called_name == name and (target == om_cls or (om_simple and target == om_simple)):
-                        is_called = True
-                        break
+                    if called_name == name:
+                        resolved_cls = resolve_target_class(target, m_cls, known_classes)
+                        if resolved_cls == om_cls:
+                            is_called = True
+                            break
             if is_called:
                 break
         if is_called:
