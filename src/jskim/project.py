@@ -23,7 +23,7 @@ from pathlib import Path
 from .util import (
     parse_java_source, instance_fields, format_enum_constants, format_annotation,
     extract_mapping_paths, extract_request_method, extract_first_annotation_string,
-    walk_types, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
+    walk_types, _strip_type_details, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
     SPRING_STEREOTYPES, CONTROLLER_ANNOTATIONS, INJECTION_ANNOTATIONS,
     KEY_CLASS_ANNOTATIONS, ENUM_CONSTANTS_MAP_MAX, MAP_COLLAPSED_KINDS, MAP_LINE_WIDTH, SKIP_DIRS,
 )
@@ -42,16 +42,6 @@ def _join_paths(base, method_path):
     if not method_path:
         return base if base.startswith("/") else "/" + base
     return base.rstrip("/") + "/" + method_path.lstrip("/")
-
-
-def _strip_type_details(type_name):
-    """Strip generics and array suffixes from a type reference."""
-    if not type_name:
-        return None
-    cleaned = type_name.split("<", 1)[0].strip()
-    while cleaned.endswith("[]"):
-        cleaned = cleaned[:-2].strip()
-    return cleaned
 
 
 def _bean_dependencies(t, is_bean):

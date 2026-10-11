@@ -1011,7 +1011,17 @@ def _is_noise_call(call_str):
 _CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]{2,}")
 
 
-def build_call_scope(package, imports, static_members, field_names=()):
+def _strip_type_details(type_name):
+    """Strip generics and array suffixes from a type reference."""
+    if not type_name:
+        return None
+    cleaned = type_name.split("<", 1)[0].strip()
+    while cleaned.endswith("[]"):
+        cleaned = cleaned[:-2].strip()
+    return cleaned
+
+
+def build_call_scope(package, imports, static_members, field_names=(), super_types=()):
     """Build the scope that decides which method calls are followable.
 
     ``foreign`` holds simple names imported from outside the project root
@@ -1020,6 +1030,8 @@ def build_call_scope(package, imports, static_members, field_names=()):
     them (``TRIP.fields()``) or to them (``assertThat(...)``) lead outside
     the class. ``fields`` are the class's own instance field names; static
     fields are not followable because the summary lists them by name only.
+    ``super_types`` holds interface and superclass names whose default or
+    inherited methods can be called via qualified super (e.g. ``I.super::audit``).
     """
     root = ".".join(package.split(".")[:2]) if package else None
     foreign = set()
@@ -1035,6 +1047,7 @@ def build_call_scope(package, imports, static_members, field_names=()):
         "foreign": foreign,
         "static_members": set(static_members),
         "fields": set(field_names),
+        "super_types": set(super_types),
     }
 
 
@@ -1045,7 +1058,7 @@ def _is_traceable_call(call, scope):
     if "." not in call:
         return call not in scope["static_members"]
     owner = call.rsplit(".", 1)[0]
-    if owner == "super" or owner in scope["fields"]:
+    if owner == "super" or owner in scope["fields"] or owner in scope.get("super_types", ()):
         return True
     if owner in scope["static_members"] or owner in scope["foreign"]:
         return False
@@ -1283,7 +1296,7 @@ def get_javadoc_summary(node):
     return sentence
 
 
-def parse_type_members(members, call_scope=None, constants=None, component_names=()):
+def parse_type_members(members, call_scope=None, constants=None, component_names=(), super_types=()):
     """Parse fields, methods, nested types and static initializers from members.
 
     Returns ``{"fields", "methods", "inner_types", "static_initializers"}``.
@@ -1299,6 +1312,7 @@ def parse_type_members(members, call_scope=None, constants=None, component_names
             fields.extend(parse_field(member))
     scope = dict(call_scope or build_call_scope(None, (), ()))
     scope["fields"] = scope["fields"] | set(component_names) | {f["name"] for f in fields if not f["static"]}
+    scope["super_types"] = scope.get("super_types", set()) | set(super_types)
 
     methods = []
     inner_types = []
@@ -1312,7 +1326,9 @@ def parse_type_members(members, call_scope=None, constants=None, component_names
                 "end": member.end_point[0] + 1,
             })
         elif member.type in INNER_TYPE_NODES:
-            inner_types.append(parse_type(member, call_scope))
+            inner_scope = dict(call_scope or build_call_scope(None, (), ()))
+            inner_scope["super_types"] = inner_scope.get("super_types", set()) | set(super_types)
+            inner_types.append(parse_type(member, inner_scope))
 
     return {
         "fields": fields,
@@ -1376,6 +1392,14 @@ def parse_type(decl_node, call_scope=None):
     info["permits"] = [_normalize_ws(p) for p in get_permits(decl_node)]
     info["constants"] = constants
 
+    super_types = {
+        _strip_type_details(t).rsplit(".", 1)[-1]
+        for t in ([info["extends"]] + info["implements"])
+        if t
+    }
+    if info.get("name"):
+        super_types.add(info["name"])
+
     record_fields = [
         {
             "type": c["type"], "name": c["name"], "annotations": c["annotations"],
@@ -1384,7 +1408,7 @@ def parse_type(decl_node, call_scope=None):
         }
         for c in extract_record_components(decl_node)
     ]
-    parsed = parse_type_members(members, call_scope, constants, [f["name"] for f in record_fields])
+    parsed = parse_type_members(members, call_scope, constants, [f["name"] for f in record_fields], super_types)
     info["fields"] = record_fields + parsed["fields"]
     info["methods"] = parsed["methods"]
     info["inner_types"] = parsed["inner_types"]
