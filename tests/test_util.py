@@ -1765,6 +1765,84 @@ class TestCallScope:
         assert not _is_traceable_call("VendorBase.work", scope)
         assert not _is_traceable_call("VendorBase.run", scope)
 
+    def test_parameter_shadowing_field_drops_call_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+            AuditService audit;
+
+            void run(Other repo) {
+                repo.save();
+                items.forEach(repo::save);
+                audit.log();
+            }
+
+            void clean() {
+                repo.save();
+            }
+        }
+        """)
+        run_calls = t["methods"][0]["calls"]
+        assert "repo.save" not in run_calls
+        assert "audit.log" in run_calls
+
+        clean_calls = t["methods"][1]["calls"]
+        assert "repo.save" in clean_calls
+
+    def test_local_variable_shadowing_field_drops_call_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+
+            void run() {
+                Other repo = new Other();
+                repo.save();
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert "repo.save" not in calls
+
+    def test_loop_and_catch_shadowing_field_drops_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+
+            void forLoop(List<Other> items) {
+                for (Other repo : items) {
+                    repo.save();
+                }
+            }
+
+            void catchBlock() {
+                try {
+                    work();
+                } catch (OtherException repo) {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        assert "repo.save" not in t["methods"][0]["calls"]
+        assert "repo.save" not in t["methods"][1]["calls"]
+
+    def test_extract_method_calls_respects_shadowed_fields(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            void run(Other repo) {
+                repo.save();
+                audit.log();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo", "audit"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["audit.log"]
+
 
 
 # ---------------------------------------------------------------------------

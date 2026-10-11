@@ -46,6 +46,17 @@ CALL_NODES = {"method_invocation", "method_reference"}
 
 TYPE_BODY_NODES = {"class_body", "interface_body", "enum_body", "annotation_type_body"}
 
+LOCAL_DECLARATION_NODES = {
+    "variable_declarator",
+    "formal_parameter",
+    "spread_parameter",
+    "catch_formal_parameter",
+    "enhanced_for_statement",
+    "resource",
+}
+
+PATTERN_VARIABLE_NODES = {"type_pattern", "record_pattern_component"}
+
 MODIFIER_KEYWORDS = {
     "public", "private", "protected", "static", "final",
     "abstract", "synchronized", "native", "default",
@@ -946,6 +957,7 @@ def parse_method(node, call_scope=None, constants=None):
     """
     mods = get_modifiers_node(node)
     raw_calls = extract_raw_method_calls(node)
+    effective_scope = _method_call_scope(node, call_scope)
     return {
         "name": get_method_name(node),
         "kind": _method_kind(node),
@@ -961,7 +973,7 @@ def parse_method(node, call_scope=None, constants=None):
         "params": parse_parameters(_get_formal_parameters(node)),
         "calls": [
             call for call in raw_calls
-            if not _is_noise_call(call) and _is_traceable_call(call, call_scope)
+            if not _is_noise_call(call) and _is_traceable_call(call, effective_scope)
         ],
         "raw_calls": raw_calls,
     }
@@ -1079,6 +1091,48 @@ def _is_traceable_call(call, scope):
     return all(p[:1].isupper() for p in parts)
 
 
+def _collect_local_names(node, names):
+    """Recursively collect local variable and parameter names declared in a method/constructor."""
+    if node.type in TYPE_BODY_NODES:
+        return
+    if node.type in LOCAL_DECLARATION_NODES:
+        name = node.child_by_field_name("name")
+        if name and name.type == "identifier":
+            names.add(name.text.decode())
+    elif node.type in PATTERN_VARIABLE_NODES:
+        for child in node.named_children:
+            if child.type == "identifier":
+                names.add(child.text.decode())
+    elif node.type == "inferred_parameters":
+        for child in node.named_children:
+            if child.type == "identifier":
+                names.add(child.text.decode())
+    elif node.type == "lambda_expression":
+        param = node.child_by_field_name("parameters")
+        if param and param.type == "identifier":
+            names.add(param.text.decode())
+    elif node.type == "instanceof_expression":
+        if len(node.named_children) >= 3 and node.named_children[-1].type == "identifier":
+            names.add(node.named_children[-1].text.decode())
+
+    for child in node.named_children:
+        _collect_local_names(child, names)
+
+
+def _method_call_scope(method_node, call_scope):
+    """Return an effective call scope with shadowed fields removed."""
+    if call_scope is None or not call_scope.get("fields"):
+        return call_scope
+    local_names = set()
+    _collect_local_names(method_node, local_names)
+    shadowed = local_names & call_scope["fields"]
+    if not shadowed:
+        return call_scope
+    scope = dict(call_scope)
+    scope["fields"] = scope["fields"] - shadowed
+    return scope
+
+
 def extract_raw_method_calls(method_node):
     """Extract raw normalized method calls from a method/constructor body.
 
@@ -1107,14 +1161,16 @@ def extract_method_calls(method_node, call_scope=None):
     when the owner is a field or a project class (same package or imported
     from the project root); calls on locals, parameters, static-imported
     members and JDK/library classes are dropped because they cannot be
-    followed from the summary.
+    followed from the summary. Method-local declarations shadow instance
+    fields of the same name, dropping calls on shadowed receivers.
 
     Boilerplate noise is filtered via NOISE_CALL_OBJECTS / NOISE_CALL_METHODS.
     """
+    effective_scope = _method_call_scope(method_node, call_scope)
     raw = extract_raw_method_calls(method_node)
     return [
         call for call in raw
-        if not _is_noise_call(call) and _is_traceable_call(call, call_scope)
+        if not _is_noise_call(call) and _is_traceable_call(call, effective_scope)
     ]
 
 
