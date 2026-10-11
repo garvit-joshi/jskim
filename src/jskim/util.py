@@ -70,6 +70,7 @@ ABRUPT_COMPLETION_NODES = {
     "throw_statement",
     "break_statement",
     "continue_statement",
+    "yield_statement",
 }
 SWITCH_RULE_NODES = {"switch_rule"}
 SWITCH_GROUP_NODES = {"switch_block_statement_group"}
@@ -1118,6 +1119,7 @@ def build_call_scope(package, imports, static_members, field_names=(), super_typ
         elif root is None or not path.startswith(root + "."):
             foreign.add(simple)
     return {
+        "root": root,
         "foreign": foreign,
         "project_types": project_types,
         "static_members": set(static_members),
@@ -1145,7 +1147,12 @@ def _is_traceable_call(call, scope):
         return True
     if any(_CONSTANT_NAME_RE.fullmatch(p) for p in parts):
         return False
-    return all(p[:1].isupper() for p in parts)
+    if not all(p[:1].isupper() for p in parts):
+        project_root = scope.get("root")
+        if project_root and owner.startswith(project_root + "."):
+            return True
+        return False
+    return True
 
 
 def _is_explicit_this(target):
@@ -1184,6 +1191,9 @@ def _declares_variable(node, name):
         n = node.child_by_field_name("name")
         if n and n.type in IDENTIFIER_NODES and n.text.decode() == name:
             return True
+        if n and _declares_variable(n, name):
+            return True
+        return False
     elif node.type in PATTERN_VARIABLE_NODES:
         for child in node.named_children:
             if child.type in IDENTIFIER_NODES and child.text.decode() == name:
@@ -1323,13 +1333,21 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                 else:
                     for child in init.named_children:
                         if child.type in LOCAL_DECLARATION_NODES and child.start_byte <= call_node.start_byte:
-                            if _declares_variable(child, receiver):
-                                return True
+                            name_node = child.child_by_field_name("name")
+                            if name_node:
+                                if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
+                                    return True
+                                if _declares_variable(name_node, receiver):
+                                    return True
                         elif child.type in LOCAL_VAR_DECLARATION_NODES:
                             for decl in child.named_children:
                                 if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
-                                    if _declares_variable(decl, receiver):
-                                        return True
+                                    name_node = decl.child_by_field_name("name")
+                                    if name_node:
+                                        if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
+                                            return True
+                                        if _declares_variable(name_node, receiver):
+                                            return True
             body = curr.child_by_field_name("body")
             if body and _is_descendant(body, call_node):
                 cond = curr.child_by_field_name("condition")
@@ -1389,8 +1407,12 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                 elif child.type in LOCAL_VAR_DECLARATION_NODES:
                     for decl in child.named_children:
                         if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
-                            if _declares_variable(decl, receiver):
-                                return True
+                            name_node = decl.child_by_field_name("name")
+                            if name_node:
+                                if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
+                                    return True
+                                if _declares_variable(name_node, receiver):
+                                    return True
                 elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
                     cond = child.child_by_field_name("condition")
                     consequence = child.child_by_field_name("consequence")
@@ -1406,8 +1428,12 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                 if child.type in LOCAL_VAR_DECLARATION_NODES:
                     for decl in child.named_children:
                         if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
-                            if _declares_variable(decl, receiver):
-                                return True
+                            name_node = decl.child_by_field_name("name")
+                            if name_node:
+                                if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
+                                    return True
+                                if _declares_variable(name_node, receiver):
+                                    return True
                 elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
                     cond = child.child_by_field_name("condition")
                     consequence = child.child_by_field_name("consequence")
@@ -1449,11 +1475,7 @@ def _normalize_call_target(target):
         text = target.text.decode()
         if text.endswith(".super"):
             text = text[:-6]
-        parts = text.split(".")
-        for i, p in enumerate(parts):
-            if p and p[0].isupper():
-                return ".".join(parts[i:])
-        return parts[-1]
+        return text
     if target.type in FIELD_ACCESS_NODES:
         inner_obj = target.child_by_field_name("object")
         field = target.child_by_field_name("field")
@@ -1463,20 +1485,21 @@ def _normalize_call_target(target):
             return field.text.decode()
         field_text = field.text.decode()
         if field_text in THIS_NODES and inner_obj:
-            text = inner_obj.text.decode()
-            parts = text.split(".")
-            for i, p in enumerate(parts):
-                if p and p[0].isupper():
-                    return ".".join(parts[i:])
-            return text
+            return inner_obj.text.decode()
         if field_text and field_text[0].isupper():
-            text = target.text.decode()
-            parts = text.split(".")
-            for i, p in enumerate(parts):
-                if p and p[0].isupper():
-                    return ".".join(parts[i:])
-            return field_text
+            return target.text.decode()
     return None
+
+
+def _display_call_target(norm):
+    """Return the display representation of a normalized call target."""
+    if not norm:
+        return norm
+    parts = norm.split(".")
+    for i, p in enumerate(parts):
+        if p and p[0].isupper():
+            return ".".join(parts[i:])
+    return parts[-1]
 
 
 def _record_call(target, method_name, calls):
@@ -1487,7 +1510,8 @@ def _record_call(target, method_name, calls):
     if norm == "":
         calls.add(method_name)
     elif norm:
-        calls.add(f"{norm}.{method_name}")
+        display_norm = _display_call_target(norm)
+        calls.add(f"{display_norm}.{method_name}")
 
 
 def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, method_node=None):
@@ -1497,8 +1521,10 @@ def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, 
     norm = _normalize_call_target(target)
     if norm is None:
         return
+    display_norm = _display_call_target(norm)
     call_str = method_name if norm == "" else f"{norm}.{method_name}"
-    if _is_noise_call(call_str):
+    display_call = method_name if display_norm == "" else f"{display_norm}.{method_name}"
+    if _is_noise_call(call_str) or _is_noise_call(display_call):
         return
     if call_scope is not None:
         if not _is_traceable_call(call_str, call_scope):
@@ -1507,7 +1533,7 @@ def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, 
             if not _is_explicit_this(target) and method_node is not None:
                 if _is_call_receiver_shadowed(call_node, norm, method_node):
                     return
-    calls.add(call_str)
+    calls.add(display_call)
 
 
 def _collect_method_calls(node, calls, call_scope=None, method_node=None, raw=False):

@@ -2332,6 +2332,50 @@ class TestGuardPatternAbruptCompletion:
         """)
         assert t["methods"][0]["calls"] == []
 
+    def test_guard_yield_scopes_remainder_in_switch_expression(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            int process(int mode, Object obj) {
+                return switch (mode) {
+                    case 1 -> {
+                        if (!(obj instanceof Other repo)) yield 0;
+                        repo.save();
+                        yield 1;
+                    }
+                    default -> 0;
+                };
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_local_var_initializer_pattern_does_not_shadow_subsequent_field_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void run(Object obj) {
+                boolean flag = obj instanceof Other repo;
+                repo.flush();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["repo.flush"]
+
+    def test_fully_qualified_external_reference_filtered_without_import(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            void run(java.util.List<Object> items) {
+                items.forEach(java.util.Map.Entry::getKey);
+                items.forEach(com.acme.service.BillingService::charge);
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["BillingService.charge"]
+
 
 class TestEnhancedForHeaderScoping:
     def test_loop_header_only_scanned_for_loop_wide_shadow(self):

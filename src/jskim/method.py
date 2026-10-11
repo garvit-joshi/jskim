@@ -20,6 +20,7 @@ from .util import (
     walk_types,
     resolve_target_class,
     get_type_and_supertypes,
+    strip_type_details,
 )
 
 
@@ -181,7 +182,24 @@ def extract_methods(parsed, method_names):
                         break
             else:
                 target, called_name = c.rsplit(".", 1)
-                resolved_cls = resolve_target_class(target, m_cls, known_classes)
+                if target == "super":
+                    parent_ext = type_map.get(m_cls, {}).get("extends")
+                    if parent_ext:
+                        parent_clean = strip_type_details(parent_ext)
+                        resolved_cls = resolve_target_class(parent_clean, m_cls, known_classes) or parent_clean
+                    else:
+                        resolved_cls = None
+                elif target.endswith(".super"):
+                    qualifier = target[:-6]
+                    resolved_qual = resolve_target_class(qualifier, m_cls, known_classes) or qualifier
+                    parent_ext = type_map.get(resolved_qual, {}).get("extends")
+                    if parent_ext:
+                        parent_clean = strip_type_details(parent_ext)
+                        resolved_cls = resolve_target_class(parent_clean, resolved_qual, known_classes) or parent_clean
+                    else:
+                        resolved_cls = None
+                else:
+                    resolved_cls = resolve_target_class(target, m_cls, known_classes)
                 if resolved_cls is not None:
                     search_classes = get_type_and_supertypes(resolved_cls, type_map, known_classes)
                     for target_cls in search_classes:

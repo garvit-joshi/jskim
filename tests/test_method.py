@@ -304,6 +304,23 @@ class TestExtractMethods:
         assert "L3-L3" in output
         assert "L6-L6" not in output
 
+    def test_called_methods_plain_super_target_resolves_superclass(self):
+        content = """
+        class Base {
+            void validate() {}
+        }
+        class Sub extends Base {
+            void run() {
+                super.validate();
+                Runnable r = super::validate;
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["run"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+
     def test_called_methods_qualified_same_class_helpers_preserved(self):
         content = """
         class S {
