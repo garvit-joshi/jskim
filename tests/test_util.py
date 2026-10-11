@@ -1730,6 +1730,27 @@ class TestCallScope:
         assert not _is_traceable_call("CONST.run", scope)
         assert _is_traceable_call("I.audit", scope)
 
+    def test_call_scope_filters_class_qualified_constants(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme", (), (), field_names=(), super_types={"I"})
+        assert not _is_traceable_call("Singleton.INSTANCE.run", scope)
+        assert not _is_traceable_call("MyClass.FOO_BAR.run", scope)
+        assert _is_traceable_call("Outer.Inner.run", scope)
+
+    def test_method_calls_filters_class_qualified_constants_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            void run() {
+                Singleton.INSTANCE.run();
+                Outer.Inner.process();
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert "Singleton.INSTANCE.run" not in calls
+        assert "Outer.Inner.process" in calls
+
 
 
 # ---------------------------------------------------------------------------

@@ -149,31 +149,37 @@ def extract_methods(parsed, method_names):
         parsed.get("classes")
         or [om.get("class_name") for om in parsed["methods"] if om.get("class_name")]
     )
-    called = []
-    for om in parsed["methods"]:
-        if om["name"] in matched_names:
-            continue
-        om_cls = om.get("class_name", "")
-        name = om["name"]
-        is_called = False
-        for m in matches:
-            m_cls = m.get("class_name", "")
-            for c in m.get("raw_calls", m.get("calls", [])):
-                if "." not in c:
-                    if c == name and om_cls == m_cls:
-                        is_called = True
+    called_ids = set()
+    for m in matches:
+        m_cls = m.get("class_name", "")
+        parts = m_cls.split(".") if m_cls else []
+        enclosing_classes = [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+        if not enclosing_classes:
+            enclosing_classes = [""]
+
+        for c in m.get("raw_calls", m.get("calls", [])):
+            if "." not in c:
+                for enc_cls in enclosing_classes:
+                    matching = [
+                        x for x in parsed["methods"]
+                        if x["name"] == c and x.get("class_name", "") == enc_cls
+                    ]
+                    if matching:
+                        for x in matching:
+                            called_ids.add(id(x))
                         break
-                else:
-                    target, called_name = c.rsplit(".", 1)
-                    if called_name == name:
-                        resolved_cls = resolve_target_class(target, m_cls, known_classes)
-                        if resolved_cls == om_cls:
-                            is_called = True
-                            break
-            if is_called:
-                break
-        if is_called:
-            called.append(om)
+            else:
+                target, called_name = c.rsplit(".", 1)
+                resolved_cls = resolve_target_class(target, m_cls, known_classes)
+                if resolved_cls is not None:
+                    for x in parsed["methods"]:
+                        if x["name"] == called_name and x.get("class_name", "") == resolved_cls:
+                            called_ids.add(id(x))
+
+    called = [
+        om for om in parsed["methods"]
+        if om["name"] not in matched_names and id(om) in called_ids
+    ]
     if called:
         out.append("// --- called methods in same class ---")
         for c in called:

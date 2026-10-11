@@ -1068,7 +1068,10 @@ def _is_traceable_call(call, scope):
     if owner in scope["static_members"] or owner in scope["foreign"]:
         return False
     # CamelCase owners are classes (static calls); ALL_CAPS owners are constants.
-    return owner[:1].isupper() and not _CONSTANT_NAME_RE.fullmatch(owner)
+    parts = owner.split(".")
+    if any(_CONSTANT_NAME_RE.fullmatch(p) for p in parts):
+        return False
+    return all(p[:1].isupper() for p in parts)
 
 
 def extract_raw_method_calls(method_node):

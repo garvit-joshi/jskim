@@ -429,6 +429,83 @@ class TestExtractMethods:
         assert "called methods in same class" in output
         assert "audit()" in output
 
+    def test_called_methods_bare_inner_class_resolves_to_enclosing(self):
+        content = """
+        class Outer {
+            void validate() {}
+            class Inner {
+                void process() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+        assert "L3-L3" in output
+
+    def test_called_methods_bare_inner_class_shadowing(self):
+        content = """
+        class Outer {
+            void validate() {}
+            class Inner {
+                void validate() {}
+                void process() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "L5-L5" in output
+        assert "L3-L3" not in output
+
+    def test_called_methods_bare_inner_class_multilevel_enclosing(self):
+        content = """
+        class Outer {
+            void audit() {}
+            class Middle {
+                void audit() {}
+                class Inner {
+                    void process() {
+                        audit();
+                    }
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        # Middle.audit (L5) shadows Outer.audit (L3)
+        assert "L5-L5" in output
+        assert "L3-L3" not in output
+
+    def test_called_methods_bare_inner_class_sibling_isolated(self):
+        content = """
+        class Outer {
+            static class A {
+                static class Inner {
+                    void processA() {
+                        validate();
+                    }
+                }
+            }
+            static class B {
+                static class Inner {
+                    static void validate() {}
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["processA"])
+        assert "called methods in same class" not in output
+
     def test_fields_shown(self):
         content = load_fixture("StaticFieldService.java")
         parsed = parse_methods(content)
