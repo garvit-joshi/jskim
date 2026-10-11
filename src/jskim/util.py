@@ -1008,7 +1008,7 @@ def _is_noise_call(call_str):
     return obj in NOISE_CALL_OBJECTS or method in NOISE_CALL_METHODS
 
 
-_CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]{2,}")
+_CONSTANT_NAME_RE = re.compile(r"[A-Z0-9_]+")
 
 
 def _strip_type_details(type_name):

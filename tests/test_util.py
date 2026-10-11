@@ -1702,6 +1702,14 @@ class TestCallScope:
             "super.audit",
         ]
 
+    def test_call_scope_filters_one_letter_constant(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme", (), (), field_names=(), super_types={"I"})
+        assert not _is_traceable_call("X.run", scope)
+        assert not _is_traceable_call("CONST.run", scope)
+        assert _is_traceable_call("I.audit", scope)
+
+
 
 # ---------------------------------------------------------------------------
 # parse_method: signature line, noise spans, wiring

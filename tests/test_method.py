@@ -265,6 +265,25 @@ class TestExtractMethods:
         assert "called methods in same class" in output
         assert "validate()" in output
 
+    def test_called_methods_unqualified_scoped_to_declaring_class(self):
+        content = """
+        class Outer {
+            void validate() {}
+            static class Inner {
+                void process() {
+                    this.validate();
+                    Runnable r = this::validate;
+                }
+                void validate() {}
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "L9-L9" in output
+        assert "L3-L3" not in output
+
     def test_fields_shown(self):
         content = load_fixture("StaticFieldService.java")
         parsed = parse_methods(content)

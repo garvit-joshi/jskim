@@ -136,19 +136,29 @@ def extract_methods(parsed, method_names):
         out.append("")
 
     matched_names = {m["name"] for m in matches}
-    match_calls = {c for m in matches for c in m.get("calls", [])}
     called = []
     for om in parsed["methods"]:
         if om["name"] in matched_names:
             continue
         om_cls = om.get("class_name", "")
-        om_simple = om_cls.rsplit(".", 1)[-1]
+        om_simple = om_cls.rsplit(".", 1)[-1] if om_cls else ""
         name = om["name"]
-        if (
-            name in match_calls
-            or f"{om_cls}.{name}" in match_calls
-            or (om_simple and f"{om_simple}.{name}" in match_calls)
-        ):
+        is_called = False
+        for m in matches:
+            m_cls = m.get("class_name", "")
+            for c in m.get("calls", []):
+                if "." not in c:
+                    if c == name and om_cls == m_cls:
+                        is_called = True
+                        break
+                else:
+                    target, called_name = c.rsplit(".", 1)
+                    if called_name == name and (target == om_cls or (om_simple and target == om_simple)):
+                        is_called = True
+                        break
+            if is_called:
+                break
+        if is_called:
             called.append(om)
     if called:
         out.append("// --- called methods in same class ---")
