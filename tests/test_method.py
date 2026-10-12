@@ -321,6 +321,24 @@ class TestExtractMethods:
         assert "called methods in same class" in output
         assert "validate()" in output
 
+    def test_called_methods_interface_qualified_super_resolves_interface(self):
+        content = """
+        interface AuditApi {
+            default void audit() {}
+        }
+        class Service implements AuditApi {
+            void run() {
+                AuditApi.super.audit();
+                Runnable r = AuditApi.super::audit;
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["run"])
+        assert "called methods in same class" in output
+        assert "audit()" in output
+
+
     def test_called_methods_qualified_same_class_helpers_preserved(self):
         content = """
         class S {

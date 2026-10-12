@@ -197,7 +197,7 @@ def extract_methods(parsed, method_names):
                         parent_clean = strip_type_details(parent_ext)
                         resolved_cls = resolve_target_class(parent_clean, resolved_qual, known_classes) or parent_clean
                     else:
-                        resolved_cls = None
+                        resolved_cls = resolved_qual
                 else:
                     resolved_cls = resolve_target_class(target, m_cls, known_classes)
                 if resolved_cls is not None:

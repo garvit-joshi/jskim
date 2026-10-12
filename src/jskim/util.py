@@ -72,6 +72,12 @@ ABRUPT_COMPLETION_NODES = {
     "continue_statement",
     "yield_statement",
 }
+BREAK_NODES = {"break_statement"}
+DO_WHILE_NODES = {"do_statement"}
+SWITCH_STATEMENT_NODES = {"switch_statement", "switch_expression"}
+LOOP_AND_SWITCH_NODES = (
+    FOR_NODES | ENHANCED_FOR_NODES | WHILE_NODES | DO_WHILE_NODES | SWITCH_STATEMENT_NODES
+)
 SWITCH_RULE_NODES = {"switch_rule"}
 SWITCH_GROUP_NODES = {"switch_block_statement_group"}
 SWITCH_LABEL_NODES = {"switch_label"}
@@ -1096,7 +1102,7 @@ def strip_type_details(type_name):
 _strip_type_details = strip_type_details
 
 
-def build_call_scope(package, imports, static_members, field_names=(), super_types=()):
+def build_call_scope(package, imports, static_members, field_names=(), super_types=(), package_types=()):
     """Build the scope that decides which method calls are followable.
 
     ``foreign`` holds simple names imported from outside the project root
@@ -1107,6 +1113,7 @@ def build_call_scope(package, imports, static_members, field_names=(), super_typ
     fields are not followable because the summary lists them by name only.
     ``super_types`` holds interface and superclass names whose default or
     inherited methods can be called via qualified super (e.g. ``I.super::audit``).
+    ``package_types`` holds same-package type names that shadow java.lang types.
     """
     root = ".".join(package.split(".")[:2]) if package else None
     foreign = set()
@@ -1121,6 +1128,8 @@ def build_call_scope(package, imports, static_members, field_names=(), super_typ
             project_types.add(simple)
         elif root is None or not path.startswith(root + "."):
             foreign.add(simple)
+    if package_types:
+        project_types.update(package_types)
     return {
         "root": root,
         "foreign": foreign,
@@ -1299,6 +1308,26 @@ def _statement_completes_abruptly(node):
     return False
 
 
+def _loop_contains_break_targeting(loop_node):
+    """Return True if loop_node contains an unlabelled break statement that exits loop_node."""
+    stack = list(loop_node.children)
+    while stack:
+        curr = stack.pop()
+        if curr.type in BREAK_NODES:
+            label = curr.child_by_field_name("label")
+            if not label:
+                p = curr.parent
+                while p and p != loop_node:
+                    if p.type in LOOP_AND_SWITCH_NODES:
+                        break
+                    p = p.parent
+                if p == loop_node:
+                    return True
+        else:
+            stack.extend(curr.children)
+    return False
+
+
 def _is_preceding_container_child_shadowing(child, call_node, receiver):
     """Return True if a container child statement shadows receiver before call_node."""
     if child.type in LOCAL_VAR_DECLARATION_NODES:
@@ -1321,11 +1350,12 @@ def _is_preceding_container_child_shadowing(child, call_node, receiver):
             if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
                 return True
     elif child.type in WHILE_NODES and child.end_byte <= call_node.start_byte:
-        cond = child.child_by_field_name("condition")
-        if cond:
-            wt, wf = _get_pattern_variables_flow(cond)
-            if receiver in wf:
-                return True
+        if not _loop_contains_break_targeting(child):
+            cond = child.child_by_field_name("condition")
+            if cond:
+                wt, wf = _get_pattern_variables_flow(cond)
+                if receiver in wf:
+                    return True
     return False
 
 
@@ -1388,7 +1418,8 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                                         if _declares_variable(name_node, receiver):
                                             return True
             body = curr.child_by_field_name("body")
-            if body and _is_descendant(body, call_node):
+            update = curr.child_by_field_name("update")
+            if (body and _is_descendant(body, call_node)) or (update and _is_descendant(update, call_node)):
                 cond = curr.child_by_field_name("condition")
                 if cond:
                     wt, _ = _get_pattern_variables_flow(cond)
@@ -1881,7 +1912,7 @@ def parse_implicit_type(program_members, source_name=None, call_scope=None):
     return info
 
 
-def parse_java_source(content, source_name=None):
+def parse_java_source(content, source_name=None, package_types=None):
     """Parse Java source text into the shared structure every mode consumes.
 
     Returns ``{"package", "package_annotations", "imports", "types",
@@ -1895,7 +1926,17 @@ def parse_java_source(content, source_name=None):
         source_bytes = content.encode("utf-8")
         text = content
     structure = parse_file_structure(source_bytes)
-    scope = build_call_scope(structure["package"], structure["imports"], structure["static_members"])
+    same_pkg = set(package_types or ())
+    for node in structure["type_nodes"]:
+        name = get_declaration_name(node)
+        if name:
+            same_pkg.add(name)
+    scope = build_call_scope(
+        structure["package"],
+        structure["imports"],
+        structure["static_members"],
+        package_types=same_pkg,
+    )
 
     if structure["program_members"]:
         types = [parse_implicit_type(structure["program_members"], source_name, scope)]

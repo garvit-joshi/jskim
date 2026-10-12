@@ -121,10 +121,17 @@ def _type_info(t, filepath, parsed):
     }
 
 
-def scan_java_file(filepath):
+def scan_java_file(filepath, package_types=None):
     """Parse one Java file into a file dict with one row per top-level type."""
+    if package_types is None:
+        try:
+            path_obj = Path(filepath)
+            if path_obj.parent.is_dir():
+                package_types = {p.stem for p in path_obj.parent.glob("*.java")}
+        except Exception:
+            package_types = None
     content = filepath.read_text(encoding="utf-8", errors="replace")
-    parsed = parse_java_source(content, source_name=filepath)
+    parsed = parse_java_source(content, source_name=filepath, package_types=package_types)
     return {
         "filepath": filepath,
         "package": parsed["package"],
@@ -416,18 +423,21 @@ def _resolve_call_target(call, source_method, indexes, methods_by_class_name=Non
     """Resolve one extracted call string to a project class and method name."""
     if "." not in call:
         if methods_by_class_name and (source_method["fq_class"], call) in methods_by_class_name:
-            return source_method["fq_class"], call
+            return source_method["fq_class"], call, source_method["fq_class"], False
         inherited = _find_inherited_method_owner(
             source_method["fq_class"], call, type_infos_by_fqn, methods_by_class_name, indexes
         )
         if inherited:
-            return inherited, call
-        return source_method["fq_class"], call
+            return inherited, call, source_method["fq_class"], False
+        return source_method["fq_class"], call, source_method["fq_class"], False
 
     owner, method_name = call.rsplit(".", 1)
+    is_super = False
     if owner == "super":
+        is_super = True
         type_name = source_method["info"].get("extends")
     elif owner.endswith(".super"):
+        is_super = True
         qualifier = owner[:-6]
         fq_qual = _resolve_type_reference(qualifier, source_method["info"], indexes)
         if fq_qual and type_infos_by_fqn and fq_qual in type_infos_by_fqn:
@@ -449,6 +459,8 @@ def _resolve_call_target(call, source_method, indexes, methods_by_class_name=Non
     if not fq_class:
         return None
 
+    receiver_class = fq_class if not is_super else None
+
     if methods_by_class_name and type_infos_by_fqn and (fq_class, method_name) not in methods_by_class_name:
         inherited = _find_inherited_method_owner(
             fq_class, method_name, type_infos_by_fqn, methods_by_class_name, indexes
@@ -456,7 +468,7 @@ def _resolve_call_target(call, source_method, indexes, methods_by_class_name=Non
         if inherited:
             fq_class = inherited
 
-    return fq_class, method_name
+    return fq_class, method_name, receiver_class, is_super
 
 
 def _subtypes_index(type_infos, indexes):
@@ -525,8 +537,17 @@ def _build_call_graph(type_infos):
             )
             if not resolved:
                 continue
-            fq_class, method_name = resolved
-            for target_class in _with_subtypes(fq_class, subtypes):
+            declaring_class, method_name, receiver_class, is_super = resolved
+            if is_super:
+                target_classes = [declaring_class]
+            elif receiver_class:
+                target_classes = [declaring_class] + [
+                    c for c in _with_subtypes(receiver_class, subtypes) if c != declaring_class
+                ]
+            else:
+                target_classes = _with_subtypes(declaring_class, subtypes)
+
+            for target_class in target_classes:
                 candidates = methods_by_class_name.get((target_class, method_name), [])
                 if len(candidates) != 1:
                     continue

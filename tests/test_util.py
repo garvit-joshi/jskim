@@ -2478,6 +2478,20 @@ class TestImplicitPlatformMethodReferences:
         """)["types"]
         assert types[0]["methods"][0]["calls"] == ["Callable.execute"]
 
+    def test_same_package_type_shadows_java_lang_name(self):
+        types = parse_java_source("""
+        package com.acme;
+        class User {
+            void run() {
+                Runnable r = Module::validate;
+            }
+        }
+        class Module {
+            static void validate() {}
+        }
+        """)["types"]
+        assert types[0]["methods"][0]["calls"] == ["Module.validate"]
+
 
 class TestWhileLoopFalseFlowScoping:
     def test_while_loop_false_flow_scopes_following_statements(self):
@@ -2494,6 +2508,60 @@ class TestWhileLoopFalseFlowScoping:
         }
         class Repo { void save() {} }
         class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_while_loop_with_break_does_not_propagate_false_flow_pattern(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj, boolean stop) {
+                while (!(obj instanceof Other repo)) {
+                    if (stop) break;
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == ["repo.save"]
+
+    def test_while_loop_with_inner_break_still_propagates_false_flow(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                while (!(obj instanceof Other repo)) {
+                    for (int i = 0; i < 10; i++) {
+                        break;
+                    }
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+
+class TestForLoopConditionPatternScoping:
+    def test_for_loop_condition_pattern_scopes_into_update_expression(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                for (; obj instanceof Other repo; repo.advance()) {
+                    repo.save();
+                }
+            }
+        }
+        class Repo { void advance() {} void save() {} }
+        class Other { void advance() {} void save() {} }
         """)
         assert t["methods"][0]["calls"] == []
 

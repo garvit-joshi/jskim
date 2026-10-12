@@ -829,6 +829,63 @@ class TestCallHierarchyOutput:
         impact = format_impact_output(types, "Service.run", depth=1)
         assert "→ com.acme.one.Repo.save" in impact
 
+    def test_callers_and_impact_inherited_call_does_not_fan_out_to_sibling_override(self, tmp_path):
+        base = """
+        package demo;
+        public class Base {
+            public void validate() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service extends Base {
+            public void run() {
+                validate();
+                Runnable r = this::validate;
+            }
+        }
+        """
+        sibling = """
+        package demo;
+        public class Sibling extends Base {
+            public void validate() {}
+        }
+        """
+        (tmp_path / "Base.java").write_text(base, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Sibling.java").write_text(sibling, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Base.validate" in impact
+        assert "Sibling.validate" not in impact
+        callers = format_callers_output(types, "Sibling.validate", depth=1)
+        assert "Service.run" not in callers
+
+    def test_callers_and_impact_qualified_super_suppresses_subtype_fan_out(self, tmp_path):
+        api = """
+        package demo;
+        public interface AuditApi {
+            default void audit() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service implements AuditApi {
+            public void run() {
+                AuditApi.super.audit();
+                Runnable r = AuditApi.super::audit;
+            }
+            public void audit() {}
+        }
+        """
+        (tmp_path / "AuditApi.java").write_text(api, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ AuditApi.audit" in impact
+        assert "→ Service.audit" not in impact
+
+
 
 
 # ---------------------------------------------------------------------------
