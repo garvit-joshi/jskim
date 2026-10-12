@@ -10,11 +10,18 @@ Outputs method bodies with surrounding context:
   - Other methods called within the same class (signatures only)
 """
 
-import re
 import sys
 from pathlib import Path
 
-from .util import parse_java_source, instance_fields, format_method_annotations, walk_types
+from .util import (
+    parse_java_source,
+    instance_fields,
+    format_method_annotations,
+    walk_types,
+    resolve_target_class,
+    get_type_and_supertypes,
+    strip_type_details,
+)
 
 
 def parse_methods(content, source_name=None):
@@ -23,8 +30,11 @@ def parse_methods(content, source_name=None):
     types = parsed["types"]
     primary = types[0] if types else None
 
+    classes = [label for label, _ in walk_types(types)]
     methods = []
+    type_map = {}
     for label, t in walk_types(types):
+        type_map[label] = t
         for m in t["methods"]:
             methods.append({
                 "name": m["name"],
@@ -35,12 +45,16 @@ def parse_methods(content, source_name=None):
                 "noise_spans": m["noise_spans"],
                 "annotations": format_method_annotations(m),
                 "class_name": label,
+                "calls": m.get("calls", []),
+                "raw_calls": m.get("raw_calls", []),
             })
 
     return {
         "package": parsed["package"],
         "class_name": primary["name"] if primary else None,
         "class_declaration": primary["declaration"] if primary else None,
+        "classes": classes,
+        "type_map": type_map,
         "fields": [
             f"{f['type']} {f['name']}" if f["name"] else f["type"]
             for f in (instance_fields(primary) if primary else [])
@@ -135,14 +149,72 @@ def extract_methods(parsed, method_names):
                 out.append(f"{i + 1:>5} | {all_lines[i]}")
         out.append("")
 
-    method_bodies = "\n".join(
-        all_lines[i] for m in matches for i in range(m["start"] - 1, m["end"])
-    )
     matched_names = {m["name"] for m in matches}
+    known_classes = set(
+        parsed.get("classes")
+        or [om.get("class_name") for om in parsed["methods"] if om.get("class_name")]
+    )
+    type_map = parsed.get("type_map") or {}
+    called_ids = set()
+    for m in matches:
+        m_cls = m.get("class_name", "")
+        parts = m_cls.split(".") if m_cls else []
+        enclosing_classes = [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+        if not enclosing_classes:
+            enclosing_classes = [""]
+
+        for c in m.get("raw_calls", m.get("calls", [])):
+            if "." not in c:
+                matched_unqualified = False
+                for enc_cls in enclosing_classes:
+                    search_classes = get_type_and_supertypes(enc_cls, type_map, known_classes)
+                    for target_cls in search_classes:
+                        matching = [
+                            x for x in parsed["methods"]
+                            if x["name"] == c and x.get("class_name", "") == target_cls
+                        ]
+                        if matching:
+                            for x in matching:
+                                called_ids.add(id(x))
+                            matched_unqualified = True
+                            break
+                    if matched_unqualified:
+                        break
+            else:
+                target, called_name = c.rsplit(".", 1)
+                if target == "super":
+                    parent_ext = type_map.get(m_cls, {}).get("extends")
+                    if parent_ext:
+                        parent_clean = strip_type_details(parent_ext)
+                        resolved_cls = resolve_target_class(parent_clean, m_cls, known_classes) or parent_clean
+                    else:
+                        resolved_cls = None
+                elif target.endswith(".super"):
+                    qualifier = target[:-6]
+                    resolved_qual = resolve_target_class(qualifier, m_cls, known_classes) or qualifier
+                    parent_ext = type_map.get(resolved_qual, {}).get("extends")
+                    if parent_ext:
+                        parent_clean = strip_type_details(parent_ext)
+                        resolved_cls = resolve_target_class(parent_clean, resolved_qual, known_classes) or parent_clean
+                    else:
+                        resolved_cls = resolved_qual
+                else:
+                    resolved_cls = resolve_target_class(target, m_cls, known_classes)
+                if resolved_cls is not None:
+                    search_classes = get_type_and_supertypes(resolved_cls, type_map, known_classes)
+                    for target_cls in search_classes:
+                        matching = [
+                            x for x in parsed["methods"]
+                            if x["name"] == called_name and x.get("class_name", "") == target_cls
+                        ]
+                        if matching:
+                            for x in matching:
+                                called_ids.add(id(x))
+                            break
+
     called = [
         om for om in parsed["methods"]
-        if om["name"] not in matched_names
-        and re.search(rf"\b{re.escape(om['name'])}\s*\(", method_bodies)
+        if om["name"] not in matched_names and id(om) in called_ids
     ]
     if called:
         out.append("// --- called methods in same class ---")

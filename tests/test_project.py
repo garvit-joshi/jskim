@@ -550,6 +550,343 @@ class TestCallHierarchyOutput:
         assert "→ BillingService.validate()" in output
         assert "→ BillingRepository.save()" in output
 
+    def test_callers_and_impact_follow_method_references(self, tmp_path):
+        service = """
+        package demo;
+        import java.util.List;
+        public class Service {
+            private Repo repo;
+            public void process(List<String> items) {
+                items.forEach(repo::save);
+                items.forEach(demo.Repo::save);
+                items.forEach(demo.Repo<String>::save);
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public static void save(String item) {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.process" in output
+        impact = format_impact_output(types, "Service.process", depth=1)
+        assert "→ Repo.save" in impact
+
+    def test_callers_and_impact_follow_qualified_super_method_references(self, tmp_path):
+        service = """
+        package demo;
+        public class Service implements AuditApi {
+            public void process() {
+                Runnable r = AuditApi.super::audit;
+            }
+        }
+        """
+        api = """
+        package demo;
+        public interface AuditApi {
+            default void audit() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "AuditApi.java").write_text(api, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "AuditApi.audit", depth=1)
+        assert "← Service.process" in output
+        impact = format_impact_output(types, "Service.process", depth=1)
+        assert "→ AuditApi.audit" in impact
+
+    def test_callers_and_impact_respect_parameter_shadowing(self, tmp_path):
+        service = """
+        package demo;
+        import java.util.List;
+        public class Service {
+            private Repo repo;
+            public void run(Other repo) {
+                items.forEach(repo::save);
+                repo.save();
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public void save() {}
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public void save() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.run" not in output
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Repo.save" not in impact
+
+    def test_callers_and_impact_preserve_calls_outside_nested_shadowing(self, tmp_path):
+        service = """
+        package demo;
+        import java.util.List;
+        public class Service {
+            private Repo repo;
+            public void run(List<Other> items) {
+                repo.save();
+                for (Other repo : items) {
+                    repo.save();
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public void save() {}
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public void save() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.run" in output
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Repo.save" in impact
+
+    def test_callers_and_impact_respect_try_with_resources_and_pattern_condition_scope(self, tmp_path):
+        service = """
+        package demo;
+        public class Service {
+            private Repo repo;
+            public void testTry() {
+                try (Other repo = open()) {
+                    repo.save();
+                } catch (Exception e) {
+                    repo.save();
+                }
+            }
+            public void testPattern(Object obj) {
+                if (obj instanceof Other repo && repo.save()) {
+                    repo.save();
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public boolean save() { return true; }
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public boolean save() { return true; }
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        output = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.testTry" in output
+        assert "Service.testPattern" not in output
+        impact_try = format_impact_output(types, "Service.testTry", depth=1)
+        assert "→ Repo.save" in impact_try
+        impact_pattern = format_impact_output(types, "Service.testPattern", depth=1)
+        assert "→ Repo.save" not in impact_pattern
+
+    def test_callers_and_impact_respect_negated_patterns_declarator_order_and_colon_switch(self, tmp_path):
+        service = """
+        package demo;
+        public class Service {
+            private Repo repo;
+            public void testNegated(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    repo.save();
+                } else {
+                    repo.flush();
+                }
+            }
+            public void testDeclaratorOrder() {
+                Repo first = repo.open(), repo = first;
+                repo.save();
+            }
+            public void testColonSwitch(Object obj) {
+                switch (obj) {
+                    case Other repo:
+                        repo.save();
+                        break;
+                    default:
+                        repo.sync();
+                        break;
+                }
+            }
+        }
+        """
+        repo = """
+        package demo;
+        public class Repo {
+            public void save() {}
+            public Repo open() { return this; }
+            public void flush() {}
+            public void sync() {}
+        }
+        """
+        other = """
+        package demo;
+        public class Other {
+            public void save() {}
+            public void flush() {}
+        }
+        """
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Repo.java").write_text(repo, encoding="utf-8")
+        (tmp_path / "Other.java").write_text(other, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+
+        callers_save = format_callers_output(types, "Repo.save", depth=1)
+        assert "← Service.testNegated" in callers_save
+        assert "Service.testDeclaratorOrder" not in callers_save
+        assert "Service.testColonSwitch" not in callers_save
+
+        callers_open = format_callers_output(types, "Repo.open", depth=1)
+        assert "← Service.testDeclaratorOrder" in callers_open
+
+        callers_flush = format_callers_output(types, "Repo.flush", depth=1)
+        assert "Service.testNegated" not in callers_flush
+
+        callers_sync = format_callers_output(types, "Repo.sync", depth=1)
+        assert "← Service.testColonSwitch" in callers_sync
+
+    def test_callers_and_impact_follow_unqualified_inherited_references(self, tmp_path):
+        base = """
+        package demo;
+        public class Base {
+            public void validate() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service extends Base {
+            public void run() {
+                validate();
+                Runnable r = this::validate;
+            }
+        }
+        """
+        (tmp_path / "Base.java").write_text(base, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        callers = format_callers_output(types, "Base.validate", depth=1)
+        assert "← Service.run" in callers
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Base.validate" in impact
+
+    def test_callers_and_impact_resolve_ambiguous_simple_name_via_fq_reference(self, tmp_path):
+        repo1 = """
+        package com.acme.one;
+        public class Repo {
+            public static void save() {}
+        }
+        """
+        repo2 = """
+        package com.acme.two;
+        public class Repo {
+            public static void save() {}
+        }
+        """
+        service = """
+        package com.acme.app;
+        public class Service {
+            public void run() {
+                com.acme.one.Repo.save();
+                Runnable r = com.acme.one.Repo::save;
+            }
+        }
+        """
+        (tmp_path / "Repo1.java").write_text(repo1, encoding="utf-8")
+        (tmp_path / "Repo2.java").write_text(repo2, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        callers = format_callers_output(types, "com.acme.one.Repo.save", depth=1)
+        assert "← Service.run" in callers
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ com.acme.one.Repo.save" in impact
+
+    def test_callers_and_impact_inherited_call_does_not_fan_out_to_sibling_override(self, tmp_path):
+        base = """
+        package demo;
+        public class Base {
+            public void validate() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service extends Base {
+            public void run() {
+                validate();
+                Runnable r = this::validate;
+            }
+        }
+        """
+        sibling = """
+        package demo;
+        public class Sibling extends Base {
+            public void validate() {}
+        }
+        """
+        (tmp_path / "Base.java").write_text(base, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        (tmp_path / "Sibling.java").write_text(sibling, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Base.validate" in impact
+        assert "Sibling.validate" not in impact
+        callers = format_callers_output(types, "Sibling.validate", depth=1)
+        assert "Service.run" not in callers
+
+    def test_callers_and_impact_qualified_super_suppresses_subtype_fan_out(self, tmp_path):
+        api = """
+        package demo;
+        public interface AuditApi {
+            default void audit() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service implements AuditApi {
+            public void run() {
+                AuditApi.super.audit();
+                Runnable r = AuditApi.super::audit;
+            }
+            public void audit() {}
+        }
+        """
+        (tmp_path / "AuditApi.java").write_text(api, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ AuditApi.audit" in impact
+        assert "→ Service.audit" not in impact
+
+
+
 
 # ---------------------------------------------------------------------------
 # Full project scan

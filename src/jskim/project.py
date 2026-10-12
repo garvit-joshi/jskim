@@ -23,7 +23,7 @@ from pathlib import Path
 from .util import (
     parse_java_source, instance_fields, format_enum_constants, format_annotation,
     extract_mapping_paths, extract_request_method, extract_first_annotation_string,
-    walk_types, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
+    walk_types, strip_type_details, HTTP_MAPPING_ANNOTATIONS, LOMBOK_SET, LOMBOK_CONSTRUCTOR_ANNOTATIONS,
     SPRING_STEREOTYPES, CONTROLLER_ANNOTATIONS, INJECTION_ANNOTATIONS,
     KEY_CLASS_ANNOTATIONS, ENUM_CONSTANTS_MAP_MAX, MAP_COLLAPSED_KINDS, MAP_LINE_WIDTH, SKIP_DIRS,
 )
@@ -42,16 +42,6 @@ def _join_paths(base, method_path):
     if not method_path:
         return base if base.startswith("/") else "/" + base
     return base.rstrip("/") + "/" + method_path.lstrip("/")
-
-
-def _strip_type_details(type_name):
-    """Strip generics and array suffixes from a type reference."""
-    if not type_name:
-        return None
-    cleaned = type_name.split("<", 1)[0].strip()
-    while cleaned.endswith("[]"):
-        cleaned = cleaned[:-2].strip()
-    return cleaned
 
 
 def _bean_dependencies(t, is_bean):
@@ -86,7 +76,7 @@ def _bean_dependencies(t, is_bean):
 def _bean_producers(t):
     """Return types produced by @Bean methods in a type and its nested types."""
     return [
-        _strip_type_details(m["return_type"])
+        strip_type_details(m["return_type"])
         for _, nested in walk_types([t])
         for m in nested["methods"]
         if m["return_type"] and any(a["name"] == "@Bean" for a in m["annotations"])
@@ -131,10 +121,17 @@ def _type_info(t, filepath, parsed):
     }
 
 
-def scan_java_file(filepath):
+def scan_java_file(filepath, package_types=None):
     """Parse one Java file into a file dict with one row per top-level type."""
+    if package_types is None:
+        try:
+            path_obj = Path(filepath)
+            if path_obj.parent.is_dir():
+                package_types = {p.stem for p in path_obj.parent.glob("*.java")}
+        except Exception:
+            package_types = None
     content = filepath.read_text(encoding="utf-8", errors="replace")
-    parsed = parse_java_source(content, source_name=filepath)
+    parsed = parse_java_source(content, source_name=filepath, package_types=package_types)
     return {
         "filepath": filepath,
         "package": parsed["package"],
@@ -251,7 +248,7 @@ def _build_dependency_indexes(type_infos):
 def _resolve_type_reference(type_name, info, indexes):
     """Resolve a type reference to a fully-qualified project type name."""
     fq_names, package_to_fqns, simple_to_fqns, explicit_imports, wildcard_imports = indexes
-    stripped = _strip_type_details(type_name)
+    stripped = strip_type_details(type_name)
     if not stripped:
         return None
 
@@ -354,6 +351,7 @@ def _iter_method_nodes(type_infos):
                 "identity": method["identity"],
                 "start": method["start"],
                 "calls": method.get("calls", []),
+                "call_targets": method.get("call_targets", method.get("calls", [])),
                 "filepath": info.get("filepath"),
                 "info": info,
                 "fields_by_name": fields_by_name,
@@ -372,18 +370,85 @@ def _method_location(method):
     return f"{location}:L{method['start']}"
 
 
-def _resolve_call_target(call, source_method, indexes):
+def _find_inherited_method_owner(start_cls, method_name, type_infos_by_fqn, methods_by_class_name, indexes):
+    """Walk superclass chain and interfaces to find which type declares method_name."""
+    if not (type_infos_by_fqn and methods_by_class_name and start_cls):
+        return None
+    visited = {start_cls}
+    curr = start_cls
+    superclass_chain = []
+    while curr:
+        info = type_infos_by_fqn.get(curr)
+        if not info:
+            break
+        ext = info.get("extends")
+        if not ext:
+            break
+        fq_ext = _resolve_type_reference(ext, info, indexes)
+        if not fq_ext or fq_ext in visited:
+            break
+        visited.add(fq_ext)
+        superclass_chain.append(fq_ext)
+        if (fq_ext, method_name) in methods_by_class_name:
+            return fq_ext
+        curr = fq_ext
+
+    queue = []
+    for cls_in_chain in [start_cls] + superclass_chain:
+        info = type_infos_by_fqn.get(cls_in_chain)
+        if info:
+            for imp in info.get("implements", []):
+                fq_imp = _resolve_type_reference(imp, info, indexes)
+                if fq_imp and fq_imp not in visited:
+                    queue.append(fq_imp)
+
+    while queue:
+        curr_iface = queue.pop(0)
+        if curr_iface in visited:
+            continue
+        visited.add(curr_iface)
+        if (curr_iface, method_name) in methods_by_class_name:
+            return curr_iface
+        info = type_infos_by_fqn.get(curr_iface)
+        if info:
+            for ext in [info.get("extends")] + list(info.get("implements", [])):
+                if ext:
+                    fq_sub = _resolve_type_reference(ext, info, indexes)
+                    if fq_sub and fq_sub not in visited:
+                        queue.append(fq_sub)
+    return None
+
+
+def _resolve_call_target(call, source_method, indexes, methods_by_class_name=None, type_infos_by_fqn=None):
     """Resolve one extracted call string to a project class and method name."""
     if "." not in call:
-        return source_method["fq_class"], call
+        if methods_by_class_name and (source_method["fq_class"], call) in methods_by_class_name:
+            return source_method["fq_class"], call, source_method["fq_class"], False
+        inherited = _find_inherited_method_owner(
+            source_method["fq_class"], call, type_infos_by_fqn, methods_by_class_name, indexes
+        )
+        if inherited:
+            return inherited, call, source_method["fq_class"], False
+        return source_method["fq_class"], call, source_method["fq_class"], False
 
     owner, method_name = call.rsplit(".", 1)
+    is_super = False
     if owner == "super":
+        is_super = True
         type_name = source_method["info"].get("extends")
+    elif owner.endswith(".super"):
+        is_super = True
+        qualifier = owner[:-6]
+        fq_qual = _resolve_type_reference(qualifier, source_method["info"], indexes)
+        if fq_qual and type_infos_by_fqn and fq_qual in type_infos_by_fqn:
+            qual_info = type_infos_by_fqn[fq_qual]
+            type_name = qual_info.get("extends") or fq_qual
+        else:
+            type_name = qualifier
     elif owner in source_method["fields_by_name"]:
         type_name = source_method["fields_by_name"][owner]
-    elif owner[:1].isupper():
-        # Static calls such as FooFactory.create() use the class name as owner.
+    elif owner[:1].isupper() or "." in owner:
+        # Static calls or fully qualified calls (e.g. FooFactory.create() or com.acme.one.Repo.save)
         type_name = owner
     else:
         type_name = None
@@ -393,7 +458,17 @@ def _resolve_call_target(call, source_method, indexes):
     fq_class = _resolve_type_reference(type_name, source_method["info"], indexes)
     if not fq_class:
         return None
-    return fq_class, method_name
+
+    receiver_class = fq_class if not is_super else None
+
+    if methods_by_class_name and type_infos_by_fqn and (fq_class, method_name) not in methods_by_class_name:
+        inherited = _find_inherited_method_owner(
+            fq_class, method_name, type_infos_by_fqn, methods_by_class_name, indexes
+        )
+        if inherited:
+            fq_class = inherited
+
+    return fq_class, method_name, receiver_class, is_super
 
 
 def _subtypes_index(type_infos, indexes):
@@ -445,18 +520,34 @@ def _build_call_graph(type_infos):
     indexes = _build_dependency_indexes(type_infos)
     simple_to_fqns = indexes[2]
     subtypes = _subtypes_index(type_infos, indexes)
+    type_infos_by_fqn = {
+        _qualified_name(info): info
+        for info in type_infos
+        if _qualified_name(info)
+    }
     incoming = defaultdict(list)
     outgoing = defaultdict(list)
     seen_edges = set()
 
     for source in methods:
         source_key = _method_key(source)
-        for call in source.get("calls", []):
-            resolved = _resolve_call_target(call, source, indexes)
+        for call in source.get("call_targets", source.get("calls", [])):
+            resolved = _resolve_call_target(
+                call, source, indexes, methods_by_class_name=methods_by_class_name, type_infos_by_fqn=type_infos_by_fqn
+            )
             if not resolved:
                 continue
-            fq_class, method_name = resolved
-            for target_class in _with_subtypes(fq_class, subtypes):
+            declaring_class, method_name, receiver_class, is_super = resolved
+            if is_super:
+                target_classes = [declaring_class]
+            elif receiver_class:
+                target_classes = [declaring_class] + [
+                    c for c in _with_subtypes(receiver_class, subtypes) if c != declaring_class
+                ]
+            else:
+                target_classes = _with_subtypes(declaring_class, subtypes)
+
+            for target_class in target_classes:
                 candidates = methods_by_class_name.get((target_class, method_name), [])
                 if len(candidates) != 1:
                     continue
