@@ -93,7 +93,7 @@ IMPLICIT_PLATFORM_TYPES = {
     "InterruptedException", "ReflectiveOperationException", "AssertionError",
     "OutOfMemoryError", "StackOverflowError",
     "System", "Runtime", "Thread", "ThreadLocal", "ThreadGroup",
-    "Runnable", "Callable", "Iterable", "AutoCloseable", "Cloneable", "Comparable",
+    "Runnable", "Iterable", "AutoCloseable", "Cloneable", "Comparable",
     "Process", "ProcessBuilder", "ClassLoader", "Package", "Module", "Record", "Enum",
     "Number", "Boolean", "Byte", "Short", "Character", "Integer", "Long", "Float", "Double",
     "Void", "Math", "StrictMath", "StackTraceElement",
@@ -1012,7 +1012,9 @@ def parse_method(node, call_scope=None, constants=None):
     """
     mods = get_modifiers_node(node)
     raw_calls = extract_raw_method_calls(node)
-    calls = extract_method_calls(node, call_scope)
+    targets_set = set()
+    calls = extract_method_calls(node, call_scope, call_targets=targets_set)
+    call_targets = sorted(targets_set)
     return {
         "name": get_method_name(node),
         "kind": _method_kind(node),
@@ -1027,6 +1029,7 @@ def parse_method(node, call_scope=None, constants=None):
         "return_type": _get_return_type(node),
         "params": parse_parameters(_get_formal_parameters(node)),
         "calls": calls,
+        "call_targets": call_targets,
         "raw_calls": raw_calls,
     }
 
@@ -1145,6 +1148,12 @@ def _is_traceable_call(call, scope):
         return False
     if owner == "super" or owner in scope["fields"] or owner in scope.get("super_types", ()):
         return True
+    if owner.endswith(".super"):
+        qualifier = owner[:-6]
+        if qualifier in scope.get("super_types", ()) or qualifier in scope.get("project_types", ()):
+            return True
+        if qualifier and qualifier[:1].isupper():
+            return True
     if any(_CONSTANT_NAME_RE.fullmatch(p) for p in parts):
         return False
     if not all(p[:1].isupper() for p in parts):
@@ -1290,6 +1299,36 @@ def _statement_completes_abruptly(node):
     return False
 
 
+def _is_preceding_container_child_shadowing(child, call_node, receiver):
+    """Return True if a container child statement shadows receiver before call_node."""
+    if child.type in LOCAL_VAR_DECLARATION_NODES:
+        for decl in child.named_children:
+            if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
+                name_node = decl.child_by_field_name("name")
+                if name_node:
+                    if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
+                        return True
+                    if _declares_variable(name_node, receiver):
+                        return True
+    elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
+        cond = child.child_by_field_name("condition")
+        consequence = child.child_by_field_name("consequence")
+        alternative = child.child_by_field_name("alternative")
+        if cond:
+            wt, wf = _get_pattern_variables_flow(cond)
+            if consequence and _statement_completes_abruptly(consequence) and receiver in wf:
+                return True
+            if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
+                return True
+    elif child.type in WHILE_NODES and child.end_byte <= call_node.start_byte:
+        cond = child.child_by_field_name("condition")
+        if cond:
+            wt, wf = _get_pattern_variables_flow(cond)
+            if receiver in wf:
+                return True
+    return False
+
+
 def _is_call_receiver_shadowed(call_node, receiver, method_node):
     """Return True if receiver is shadowed at call_node by an enclosing scope declaration."""
     curr = call_node.parent
@@ -1404,46 +1443,12 @@ def _is_call_receiver_shadowed(call_node, receiver, method_node):
                 if child.type in SWITCH_LABEL_NODES:
                     if child.start_byte < call_node.start_byte and _declares_variable(child, receiver):
                         return True
-                elif child.type in LOCAL_VAR_DECLARATION_NODES:
-                    for decl in child.named_children:
-                        if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
-                            name_node = decl.child_by_field_name("name")
-                            if name_node:
-                                if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
-                                    return True
-                                if _declares_variable(name_node, receiver):
-                                    return True
-                elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
-                    cond = child.child_by_field_name("condition")
-                    consequence = child.child_by_field_name("consequence")
-                    alternative = child.child_by_field_name("alternative")
-                    if cond:
-                        wt, wf = _get_pattern_variables_flow(cond)
-                        if consequence and _statement_completes_abruptly(consequence) and receiver in wf:
-                            return True
-                        if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
-                            return True
+                elif _is_preceding_container_child_shadowing(child, call_node, receiver):
+                    return True
         elif curr.type in BODY_NODES:
             for child in curr.named_children:
-                if child.type in LOCAL_VAR_DECLARATION_NODES:
-                    for decl in child.named_children:
-                        if decl.type in LOCAL_DECLARATION_NODES and decl.start_byte <= call_node.start_byte:
-                            name_node = decl.child_by_field_name("name")
-                            if name_node:
-                                if name_node.type in IDENTIFIER_NODES and name_node.text.decode() == receiver:
-                                    return True
-                                if _declares_variable(name_node, receiver):
-                                    return True
-                elif child.type in IF_STATEMENT_NODES and child.end_byte <= call_node.start_byte:
-                    cond = child.child_by_field_name("condition")
-                    consequence = child.child_by_field_name("consequence")
-                    alternative = child.child_by_field_name("alternative")
-                    if cond:
-                        wt, wf = _get_pattern_variables_flow(cond)
-                        if consequence and _statement_completes_abruptly(consequence) and receiver in wf:
-                            return True
-                        if alternative and _statement_completes_abruptly(alternative) and receiver in wt:
-                            return True
+                if _is_preceding_container_child_shadowing(child, call_node, receiver):
+                    return True
         curr = curr.parent
 
     params = _get_formal_parameters(method_node)
@@ -1463,8 +1468,6 @@ def _normalize_call_target(target):
         return ""
     if target.type in SUPER_NODES:
         return "super"
-    if target.type in SCOPED_TYPE_IDENTIFIER_NODES and target.text.decode().endswith(".super") and target.children:
-        target = target.children[0]
     if target.type in GENERIC_TYPE_NODES:
         target = target.children[0] if target.children else None
         if target is None:
@@ -1473,9 +1476,7 @@ def _normalize_call_target(target):
         return target.text.decode()
     if target.type in SCOPED_TYPE_IDENTIFIER_NODES:
         text = target.text.decode()
-        if text.endswith(".super"):
-            text = text[:-6]
-        return text
+        return re.sub(r"<[^>]+>", "", text)
     if target.type in FIELD_ACCESS_NODES:
         inner_obj = target.child_by_field_name("object")
         field = target.child_by_field_name("field")
@@ -1487,41 +1488,47 @@ def _normalize_call_target(target):
         if field_text in THIS_NODES and inner_obj:
             return inner_obj.text.decode()
         if field_text and field_text[0].isupper():
-            return target.text.decode()
+            text = target.text.decode()
+            return re.sub(r"<[^>]+>", "", text)
     return None
 
 
-def _display_call_target(norm):
+def _display_call_target(norm, keep_super=False):
     """Return the display representation of a normalized call target."""
     if not norm:
         return norm
-    parts = norm.split(".")
+    text = norm
+    if text.endswith(".super") and not keep_super:
+        text = text[:-6]
+    parts = text.split(".")
     for i, p in enumerate(parts):
         if p and p[0].isupper():
             return ".".join(parts[i:])
     return parts[-1]
 
 
-def _record_call(target, method_name, calls):
+def _record_call(target, method_name, calls, norm=None):
     """Record a raw call into ``calls`` from an object/target node and method name."""
     if not method_name:
         return
-    norm = _normalize_call_target(target)
+    if norm is None:
+        norm = _normalize_call_target(target)
     if norm == "":
         calls.add(method_name)
     elif norm:
-        display_norm = _display_call_target(norm)
+        display_norm = _display_call_target(norm, keep_super=True)
         calls.add(f"{display_norm}.{method_name}")
 
 
-def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, method_node=None):
+def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, method_node=None, call_targets=None, norm=None):
     """Record a call into ``calls`` if it is followable and not shadowed at call_node."""
     if not method_name:
         return
-    norm = _normalize_call_target(target)
+    if norm is None:
+        norm = _normalize_call_target(target)
     if norm is None:
         return
-    display_norm = _display_call_target(norm)
+    display_norm = _display_call_target(norm, keep_super=False)
     call_str = method_name if norm == "" else f"{norm}.{method_name}"
     display_call = method_name if display_norm == "" else f"{display_norm}.{method_name}"
     if _is_noise_call(call_str) or _is_noise_call(display_call):
@@ -1534,9 +1541,11 @@ def _record_scoped_call(call_node, target, method_name, calls, call_scope=None, 
                 if _is_call_receiver_shadowed(call_node, norm, method_node):
                     return
     calls.add(display_call)
+    if call_targets is not None:
+        call_targets.add(call_str)
 
 
-def _collect_method_calls(node, calls, call_scope=None, method_node=None, raw=False):
+def _collect_method_calls(node, calls, call_scope=None, method_node=None, raw=False, call_targets=None):
     """Recursively collect method invocation and reference strings from an AST subtree."""
     if node.type in CALL_NODES:
         if node.type in METHOD_INVOCATION_NODES:
@@ -1544,23 +1553,30 @@ def _collect_method_calls(node, calls, call_scope=None, method_node=None, raw=Fa
             if name:
                 obj = node.child_by_field_name("object")
                 method_name = name.text.decode()
+                norm = _normalize_call_target(obj)
+                if obj is not None and norm and norm != "super":
+                    for child in node.children:
+                        if child.type in SUPER_NODES and child != obj:
+                            norm = f"{norm}.super"
+                            break
                 if raw:
-                    _record_call(obj, method_name, calls)
+                    _record_call(obj, method_name, calls, norm=norm)
                 else:
-                    _record_scoped_call(node, obj, method_name, calls, call_scope, method_node)
+                    _record_scoped_call(node, obj, method_name, calls, call_scope, method_node, call_targets=call_targets, norm=norm)
         elif node.type in METHOD_REFERENCE_NODES:
             if len(node.children) >= 3:
                 target = node.children[0]
                 last = node.children[-1]
                 if last.type in IDENTIFIER_NODES:
                     method_name = last.text.decode()
+                    norm = _normalize_call_target(target)
                     if raw:
-                        _record_call(target, method_name, calls)
+                        _record_call(target, method_name, calls, norm=norm)
                     else:
-                        _record_scoped_call(node, target, method_name, calls, call_scope, method_node)
+                        _record_scoped_call(node, target, method_name, calls, call_scope, method_node, call_targets=call_targets, norm=norm)
 
     for child in node.children:
-        _collect_method_calls(child, calls, call_scope=call_scope, method_node=method_node, raw=raw)
+        _collect_method_calls(child, calls, call_scope=call_scope, method_node=method_node, raw=raw, call_targets=call_targets)
 
 
 def extract_raw_method_calls(method_node):
@@ -1577,7 +1593,7 @@ def extract_raw_method_calls(method_node):
     return sorted(calls)
 
 
-def extract_method_calls(method_node, call_scope=None):
+def extract_method_calls(method_node, call_scope=None, call_targets=None):
     """Extract method calls from a method/constructor body.
 
     Returns a deduplicated sorted list of call strings like:
@@ -1602,7 +1618,7 @@ def extract_method_calls(method_node, call_scope=None):
     if body is None:
         return []
     calls = set()
-    _collect_method_calls(body, calls, call_scope=call_scope, method_node=method_node, raw=False)
+    _collect_method_calls(body, calls, call_scope=call_scope, method_node=method_node, raw=False, call_targets=call_targets)
     return sorted(calls)
 
 
@@ -1940,16 +1956,47 @@ def get_type_and_supertypes(cls_name, type_map, known_classes=None):
     """Return [cls_name, *supertypes] in resolution order for cls_name.
 
     Resolves superclass and interface names using ``type_map`` (keyed by type label)
-    and ``resolve_target_class`` against ``known_classes``.
+    and ``resolve_target_class`` against ``known_classes``. The superclass chain
+    is traversed before interfaces.
     """
     if not cls_name:
         return []
-    result = []
-    visited = set()
-    queue = [cls_name]
     classes = set(known_classes or ())
     if type_map:
         classes.update(type_map.keys())
+
+    result = []
+    visited = set()
+
+    # 1. Walk the superclass chain first
+    curr = cls_name
+    class_chain = []
+    while curr and curr not in visited:
+        visited.add(curr)
+        result.append(curr)
+        class_chain.append(curr)
+        t = type_map.get(curr) if type_map else None
+        if t:
+            ext = t.get("extends")
+            if ext:
+                clean_ext = strip_type_details(ext)
+                resolved = resolve_target_class(clean_ext, curr, classes) or clean_ext
+                curr = resolved
+            else:
+                curr = None
+        else:
+            curr = None
+
+    # 2. Traverse interface hierarchies BFS / in order
+    queue = []
+    for c in class_chain:
+        t = type_map.get(c) if type_map else None
+        if t:
+            for imp in t.get("implements", []):
+                clean_imp = strip_type_details(imp)
+                resolved = resolve_target_class(clean_imp, c, classes) or clean_imp
+                if resolved and resolved not in visited:
+                    queue.append(resolved)
 
     while queue:
         curr = queue.pop(0)

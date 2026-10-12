@@ -2464,6 +2464,60 @@ class TestImplicitPlatformMethodReferences:
         """)
         assert t["methods"][0]["calls"] == ["Throwable.getMessage"]
 
+    def test_same_package_callable_not_filtered_as_implicit_platform_type(self):
+        types = parse_java_source("""
+        package com.acme;
+        class User {
+            void run() {
+                Runnable r = Callable::execute;
+            }
+        }
+        class Callable {
+            static void execute() {}
+        }
+        """)["types"]
+        assert types[0]["methods"][0]["calls"] == ["Callable.execute"]
+
+
+class TestWhileLoopFalseFlowScoping:
+    def test_while_loop_false_flow_scopes_following_statements(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                while (!(obj instanceof Other repo)) {
+                    // loop
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+
+class TestRawCallsPreservesQualifiedSuper:
+    def test_raw_calls_preserves_qualified_super(self):
+        t = _first_type("""
+        package com.acme;
+        class Outer extends Base {
+            class Inner {
+                void run() {
+                    Outer.super.validate();
+                    Runnable r = Outer.super::validate;
+                }
+            }
+        }
+        class Base { void validate() {} }
+        """)
+        inner = t["inner_types"][0]
+        method = inner["methods"][0]
+        assert "Outer.super.validate" in method["raw_calls"]
+        assert "Outer.super.validate" in method["call_targets"]
+        assert method["calls"] == ["Outer.validate"]
+
 
 class TestGetTypeAndSupertypes:
     def test_inheritance_hierarchy_order(self):
@@ -2475,4 +2529,4 @@ class TestGetTypeAndSupertypes:
         }
         known = set(type_map.keys())
         result = get_type_and_supertypes("Outer.Inner", type_map, known)
-        assert result == ["Outer.Inner", "Base", "Auditable", "GrandBase"]
+        assert result == ["Outer.Inner", "Base", "GrandBase", "Auditable"]

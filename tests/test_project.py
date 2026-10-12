@@ -774,6 +774,62 @@ class TestCallHierarchyOutput:
         callers_sync = format_callers_output(types, "Repo.sync", depth=1)
         assert "← Service.testColonSwitch" in callers_sync
 
+    def test_callers_and_impact_follow_unqualified_inherited_references(self, tmp_path):
+        base = """
+        package demo;
+        public class Base {
+            public void validate() {}
+        }
+        """
+        service = """
+        package demo;
+        public class Service extends Base {
+            public void run() {
+                validate();
+                Runnable r = this::validate;
+            }
+        }
+        """
+        (tmp_path / "Base.java").write_text(base, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        callers = format_callers_output(types, "Base.validate", depth=1)
+        assert "← Service.run" in callers
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ Base.validate" in impact
+
+    def test_callers_and_impact_resolve_ambiguous_simple_name_via_fq_reference(self, tmp_path):
+        repo1 = """
+        package com.acme.one;
+        public class Repo {
+            public static void save() {}
+        }
+        """
+        repo2 = """
+        package com.acme.two;
+        public class Repo {
+            public static void save() {}
+        }
+        """
+        service = """
+        package com.acme.app;
+        public class Service {
+            public void run() {
+                com.acme.one.Repo.save();
+                Runnable r = com.acme.one.Repo::save;
+            }
+        }
+        """
+        (tmp_path / "Repo1.java").write_text(repo1, encoding="utf-8")
+        (tmp_path / "Repo2.java").write_text(repo2, encoding="utf-8")
+        (tmp_path / "Service.java").write_text(service, encoding="utf-8")
+        types = flatten_types(files_of(*sorted(tmp_path.glob("*.java"))))
+        callers = format_callers_output(types, "com.acme.one.Repo.save", depth=1)
+        assert "← Service.run" in callers
+        impact = format_impact_output(types, "Service.run", depth=1)
+        assert "→ com.acme.one.Repo.save" in impact
+
+
 
 # ---------------------------------------------------------------------------
 # Full project scan
