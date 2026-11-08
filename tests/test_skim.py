@@ -457,3 +457,19 @@ class TestSkimFixtureFiles:
         output = skim(load_fixture(java_file), java_file)
         assert output.startswith("//")
         assert "total:" in output
+
+    def test_method_reference_tracing_in_output(self):
+        source = """
+        package com.acme.app;
+        import java.util.List;
+        public class Service {
+            private Repo repo;
+            public void handle(List<String> items) {
+                items.forEach(this::validate);
+                items.forEach(repo::save);
+            }
+            private void validate(String item) {}
+        }
+        """
+        output = skim(source, "Service.java")
+        assert "→ repo.save, validate" in output

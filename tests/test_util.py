@@ -25,6 +25,10 @@ from jskim.util import (
     is_field_final,
     is_field_static,
     extract_method_calls,
+    extract_raw_method_calls,
+    resolve_target_class,
+    get_type_and_supertypes,
+    strip_type_details,
     build_call_scope,
     get_javadoc_summary,
     walk_types,
@@ -36,6 +40,7 @@ from jskim.util import (
     extract_first_annotation_string,
     INNER_TYPE_NODES,
     METHOD_NODES,
+    CALL_NODES,
     LOMBOK_SET,
     MODIFIER_KEYWORDS,
     HTTP_MAPPING_ANNOTATIONS,
@@ -936,6 +941,25 @@ class TestExtractMethodCalls:
         calls = extract_method_calls(method)
         assert calls == ["notifyStakeholders", "order.getExtras", "orderRepo.save", "validator.validate"]
 
+    def test_extract_raw_method_calls_preserves_noise_and_qualified_helpers(self):
+        source = b"""
+        class S {
+            void process(Optional<String> opt) {
+                S.get();
+                S.of();
+                opt.get();
+                Stream.of("x");
+                this.validate();
+            }
+        }
+        """
+        method = self._get_first_method(source)
+        raw = extract_raw_method_calls(method)
+        assert raw == ["S.get", "S.of", "Stream.of", "opt.get", "validate"]
+        # extract_method_calls filters noise methods on objects
+        filtered = extract_method_calls(method)
+        assert filtered == ["validate"]
+
 
 # ---------------------------------------------------------------------------
 # Spring annotation helpers
@@ -1066,6 +1090,9 @@ class TestConstants:
             "compact_constructor_declaration", "annotation_type_element_declaration",
         }
         assert METHOD_NODES == expected
+
+    def test_call_nodes_complete(self):
+        assert CALL_NODES == {"method_invocation", "method_reference"}
 
     def test_lombok_set_has_common_annotations(self):
         assert "@Data" in LOMBOK_SET
@@ -1619,6 +1646,366 @@ class TestCallScope:
         method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
         assert extract_method_calls(method) == ["Helper.build", "x.run"]
 
+    def test_method_references_extracted(self):
+        t = _first_type("""
+        package com.acme.app;
+        import java.util.Objects;
+        import com.acme.app.service.BillingService;
+        class S {
+            Repo repo;
+            void process(List<Item> items) {
+                items.forEach(this::validate);
+                items.forEach(super::audit);
+                items.forEach(repo::save);
+                items.forEach(this.repo::flush);
+                items.forEach(BillingService::charge);
+                items.forEach(Objects::requireNonNull);
+                items.forEach(String::valueOf);
+            }
+            void validate(Item item) {}
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert calls == [
+            "BillingService.charge",
+            "repo.flush",
+            "repo.save",
+            "super.audit",
+            "validate",
+        ]
+
+    def test_method_references_scoped_and_edge_cases(self):
+        t = _first_type("""
+        package com.acme.app;
+        import java.util.Objects;
+        class Outer {
+            void run() {
+                items.forEach(com.acme.service.BillingService::charge);
+                items.forEach(com.acme.service.BillingService<String>::charge);
+                items.forEach(Outer.Inner::process);
+                items.forEach(Outer.super::audit);
+                items.forEach(super::audit);
+                items.forEach(Outer.this::validate);
+                items.forEach((this)::validate);
+                items.forEach(this::<String>validate);
+                items.forEach(java.util.Objects::requireNonNull);
+                items.forEach(Service::new);
+                items.forEach(String[]::new);
+            }
+            void validate(String s) {}
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert calls == [
+            "BillingService.charge",
+            "Outer.Inner.process",
+            "Outer.audit",
+            "Outer.validate",
+            "super.audit",
+            "validate",
+        ]
+
+    def test_method_references_qualified_super_interfaces(self):
+        t = _first_type("""
+        package com.acme.app;
+        import com.acme.app.api.AuditApi;
+        class Service implements AuditApi, I {
+            void run() {
+                items.forEach(AuditApi.super::audit);
+                items.forEach(AuditApi<String>.super::audit);
+                items.forEach(I.super::audit);
+                items.forEach(super::audit);
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert calls == [
+            "AuditApi.audit",
+            "I.audit",
+            "super.audit",
+        ]
+
+    def test_call_scope_filters_one_letter_constant(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme", (), (), field_names=(), super_types={"I"})
+        assert not _is_traceable_call("X.run", scope)
+        assert not _is_traceable_call("CONST.run", scope)
+        assert _is_traceable_call("I.audit", scope)
+
+    def test_call_scope_filters_class_qualified_constants(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme", (), (), field_names=(), super_types={"I"})
+        assert not _is_traceable_call("Singleton.INSTANCE.run", scope)
+        assert not _is_traceable_call("MyClass.FOO_BAR.run", scope)
+        assert _is_traceable_call("Outer.Inner.run", scope)
+
+    def test_method_calls_filters_class_qualified_constants_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            void run() {
+                Singleton.INSTANCE.run();
+                Outer.Inner.process();
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert "Singleton.INSTANCE.run" not in calls
+        assert "Outer.Inner.process" in calls
+
+    def test_call_scope_filters_nested_owners_rooted_in_foreign_types(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme.app", ["java.util.Map"], ())
+        assert not _is_traceable_call("Map.Entry.getKey", scope)
+        assert not _is_traceable_call("Map.Entry.run", scope)
+        assert _is_traceable_call("Outer.Inner.run", scope)
+
+    def test_call_scope_filters_foreign_super_types(self):
+        from jskim.util import build_call_scope, _is_traceable_call
+        scope = build_call_scope("com.acme.app", ["com.vendor.VendorBase"], (), super_types={"VendorBase"})
+        assert not _is_traceable_call("VendorBase.work", scope)
+        assert not _is_traceable_call("VendorBase.run", scope)
+
+    def test_parameter_shadowing_field_drops_call_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+            AuditService audit;
+
+            void run(Other repo) {
+                repo.save();
+                items.forEach(repo::save);
+                audit.log();
+            }
+
+            void clean() {
+                repo.save();
+            }
+        }
+        """)
+        run_calls = t["methods"][0]["calls"]
+        assert "repo.save" not in run_calls
+        assert "audit.log" in run_calls
+
+        clean_calls = t["methods"][1]["calls"]
+        assert "repo.save" in clean_calls
+
+    def test_local_variable_shadowing_field_drops_call_in_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+
+            void run() {
+                Other repo = new Other();
+                repo.save();
+            }
+        }
+        """)
+        calls = t["methods"][0]["calls"]
+        assert "repo.save" not in calls
+
+    def test_loop_and_catch_shadowing_field_drops_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class Service {
+            Repo repo;
+
+            void forLoop(List<Other> items) {
+                for (Other repo : items) {
+                    repo.save();
+                }
+            }
+
+            void catchBlock() {
+                try {
+                    work();
+                } catch (OtherException repo) {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        assert "repo.save" not in t["methods"][0]["calls"]
+        assert "repo.save" not in t["methods"][1]["calls"]
+
+    def test_extract_method_calls_respects_shadowed_fields(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            void run(Other repo) {
+                repo.save();
+                audit.log();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[0]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo", "audit"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["audit.log"]
+
+    def test_nested_scope_shadowing_preserves_outer_calls(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(List<Item> items, Object obj) {
+                repo.save();
+                items.forEach(repo -> repo.save());
+                repo.flush();
+                for (Item repo : items) {
+                    repo.save();
+                }
+                repo.refresh();
+                try {
+                    repo.save();
+                } catch (Exception repo) {
+                    repo.save();
+                }
+                repo.sync();
+                if (obj instanceof Item repo) {
+                    repo.save();
+                }
+                repo.commit();
+                {
+                    Item repo = null;
+                    repo.save();
+                }
+                repo.close();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == [
+            "repo.close", "repo.commit",
+            "repo.flush", "repo.refresh", "repo.save", "repo.sync",
+        ]
+
+    def test_explicit_this_call_preserved_when_shadowed(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Other repo) {
+                repo.save();
+                this.repo.save();
+                Runnable r1 = repo::save;
+                Runnable r2 = this.repo::save;
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.save"]
+
+    def test_try_with_resources_shadowing_limited_to_try_body_and_ordered_resources(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run() {
+                try (Other r1 = repo.init(); Other repo = open(); Other r2 = repo.next()) {
+                    repo.save();
+                } catch (Exception e) {
+                    repo.sync();
+                } finally {
+                    repo.flush();
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["open", "repo.flush", "repo.init", "repo.sync"]
+
+    def test_pattern_variable_shadowing_in_conditional_and_expressions(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                if (obj instanceof Other repo && repo.isReady()) {
+                    repo.save();
+                }
+                if (repo.check() && obj instanceof Other repo) {
+                    repo.save();
+                }
+                while (obj instanceof Other repo && repo.isReady()) {
+                    repo.save();
+                }
+                boolean ok = (obj instanceof Other repo && repo.isReady()) ? repo.save() : false;
+                this.repo.save();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.check", "repo.save"]
+
+    def test_negated_and_flow_scoped_pattern_variables(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    repo.save();
+                } else {
+                    repo.flush();
+                }
+                if (obj instanceof Other repo) {
+                    repo.save();
+                } else {
+                    repo.sync();
+                }
+                if (!(obj instanceof Other repo) || repo.isReady()) {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.save", "repo.sync"]
+
+    def test_local_declarator_ordering(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run() {
+                Repo first = repo.open(), repo = first;
+                repo.save();
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.open"]
+
+    def test_colon_switch_pattern_scoping(self):
+        root = parse_java_bytes(b"""
+        class Service {
+            Repo repo;
+            void run(Object obj) {
+                switch (obj) {
+                    case Other repo when repo.isReady():
+                        repo.save();
+                        break;
+                    default:
+                        repo.sync();
+                        break;
+                }
+            }
+        }
+        """)
+        method = get_body_members(get_class_body(find_first_type_declaration(root)))[1]
+        scope = build_call_scope("com.acme.app", (), (), field_names={"repo"})
+        calls = extract_method_calls(method, scope)
+        assert calls == ["repo.sync"]
+
+
 
 # ---------------------------------------------------------------------------
 # parse_method: signature line, noise spans, wiring
@@ -1659,6 +2046,23 @@ class TestMethodLines:
     def test_wiring_flag(self):
         t = _first_type("class C { C(A a) { this.a = a; } C(A a, int n) { this.a = a; this.n = n + 1; } }")
         assert [m["wiring"] for m in t["methods"]] == [True, False]
+
+    def test_raw_calls_and_filtered_calls_recorded(self):
+        t = _first_type("""
+        class C {
+            void run() {
+                C.get();
+                validate();
+            }
+            static void get() {}
+            void validate() {}
+        }
+        """)
+        m = t["methods"][0]
+        assert "raw_calls" in m
+        assert m["raw_calls"] == ["C.get", "validate"]
+        # In filtered calls, C.get is dropped as noise, while validate is kept
+        assert m["calls"] == ["validate"]
 
 
 # ---------------------------------------------------------------------------
@@ -1759,3 +2163,438 @@ class TestAnnotationConstantResolution:
             "@RequiresPermission(value = CREATE)",
             '@RequiresPermission("lit")',
         ]
+
+
+class TestResolveTargetClass:
+    def test_top_level_self(self):
+        assert resolve_target_class("S", "S", {"S"}) == "S"
+
+    def test_nested_self(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("Inner", "Outer.Inner", known) == "Outer.Inner"
+        assert resolve_target_class("Outer.Inner", "Outer.Inner", known) == "Outer.Inner"
+
+    def test_nested_ancestor(self):
+        known = {"Outer", "Outer.A", "Outer.A.Inner"}
+        assert resolve_target_class("Outer", "Outer.A.Inner", known) == "Outer"
+        assert resolve_target_class("A", "Outer.A.Inner", known) == "Outer.A"
+        assert resolve_target_class("Outer.A", "Outer.A.Inner", known) == "Outer.A"
+
+    def test_nested_child_from_enclosing(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("Inner", "Outer", known) == "Outer.Inner"
+
+    def test_nested_sibling(self):
+        known = {"Outer", "Outer.Sibling1", "Outer.Sibling2"}
+        assert resolve_target_class("Sibling2", "Outer.Sibling1", known) == "Outer.Sibling2"
+
+    def test_sibling_nested_classes_with_same_simple_name(self):
+        known = {"Outer", "Outer.A", "Outer.A.Inner", "Outer.B", "Outer.B.Inner"}
+        # From within A.Inner, "Inner" refers to A.Inner, not B.Inner
+        assert resolve_target_class("Inner", "Outer.A.Inner", known) == "Outer.A.Inner"
+        # From within B.Inner, "Inner" refers to B.Inner, not A.Inner
+        assert resolve_target_class("Inner", "Outer.B.Inner", known) == "Outer.B.Inner"
+        # From within A, "Inner" refers to A.Inner
+        assert resolve_target_class("Inner", "Outer.A", known) == "Outer.A.Inner"
+        # From within B, "Inner" refers to B.Inner
+        assert resolve_target_class("Inner", "Outer.B", known) == "Outer.B.Inner"
+        # From Outer, simple "Inner" is ambiguous and does not match
+        assert resolve_target_class("Inner", "Outer", known) is None
+        # From Outer, qualified relative paths resolve correctly
+        assert resolve_target_class("A.Inner", "Outer", known) == "Outer.A.Inner"
+        assert resolve_target_class("B.Inner", "Outer", known) == "Outer.B.Inner"
+
+    def test_unknown_receiver_resolves_to_none(self):
+        known = {"Outer", "Outer.Inner"}
+        assert resolve_target_class("repo", "Outer.Inner", known) is None
+        assert resolve_target_class("opt", "Outer.Inner", known) is None
+        assert resolve_target_class("", "Outer.Inner", known) is None
+        assert resolve_target_class(None, "Outer.Inner", known) is None
+
+
+class TestStripTypeDetails:
+    def test_strip_generics_and_arrays(self):
+        assert strip_type_details("List<String>") == "List"
+        assert strip_type_details("Map<String, List<Integer>>") == "Map"
+        assert strip_type_details("String[]") == "String"
+        assert strip_type_details("int[][]") == "int"
+        assert strip_type_details("Foo<Bar>[]") == "Foo"
+        assert strip_type_details(None) is None
+        assert strip_type_details("") is None
+
+
+class TestShortCircuitPatternFlow:
+    def test_short_circuit_and_false_path_keeps_field_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj, boolean condition) {
+                if (!(obj instanceof Other repo) && condition) {
+                    doSomething();
+                } else {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        # Condition failure can reach else without pattern matching, so repo.save is kept as field call
+        assert t["methods"][0]["calls"] == ["doSomething", "repo.save"]
+
+    def test_guaranteed_false_path_shadows_field_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    doSomething();
+                } else {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        # Pattern definitely matched on false path of !(instanceof), so repo shadows field
+        assert t["methods"][0]["calls"] == ["doSomething"]
+
+
+class TestGuardPatternAbruptCompletion:
+    def test_guard_return_scopes_remainder_of_block(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj) {
+                if (!(obj instanceof Other repo)) return;
+                repo.save();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_guard_block_return_scopes_remainder_of_block(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj) {
+                if (!(obj instanceof Other repo)) {
+                    log();
+                    return;
+                }
+                repo.save();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["log"]
+
+    def test_guard_throw_scopes_remainder_of_block(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj) {
+                if (!(obj instanceof Other repo)) throw new IllegalArgumentException();
+                repo.save();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_non_abrupt_if_does_not_scope_remainder(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(Object obj) {
+                if (!(obj instanceof Other repo)) log();
+                repo.save();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["log", "repo.save"]
+
+    def test_guard_in_switch_group_scopes_remainder(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(int mode, Object obj) {
+                switch (mode) {
+                    case 1:
+                        if (!(obj instanceof Other repo)) return;
+                        repo.save();
+                        break;
+                }
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_guard_yield_scopes_remainder_in_switch_expression(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            int process(int mode, Object obj) {
+                return switch (mode) {
+                    case 1 -> {
+                        if (!(obj instanceof Other repo)) yield 0;
+                        repo.save();
+                        yield 1;
+                    }
+                    default -> 0;
+                };
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_local_var_initializer_pattern_does_not_shadow_subsequent_field_call(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void run(Object obj) {
+                boolean flag = obj instanceof Other repo;
+                repo.flush();
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["repo.flush"]
+
+    def test_fully_qualified_external_reference_filtered_without_import(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            void run(java.util.List<Object> items) {
+                items.forEach(java.util.Map.Entry::getKey);
+                items.forEach(com.acme.service.BillingService::charge);
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["BillingService.charge"]
+
+
+class TestEnhancedForHeaderScoping:
+    def test_loop_header_only_scanned_for_loop_wide_shadow(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(java.util.List<String> items) {
+                for (String item : items) {
+                    repo.save();
+                    Other repo = open();
+                    repo.save();
+                }
+            }
+        }
+        """)
+        # First call before local declaration uses field; second call after is shadowed
+        assert t["methods"][0]["calls"] == ["open", "repo.save"]
+
+    def test_enhanced_for_loop_var_shadows_body(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process(java.util.List<String> repo) {
+                for (String repo : repo) {
+                    repo.save();
+                }
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+
+class TestForLoopInitializerOrdering:
+    def test_for_loop_initializer_order_shadows_subsequent(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process() {
+                for (Repo repo = this.repo, next = repo.next(); ; ) {
+                }
+            }
+        }
+        """)
+        # repo in next = repo.next() is the loop local, not the field
+        assert t["methods"][0]["calls"] == []
+
+    def test_for_loop_initializer_call_before_declaration_kept(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            Repo repo;
+            void process() {
+                for (Repo a = repo.next(), repo = this.repo; ; ) {
+                }
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["repo.next"]
+
+
+class TestImplicitPlatformMethodReferences:
+    def test_implicit_java_lang_method_references_filtered(self):
+        t = _first_type("""
+        package com.acme.app;
+        class S {
+            void process() {
+                Runnable r = Throwable::getMessage;
+                Runnable r2 = Exception::printStackTrace;
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_project_import_overrides_implicit_platform_type(self):
+        t = _first_type("""
+        package com.acme.app;
+        import com.acme.app.Throwable;
+        class S {
+            void process() {
+                Runnable r = Throwable::getMessage;
+            }
+        }
+        """)
+        assert t["methods"][0]["calls"] == ["Throwable.getMessage"]
+
+    def test_same_package_callable_not_filtered_as_implicit_platform_type(self):
+        types = parse_java_source("""
+        package com.acme;
+        class User {
+            void run() {
+                Runnable r = Callable::execute;
+            }
+        }
+        class Callable {
+            static void execute() {}
+        }
+        """)["types"]
+        assert types[0]["methods"][0]["calls"] == ["Callable.execute"]
+
+    def test_same_package_type_shadows_java_lang_name(self):
+        types = parse_java_source("""
+        package com.acme;
+        class User {
+            void run() {
+                Runnable r = Module::validate;
+            }
+        }
+        class Module {
+            static void validate() {}
+        }
+        """)["types"]
+        assert types[0]["methods"][0]["calls"] == ["Module.validate"]
+
+
+class TestWhileLoopFalseFlowScoping:
+    def test_while_loop_false_flow_scopes_following_statements(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                while (!(obj instanceof Other repo)) {
+                    // loop
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+    def test_while_loop_with_break_does_not_propagate_false_flow_pattern(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj, boolean stop) {
+                while (!(obj instanceof Other repo)) {
+                    if (stop) break;
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == ["repo.save"]
+
+    def test_while_loop_with_inner_break_still_propagates_false_flow(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                while (!(obj instanceof Other repo)) {
+                    for (int i = 0; i < 10; i++) {
+                        break;
+                    }
+                }
+                repo.save();
+            }
+        }
+        class Repo { void save() {} }
+        class Other { void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+
+class TestForLoopConditionPatternScoping:
+    def test_for_loop_condition_pattern_scopes_into_update_expression(self):
+        t = _first_type("""
+        package com.acme;
+        class S {
+            private Repo repo;
+            void process(Object obj) {
+                for (; obj instanceof Other repo; repo.advance()) {
+                    repo.save();
+                }
+            }
+        }
+        class Repo { void advance() {} void save() {} }
+        class Other { void advance() {} void save() {} }
+        """)
+        assert t["methods"][0]["calls"] == []
+
+
+class TestRawCallsPreservesQualifiedSuper:
+    def test_raw_calls_preserves_qualified_super(self):
+        t = _first_type("""
+        package com.acme;
+        class Outer extends Base {
+            class Inner {
+                void run() {
+                    Outer.super.validate();
+                    Runnable r = Outer.super::validate;
+                }
+            }
+        }
+        class Base { void validate() {} }
+        """)
+        inner = t["inner_types"][0]
+        method = inner["methods"][0]
+        assert "Outer.super.validate" in method["raw_calls"]
+        assert "Outer.super.validate" in method["call_targets"]
+        assert method["calls"] == ["Outer.validate"]
+
+
+class TestGetTypeAndSupertypes:
+    def test_inheritance_hierarchy_order(self):
+        type_map = {
+            "Outer.Inner": {"extends": "Base", "implements": ["Auditable"]},
+            "Base": {"extends": "GrandBase", "implements": []},
+            "GrandBase": {"extends": None, "implements": []},
+            "Auditable": {"extends": None, "implements": []},
+        }
+        known = set(type_map.keys())
+        result = get_type_and_supertypes("Outer.Inner", type_map, known)
+        assert result == ["Outer.Inner", "Base", "GrandBase", "Auditable"]

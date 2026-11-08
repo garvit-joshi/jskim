@@ -219,6 +219,348 @@ class TestExtractMethods:
         # extractData calls mapRow, isValidCabId, isValidString
         assert "called methods" in output.lower()
 
+    def test_called_methods_via_method_reference_shown(self):
+        content = """
+        class S {
+            void process(List<String> items) {
+                items.forEach(this::validate);
+            }
+            void validate(String item) {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "validate(String item)" in output
+
+    def test_called_methods_receiver_isolation(self):
+        content = """
+        class S {
+            Repo repo;
+            void process(List<String> items) {
+                repo.save("item");
+                items.forEach(repo::save);
+            }
+            void save(String item) {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" not in output
+
+    def test_called_methods_nested_class_simple_name(self):
+        content = """
+        class Outer {
+            static class Inner {
+                void process() {
+                    Inner.validate();
+                    Runnable r = Inner::validate;
+                }
+                static void validate() {}
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+
+    def test_called_methods_unqualified_scoped_to_declaring_class(self):
+        content = """
+        class Outer {
+            void validate() {}
+            static class Inner {
+                void process() {
+                    this.validate();
+                    Runnable r = this::validate;
+                }
+                void validate() {}
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "L9-L9" in output
+        assert "L3-L3" not in output
+
+    def test_called_methods_inherited_takes_precedence_over_enclosing(self):
+        content = """
+        class Base {
+            void validate() {}
+        }
+        class Outer {
+            void validate() {}
+            class Inner extends Base {
+                void test() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["test"])
+        assert "called methods in same class" in output
+        assert "L3-L3" in output
+        assert "L6-L6" not in output
+
+    def test_called_methods_plain_super_target_resolves_superclass(self):
+        content = """
+        class Base {
+            void validate() {}
+        }
+        class Sub extends Base {
+            void run() {
+                super.validate();
+                Runnable r = super::validate;
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["run"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+
+    def test_called_methods_interface_qualified_super_resolves_interface(self):
+        content = """
+        interface AuditApi {
+            default void audit() {}
+        }
+        class Service implements AuditApi {
+            void run() {
+                AuditApi.super.audit();
+                Runnable r = AuditApi.super::audit;
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["run"])
+        assert "called methods in same class" in output
+        assert "audit()" in output
+
+
+    def test_called_methods_qualified_same_class_helpers_preserved(self):
+        content = """
+        class S {
+            void process() {
+                S.get();
+                S.build();
+                S.of();
+                Runnable r = S::get;
+            }
+            static void get() {}
+            static void build() {}
+            static void of() {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "get()" in output
+        assert "build()" in output
+        assert "of()" in output
+
+    def test_called_methods_noise_on_foreign_objects_isolated(self):
+        content = """
+        class S {
+            void process(Optional<String> opt, Stream<String> stream) {
+                opt.get();
+                Stream.of("a");
+            }
+            static void get() {}
+            static void of() {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" not in output
+
+    def test_called_methods_sibling_nested_classes_same_simple_name(self):
+        content = """
+        class Outer {
+            static class A {
+                static class Inner {
+                    void processA() {
+                        Inner.validate();
+                        Runnable r = Inner::validate;
+                    }
+                    static void validate() {}
+                }
+            }
+            static class B {
+                static class Inner {
+                    void processB() {
+                        Inner.validate();
+                        Runnable r = Inner::validate;
+                    }
+                    static void validate() {}
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        # Calling processA in A.Inner matches A.Inner.validate (L9), not B.Inner.validate (L18)
+        output_a = extract_methods(parsed, ["processA"])
+        assert "called methods in same class" in output_a
+        assert "L9-L9" in output_a
+        assert "L18-L18" not in output_a
+
+        # Calling processB in B.Inner matches B.Inner.validate (L18), not A.Inner.validate (L9)
+        output_b = extract_methods(parsed, ["processB"])
+        assert "called methods in same class" in output_b
+        assert "L18-L18" in output_b
+        assert "L9-L9" not in output_b
+
+    def test_called_methods_nested_class_helper_noise_name(self):
+        content = """
+        class S {
+            static class Helper {
+                static void get() {}
+            }
+            void process() {
+                Helper.get();
+                Runnable r = Helper::get;
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "get()" in output
+
+    def test_called_methods_method_reference_only_preserves_qualified_helper(self):
+        content = """
+        class S {
+            void process() {
+                Runnable r = S::get;
+            }
+            static void get() {}
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "get()" in output
+
+    def test_called_methods_sibling_nested_classes_method_reference_only(self):
+        content = """
+        class Outer {
+            static class A {
+                static class Inner {
+                    void process() {
+                        Runnable r = Inner::validate;
+                    }
+                    static void validate() {}
+                }
+            }
+            static class B {
+                static class Inner {
+                    static void validate() {}
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "L8-L8" in output
+        assert "L14-L14" not in output
+
+    def test_called_methods_enclosing_ancestor_resolution(self):
+        content = """
+        class Outer {
+            static class A {
+                static void audit() {}
+                static class Inner {
+                    void process() {
+                        A.audit();
+                    }
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "audit()" in output
+
+    def test_called_methods_bare_inner_class_resolves_to_enclosing(self):
+        content = """
+        class Outer {
+            void validate() {}
+            class Inner {
+                void process() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "validate()" in output
+        assert "L3-L3" in output
+
+    def test_called_methods_bare_inner_class_shadowing(self):
+        content = """
+        class Outer {
+            void validate() {}
+            class Inner {
+                void validate() {}
+                void process() {
+                    validate();
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        assert "L5-L5" in output
+        assert "L3-L3" not in output
+
+    def test_called_methods_bare_inner_class_multilevel_enclosing(self):
+        content = """
+        class Outer {
+            void audit() {}
+            class Middle {
+                void audit() {}
+                class Inner {
+                    void process() {
+                        audit();
+                    }
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["process"])
+        assert "called methods in same class" in output
+        # Middle.audit (L5) shadows Outer.audit (L3)
+        assert "L5-L5" in output
+        assert "L3-L3" not in output
+
+    def test_called_methods_bare_inner_class_sibling_isolated(self):
+        content = """
+        class Outer {
+            static class A {
+                static class Inner {
+                    void processA() {
+                        validate();
+                    }
+                }
+            }
+            static class B {
+                static class Inner {
+                    static void validate() {}
+                }
+            }
+        }
+        """
+        parsed = parse_methods(content)
+        output = extract_methods(parsed, ["processA"])
+        assert "called methods in same class" not in output
+
     def test_fields_shown(self):
         content = load_fixture("StaticFieldService.java")
         parsed = parse_methods(content)
